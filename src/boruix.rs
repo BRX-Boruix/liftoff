@@ -32,6 +32,8 @@ pub const HHDM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
 /// Memmap 类型（lib.rs MemoryMapEntryType）。
 pub const MEMMAP_USABLE: u64 = 0;
+/// bootloader 可回收区（内核快照页表根后可复用；liftoff 自占区用此类型）。
+pub const MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
 pub const MEMMAP_RESERVED: u64 = 1;
 pub const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
 pub const MEMMAP_ACPI_NVS: u64 = 3;
@@ -150,6 +152,9 @@ pub struct Handover {
     pub kfile: KernelFileResponse,
     pub file_struct: File,
     pub kaddr: KernelAddressResponse,
+    /// 帧缓冲物理基址（loader 内部 memmap 剥离用；fb_struct.address 是
+    /// HHDM 虚地址，协议语义不可逆推物理）。0 = 无 GOP。
+    pub fb_phys: u64,
 }
 
 impl Handover {
@@ -163,6 +168,7 @@ impl Handover {
         kernel_base: u64,
         kernel_vbase: u64,
         kernel_len: u64,
+        fb_phys: u64,
     ) -> Handover {
         Handover {
             hhdm: HhdmResponse { revision: 0, offset: hhdm_off },
@@ -170,6 +176,7 @@ impl Handover {
             fb: FramebufferResponse { revision: 0, framebuffer_count: 1, framebuffers: core::ptr::null_mut() },
             fb_ptr: core::ptr::null_mut(),
             fb_struct: fb,
+            fb_phys,
             rsdp: RsdpResponse { revision: 0, address: rsdp },
             kfile: KernelFileResponse { revision: 0, kernel_file: core::ptr::null_mut() },
             file_struct: File {

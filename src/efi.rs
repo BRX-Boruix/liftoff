@@ -286,6 +286,50 @@ pub struct Guid {
 
 const _: () = assert!(core::mem::size_of::<Guid>() == 16);
 
+/// EFI_CONFIGURATION_TABLE 项（UEFI §4.6：VendorGuid + VendorTable，16 字节）。
+#[repr(C)]
+pub struct ConfigTableEntry {
+    pub vendor_guid: Guid,
+    pub vendor_table: *mut c_void,
+}
+
+const _: () = assert!(core::mem::size_of::<ConfigTableEntry>() == 24);
+
+/// ACPI 2.0+ RSDP 的配置表 GUID {8868E871-E4F1-11D3-BC22-0080C73C8881}
+/// （UEFI §4.6.2 EFI_ACPI_20_TABLE_GUID）。
+pub const ACPI_20_GUID: Guid = Guid {
+    data1: 0x8868_E871,
+    data2: 0xE4F1,
+    data3: 0x11D3,
+    data4: [0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81],
+};
+
+/// 在系统表配置数组中找 ACPI 2.0 RSDP（UEFI spec 4.6.2）。
+/// 返回固件提供的 RSDP 指针（物理地址，恒等映射期可直接读）。
+/// OVMF 安装 ACPI_20 表；未找到返回 None（内核侧退化）。
+pub fn find_rsdp(st: &SystemTable) -> Option<*const u8> {
+    let n = st.number_of_table_entries;
+    if n == 0 || st.configuration_table.is_null() {
+        return None;
+    }
+    let table = st.configuration_table as *const ConfigTableEntry;
+    for i in 0..n {
+        let e = unsafe { &*table.add(i) };
+        if e.vendor_guid.data1 == ACPI_20_GUID.data1
+            && e.vendor_guid.data2 == ACPI_20_GUID.data2
+            && e.vendor_guid.data3 == ACPI_20_GUID.data3
+            && e.vendor_guid.data4 == ACPI_20_GUID.data4
+        {
+            let p = e.vendor_table as *const u8;
+            if p.is_null() {
+                return None;
+            }
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// {5B1B31A1-9562-11D2-8E3F-00A0C969723B}，EFI_LOADED_IMAGE_PROTOCOL。
 pub const LOADED_IMAGE_GUID: Guid = Guid {
     data1: 0x5B1B_31A1,

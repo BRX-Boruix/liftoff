@@ -5,8 +5,11 @@
 //! EBS 之后只允许直接硬件 IO（串口 0x3F8）。
 //!
 //! 内存映射转换（UEFI → Limine 语义）：
-//!   CONVENTIONAL / LOADER_CODE / LOADER_DATA → Usable（Limine 把 loader 区计入
-//!   usable——bootloader 已退位）
+//!   LOADER_CODE / LOADER_DATA → BootloaderReclaimable（loader 自占区——响应
+//!   区、内核文件拷贝、页表、RSDP 拷贝都从这类分配；标 usable 会被内核 pmm
+//!   回收后踩踏。Limine 语义：bootloader reclaimable 在内核快照页表根之后
+//!   才可回收，我们的内核 pmm 只把 Usable 计入 free list，安全）
+//!   CONVENTIONAL → Usable
 //!   BOOT_SERVICES_CODE/DATA → Usable（EBS 后固件服务内存释放，规范语义）
 //!   ACPI_RECLAIM → AcpiReclaimable；ACPI_NVS → AcpiNvs
 //!   RUNTIME_* / MMIO / 其他 → Reserved
@@ -25,10 +28,11 @@ use crate::efi;
 fn uefi_to_limine(uefi_type: u32) -> u64 {
     match uefi_type {
         efi::MEM_EFI_CONVENTIONAL
-        | efi::MEM_EFI_LOADER_CODE
-        | efi::MEM_EFI_LOADER_DATA
         | efi::MEM_EFI_BOOT_SERVICES_CODE
         | efi::MEM_EFI_BOOT_SERVICES_DATA => boruix::MEMMAP_USABLE,
+        efi::MEM_EFI_LOADER_CODE | efi::MEM_EFI_LOADER_DATA => {
+            boruix::MEMMAP_BOOTLOADER_RECLAIMABLE
+        }
         efi::MEM_EFI_ACPI_RECLAIM => boruix::MEMMAP_ACPI_RECLAIMABLE,
         efi::MEM_EFI_ACPI_NVS => boruix::MEMMAP_ACPI_NVS,
         _ => boruix::MEMMAP_RESERVED,
@@ -74,14 +78,19 @@ pub fn convert_memmap(
             // 先内核后帧缓冲（区间不重叠：帧缓冲 MMIO 通常不在 conventional；
             // 若重叠，属于固件异常，内核区间优先）。
             if base < k_lo {
-                push(&mut tmp, &mut n, base, k_lo - base, boruix::MEMMAP_USABLE)?;
+                // clamp 到 desc 区间内：k_lo 可能在 base+len 之外（desc 不含
+                // 内核时不截断会产出越界长度、usable 重叠——M5 实锤）。
+                let hi = k_lo.min(base + len);
+                push(&mut tmp, &mut n, base, hi - base, boruix::MEMMAP_USABLE)?;
             }
             if k_hi > k_lo {
                 push(&mut tmp, &mut n, k_lo, k_hi - k_lo, boruix::MEMMAP_KERNEL_AND_MODULES)?;
             }
             let seg_start = k_hi.max(base);
             if seg_start < f_lo {
-                push(&mut tmp, &mut n, seg_start, f_lo - seg_start, boruix::MEMMAP_USABLE)?;
+                // f_lo 也可能越 desc 上界（同上）。
+                let hi = f_lo.min(base + len);
+                push(&mut tmp, &mut n, seg_start, hi - seg_start, boruix::MEMMAP_USABLE)?;
             }
             if f_hi > f_lo {
                 push(&mut tmp, &mut n, f_lo, f_hi - f_lo, boruix::MEMMAP_FRAMEBUFFER)?;
@@ -185,27 +194,43 @@ pub unsafe fn final_ebs_and_jump(
     for i in 0..ndesc.min(128) {
         descs[i] = core::ptr::read(buf.as_ptr().add(i * dsize) as *const efi::MemoryDescriptor);
     }
-    // entries 缓冲：单独 LoaderData 页（ Handover 持指针）。
+    // entries 缓冲：单独 LoaderData 页。布局依据 brxlimine-rs MemmapResponse
+    //   语义（lib.rs 626-627）：entries 是 entry_count 个 POINTERS 的数组
+    //   （ArrayPtr<MemmapEntry> = NonNullPtr<NonNullPtr<T>>），内核逐槽解引用。
+    //   M4 误填结构体连续数组 → 内核把 8B 槽当指针解引用出全垃圾
+    //   （pmm max_phys 4GB / 0x0-0x0 段，boot 轮实锤）。新布局：
+    //   页首 = 指针数组 [ptr; n]，页尾 = 结构体数组 [MemmapEntry; n]，
+    //   指针 = 结构体槽位物理地址 + HHDM。8n + 24n ≤ 4096 → n ≤ 128。
     let mut entries_addr: u64 = 0;
     let st = (bs.allocate_pages)(efi::ALLOCATE_ANY_PAGES, efi::MEMORY_LOADER_DATA, 1, &mut entries_addr);
     if efi::is_error(st) {
         loop { core::arch::asm!("hlt", options(nomem, nostack)); }
     }
     core::slice::from_raw_parts_mut(entries_addr as *mut u8, 4096).fill(0);
-    let entries = entries_addr as *mut boruix::MemmapEntry;
+    // 结构体数组放页尾（向下生长），容量 128。
+    let struct_base = entries_addr + 4096 - 128 * 24;
+    let entries = struct_base as *mut boruix::MemmapEntry;
     let kbase = hd.kaddr.physical_base;
     let klen = hd.file_struct.length;
     // 内核映像区间（物理）
     let kbase_al = kbase & !0x1F_FFFF;
     let kend = (kbase + klen + 0x1F_FFFF) & !0x1F_FFFF;
-    // fb address 已在 main.rs 侧填物理；这里读物理做 memmap 剥离。填给内核前转 HHDM。
-    let fb_base = hd.fb_struct.address as u64;
+    // 帧缓冲物理基址（fb_struct.address 是 HHDM 虚地址——协议语义；剥离必须用
+    // 物理：M5 曾误用虚地址当物理，产出 base=0xffff800080000000 的 Framebuffer
+    // 条目，内核 pmm max_phys 飙到 17TB）。
+    let fb_base = hd.fb_phys;
     let fb_size = if fb_base != 0 { 16 * 1024 * 1024 } else { 0 }; // 保守 16MiB 窗口
     let n = match convert_memmap(&descs[..ndesc.min(128)], entries, 128, kbase_al, kend, fb_base, fb_size) {
         Ok(n) => n,
         Err(_) => 0,
     };
-    hd.memmap.entries = (entries as u64 + boruix::HHDM_OFFSET) as *mut boruix::MemmapEntry;
+    // 指针数组（页首）：第 i 项 = 结构体第 i 项的 HHDM 地址。
+    let ptrs = entries_addr as *mut u64;
+    for i in 0..n {
+        let slot_phys = struct_base + (i as u64) * 24;
+        core::ptr::write(ptrs.add(i), slot_phys + boruix::HHDM_OFFSET);
+    }
+    hd.memmap.entries = (entries_addr + boruix::HHDM_OFFSET) as *mut boruix::MemmapEntry;
     hd.memmap.entry_count = n as u64;
     crate::serial::write(format_args!("[m4] memmap converted n={}\n", n));
 
@@ -217,22 +242,11 @@ pub unsafe fn final_ebs_and_jump(
 
     // 5) EBS（map_key）→ 跳转。EBS 失败重试上限内重取（规范 §7.4 惯例）。
     crate::serial::write(format_args!("[m4] exiting boot services key={:#x}\n", key));
-    for _ in 0..2_000_000u32 {
-        core::arch::asm!("out 0x80, al", out("al") _, options(nomem, nostack, preserves_flags));
-    }
-    crate::serial::write(format_args!("[m4] snapshot window closed\n"));
     for _ in 0..efi::EBS_MAX_RETRIES {
         let status = (bs.exit_boot_services)(crate::efi::image_handle_global(), key);
         if !efi::is_error(status) {
             crate::serial::write(format_args!("[m4] EBS ok, jumping entry={:#x}\n", entry));
-            // DIAG: 跳转机制自检——跳到自写 stub（串口打 'S' 后死循环），验证
-            // GDT/CR3/大页映射链。验证通过后改回 entry。
-            let stub: *mut u8 = 0x300000 as *mut u8;
-            // BA F8 03 (mov dx,0x3F8) B0 53 (mov al,'S') EE (out) FA (cli) F4 (hlt) EB FD (jmp -3)
-            let code: [u8; 10] = [0xBA, 0xF8, 0x03, 0xB0, 0x53, 0xEE, 0xFA, 0xF4, 0xEB, 0xFD];
-            core::ptr::copy_nonoverlapping(code.as_ptr(), stub, code.len());
             jump_kernel(pml4_phys, entry);
-
         }
         // map 已变：重取
         let mut size: usize = buf.len();

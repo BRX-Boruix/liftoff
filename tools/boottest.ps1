@@ -99,6 +99,12 @@ if ($Variant -eq "elf-iso") {
     $autoExpect = @($oracleOut | Where-Object { $_ -match '^M3: ' })
     if ($autoExpect.Count -lt 6) { Write-Output "FAIL: oracle produced too few lines"; exit 2 }
 }
+# boot: full-chain anchors. Each line appears only if a distinct handover
+# stage works: banner (jump), HHDM offset (protocol), RSDP rev=2 (M5 config
+# table), pmm sizing on a sane map (memmap pointer-array semantics).
+if ($Variant -eq "boot") {
+    $autoExpect = @("Hello, BORUIX!", "Kernel M0 is running.", "[mm] HHDM offset: 0xffff800000000000", "[acpi] RSDP rev=2", "LazyBuddy init done")
+}
 
 # EXT2 variants: whole-disk fixture from mkext2.py attached as a plain raw drive.
 # ext: /BOOT/KERNIMG.BIN present; ext-nosig: non-EXT2 blob (magic must fail);

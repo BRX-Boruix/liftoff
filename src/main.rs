@@ -76,6 +76,20 @@ pub extern "efiapi" fn efi_main(
         fatal("boot services signature mismatch", efi::EFI_UNSUPPORTED);
     }
     serial::write(format_args!("[liftoff] boot services ok\n"));
+
+    // M5：RSDP 经配置表传递（UEFI spec 4.6.2 ACPI_20_GUID）。固件源指针只在
+    // 引导服务期可靠（源页类型 AcpiReclaim 会被内核回收），立即拷贝到
+    // LoaderData 永久区；m4_handover 填 RsdpResponse.address（HHDM 虚地址）。
+    match efi::find_rsdp(st) {
+        Some(src) => match copy_rsdp(bs, src) {
+            Ok(dst) => RSDP_COPY.store(dst as usize, core::sync::atomic::Ordering::Release),
+            Err(s) => m4_fail("rsdp copy", s),
+        },
+        None => {
+            // 非致命：内核 acpi::init 对 NULL RSDP 退化（M4 行为）。
+            serial::write(format_args!("[liftoff] RSDP not found in config table\n"));
+        }
+    }
     serial::write(format_args!(
         "[liftoff] contract: kernel={} base_rev={}\n",
         config::KERNEL_PATH, config::LIMINE_BASE_REVISION,
@@ -288,6 +302,34 @@ fn m2b(bs: &efi::BootServices) {
 // ================================ M4
 // 全量交接：响应区 → 扫描填充 → 页表 → GOP → 内存映射 → EBS → 跳 kmain。
 
+
+/// RSDP 拷贝区物理地址（efi_main 写入，m4_handover 读取；单遍引导无并发）。
+static RSDP_COPY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 从固件 RSDP 拷贝到 EfiLoaderData 永久区（长度按 ACPI 规范 offset20 的
+/// length 字段，最小 36；ACPI 1.0 源 20 字节）。返回拷贝区物理地址。
+/// 两阶段读取与内核 arch-x86_64/acpi.rs 同款（S31/S19）。
+fn copy_rsdp(bs: &efi::BootServices, src: *const u8) -> Result<*mut u8, usize> {
+    let rev = unsafe { *src.add(15) };
+    let len = if rev >= 2 {
+        let l = unsafe { core::ptr::read_unaligned(src.add(20) as *const u32) } as usize;
+        l.max(36)
+    } else {
+        20
+    };
+    let pages = (len + 0xFFF) / 0x1000;
+    let mut addr: u64 = 0;
+    let status = unsafe {
+        (bs.allocate_pages)(efi::ALLOCATE_ANY_PAGES, efi::MEMORY_LOADER_DATA, pages, &mut addr)
+    };
+    if efi::is_error(status) {
+        return Err(0xC2);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, addr as *mut u8, len);
+    }
+    Ok(addr as *mut u8)
+}
 /// 把 ELF blob 拷进 EfiLoaderData 永久区（连续单块，File.base 语义）。
 fn copy_persistent(bs: &efi::BootServices, blob: &[u8]) -> Result<*mut u8, usize> {
     let pages = (blob.len() + 0xFFF) / 0x1000;
@@ -359,9 +401,11 @@ fn m4_handover(bs: &efi::BootServices, lr: &elf::LoadResult, file_base: *mut u8,
         .filter(|p| !p.is_null())
         .and_then(|p| unsafe { (&*p).mode.as_ref() });
     // 帧缓冲物理上界（QEMU 的 fb BAR 在 RAM 顶端之外，HHDM 映射必须覆盖）。
+    let mut fb_phys: u64 = 0;
     let mut fb_end: u64 = ram_top;
     if let Some(mode) = fb_mode_ref {
         let fb_base = mode.frame_buffer_base;
+        fb_phys = fb_base;
         fb_end = ((fb_base + 16 * 1024 * 1024) + 0x1F_FFFF) & !0x1F_FFFF;
     }
 
@@ -397,12 +441,16 @@ fn m4_handover(bs: &efi::BootServices, lr: &elf::LoadResult, file_base: *mut u8,
         None => None,
     };
 
-    // 4) RSDP：ACPI 2.0 由 EFI configuration table 找（略——M4 子集：查 config
-//    table 属 RunTimeServices 遍历，内核 ACPI 在 NULL RSDP 时退化为无 ACPI；
-//    QEMU acpi 在 EBS 后也能从 BIOS 区扫到——这里先给 NULL，内核 acpi::init 有
-//    Option 退化。TODO(M5)：configuration table 遍历补全 RSDP 传递。）
-    let rsdp_ptr: *mut u8 = core::ptr::null_mut();
-    let _ = rsdp_ptr;
+    // 4) RSDP：efi_main 已从配置表找到并拷贝（RSDP_COPY）。Limine 语义：
+    //    RsdpResponse.address 是内核可解引用的虚地址 → 填 HHDM 虚地址。
+    //    拷贝区类型 EfiLoaderData → memmap 转换后标 BootloaderReclaimable，
+    //    内核 pmm 不会回收，RSDP 内容在快照前稳定。
+    let rsdp_phys = RSDP_COPY.load(core::sync::atomic::Ordering::Acquire) as u64;
+    let rsdp_ptr: *mut u8 = if rsdp_phys != 0 {
+        (rsdp_phys + boruix::HHDM_OFFSET) as *mut u8
+    } else {
+        core::ptr::null_mut()
+    };
 
     // 5) 响应区（LoaderData 单块）。
     let kernel_len = file_len;
@@ -416,8 +464,9 @@ fn m4_handover(bs: &efi::BootServices, lr: &elf::LoadResult, file_base: *mut u8,
             green_mask_shift: 0, blue_mask_size: 0, blue_mask_shift: 0, reserved: [0; 7],
             edid_size: 0, edid: core::ptr::null_mut(),
         }),
-        core::ptr::null_mut(),
+        rsdp_ptr,
         kphys, kvbase, kernel_len,
+        fb_phys,
     );
     hd.file_struct.base = (file_base as u64 + boruix::HHDM_OFFSET) as *mut u8;
 

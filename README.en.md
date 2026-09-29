@@ -10,11 +10,13 @@ BORUIX's bootloader: reads the kernel ELF under UEFI and hands over control.
 - Reads `/boot/kernel` from an ISO9660 disc (liveCD mode)
 - Passes the memory map, framebuffer, RSDP and SMP information to the kernel
 - x86-64 UEFI only
-- Current status: M4 done. The kernel now boots for real: liftoff validates and loads the ELF64
+- Current status: M5 done. The kernel now boots for real: liftoff validates and loads the ELF64
   image, applies PIE R_X86_64_RELATIVE relocations, hands off the Limine-semantic subset protocol
-  (BaseRevision/HHDM/Memmap/Framebuffer/KernelFile/KernelAddress), builds 4-level huge-page tables,
-  exits boot services and jumps to the kernel — BORUIX kmain runs to completion of its init chain
-  (verified under QEMU/OVMF). Unconsumed requests such as SMP/RSDP are left for later milestones.
+  (BaseRevision/HHDM/Memmap/Framebuffer/RSDP/KernelFile/KernelAddress), builds 4-level huge-page
+  tables, exits boot services and jumps to the kernel — BORUIX kmain runs its full init chain:
+  pmm pool setup, ACPI RSDP-to-XSDT-to-FADT/HPET/S5 parsing, the driver framework and PCI
+  enumeration, all verified under QEMU/OVMF. Unconsumed requests such as SMP are left for later
+  milestones.
 
 ## Known limitations
 
