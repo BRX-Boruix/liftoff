@@ -6,3 +6,4 @@
 /esp/
 *.img
 *.iso
+_commit_msg*.txt
