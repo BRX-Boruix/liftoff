@@ -1,0 +1,8 @@
+# 构建产物
+/target
+
+# UEFI 引导产物
+*.efi
+/esp/
+*.img
+*.iso

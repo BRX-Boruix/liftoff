@@ -1,0 +1,7 @@
+# 统一使用 LF，避免 Windows 上检出为 CRLF 导致的噪音 diff。
+* text=auto eol=lf
+
+# 二进制产物不做换行符转换。
+*.efi binary
+*.img binary
+*.iso binary

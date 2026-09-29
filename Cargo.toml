@@ -1,0 +1,19 @@
+[package]
+name = "liftoff"
+version = "0.1.0"
+edition = "2024"
+description = "BORUIX 引导程序：UEFI 下通过 Limine 协议加载内核"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true
