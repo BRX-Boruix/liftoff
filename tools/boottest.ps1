@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory = $false)][string[]]$Expect = @(),
     [string[]]$NotExpect = @(),
     [int]$TimeoutSec = 45,
-    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot")][string]$Variant = "normal"
+    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot", "mod")][string]$Variant = "normal"
 )
 $ErrorActionPreference = "Stop"
 
@@ -57,7 +57,7 @@ switch ($Variant) {
 # directory (mount ok, open must report not-found).
 $iso = $null
 $media = "fat"
-if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot") {
+if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot" -or $Variant -eq "mod") {
     $media = "iso"
     $payload = Join-Path $liftoff "target\m2b-payload.bin"
     $iso = Join-Path $liftoff "target\m2b.iso"
@@ -83,6 +83,18 @@ if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot") {
         # responses, exits boot services and jumps. Kernel prints its banner.
         $kernelElf = Join-Path $liftoff "target\kernel.elf"
         python (Join-Path $PSScriptRoot "mkiso.py") --kernel $kernelElf --out $iso --volident LIFTOFF_BOOT
+    } elseif ($Variant -eq "mod") {
+        # M8 modules: the payload kernel is the standalone consumer in
+        # tools/modtest (declares BaseRevision + ModuleRequest). Module files
+        # and expectations come from modtest_oracle.py (single source).
+        & (Join-Path $PSScriptRoot "modtest\build.ps1") | Out-Null
+        $payload = Join-Path $liftoff "tools\modtest\modtest.elf"
+        if (-not (Test-Path $payload)) { Write-Output "FAIL: modtest kernel build failed"; exit 2 }
+        python (Join-Path $PSScriptRoot "modtest_oracle.py") --fixtures (Join-Path $liftoff "target") | Out-Null
+        $alpha = Join-Path $liftoff "target\mod-alpha.bin"
+        $beta = Join-Path $liftoff "target\mod-beta.bin"
+        python (Join-Path $PSScriptRoot "mkiso.py") --kernel $payload --out $iso --volident LIFTOFF_M8 `
+            --extra "MODULES/ALPHA.BIN=$alpha" --extra "MODULES/BETA.BIN=$beta" | Out-Null
     } elseif ($Variant -eq "elf-iso") {
         # Real kernel ELF packed as KERNEL/KERNIMG.BIN; expectations derive from
         # elf_oracle.py at run time (the ELF changes with every kernel rebuild).
@@ -104,6 +116,13 @@ if ($Variant -eq "elf-iso") {
 # table), pmm sizing on a sane map (memmap pointer-array semantics).
 if ($Variant -eq "boot") {
     $autoExpect = @("Hello, BORUIX!", "Kernel M0 is running.", "[mm] HHDM offset: 0xffff800000000000", "[acpi] RSDP rev=2", "LazyBuddy init done", "[smp] BSP lapic_id=0", "[smp] fired AP lapic_id=1", "[smp] AP online, lapic_id=1")
+}
+if ($Variant -eq "mod") {
+    # M8: expectations are derived by the oracle from the same fixture bytes
+    # that mkiso packs (module paths/lengths/sums/cmdlines).
+    $oracleOut = python (Join-Path $PSScriptRoot "modtest_oracle.py") --fixtures (Join-Path $liftoff "target") 2>&1 | ForEach-Object { $_.ToString() }
+    $autoExpect = @($oracleOut | Where-Object { $_ -match '^MOD: ' } | ForEach-Object { $_.Substring(5) })
+    if ($autoExpect.Count -lt 8) { Write-Output "FAIL: modtest oracle produced too few lines"; exit 2 }
 }
 
 # EXT2 variants: whole-disk fixture from mkext2.py attached as a plain raw drive.

@@ -15,6 +15,15 @@ pub const TEST_FILE: &str = "m2a.txt";
 /// 未来 xorriso 生成的真实 liveCD 沿用此布局与大小写不敏感匹配。
 pub const ISO_KERNEL_PATH: &str = "KERNEL/KERNIMG.BIN";
 
+/// M8 模块清单（路径, 命令行）——`limine.cfg` 的编译期等价物。
+///
+/// 语义：仅当内核映像声明了 Limine ModuleRequest 标记时才会加载（见
+/// `boruix::has_request`）；路径对 ISO 与 EXT2 两条链共用，按各自介质
+/// 的大小写规则匹配。当前为 M8 验收 fixture 布局。
+pub const MODULES: &[(&str, &str)] = &[
+    ("/MODULES/ALPHA.BIN", "role=alpha"),
+    ("/MODULES/BETA.BIN", "role=beta"),
+];
 /// M2c 阶段 EXT2 内的内核路径（fixture 布局：/BOOT/KERNIMG.BIN）。
 /// 未来 mke2fs 生成的安装镜像沿用此布局。
 pub const EXT_KERNEL_PATH: &str = "BOOT/KERNIMG.BIN";

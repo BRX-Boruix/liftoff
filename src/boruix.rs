@@ -26,6 +26,9 @@ pub const FRAMEBUFFER_ID: [u64; 2] = [0x9d5827dcd881dd75, 0xa3148604f6fab11b];
 pub const RSDP_ID: [u64; 2] = [0xc5e77b6b397e7b43, 0x27637845accdcf3c];
 pub const KERNEL_FILE_ID: [u64; 2] = [0xad97e90e83f1ed67, 0x31eb5d1c5ff23b69];
 pub const KERNEL_ADDRESS_ID: [u64; 2] = [0x71ba76863cc55f63, 0xb2644a48c516a487];
+/// 模块请求 id（brxlimine-rs lib.rs 689 make_struct!）。
+pub const MODULE_ID: [u64; 2] = [0x3e7e279702be32af, 0xca1c4f3bd1280cee];
+
 /// SMP 请求 id（brxlimine-rs lib.rs 584 make_struct!）。
 pub const SMP_ID: [u64; 2] = [0x95a67b819a1b857e, 0xa0b61b723b6a73e0];
 
@@ -164,6 +167,17 @@ pub struct SmpResponse {
 
 const _: () = assert!(core::mem::size_of::<SmpResponse>() == 32);
 
+/// ModuleResponse（brxlimine-rs lib.rs 674）：模块即 File（同 KernelFile 的 File），
+/// `modules` 是 module_count 个 **File 指针** 的数组（ArrayPtr 语义）。
+#[repr(C)]
+pub struct ModuleResponse {
+    pub revision: u64,
+    pub module_count: u64,
+    pub modules: *mut *mut File,
+}
+
+const _: () = assert!(core::mem::size_of::<ModuleResponse>() == 24);
+
 /// media_type：Limine 语义（内核 main.rs LIMINE_MEDIA_*）。
 pub const MEDIA_OPTICAL: u32 = 1;
 
@@ -186,6 +200,11 @@ pub struct Handover {
     pub smp: SmpResponse,
     pub smp_infos: *mut SmpInfo,
     pub smp_ptrs: *mut *mut SmpInfo,
+    pub modules: ModuleResponse,
+    /// 模块 File 结构数组（物理地址；load 时填充）。
+    pub module_files: *mut File,
+    /// 模块 File 指针数组（物理地址；内核解引用为 HHDM 虚地址）。
+    pub module_ptrs: *mut *mut File,
 }
 
 impl Handover {
@@ -240,6 +259,9 @@ impl Handover {
             },
             smp_infos: core::ptr::null_mut(),
             smp_ptrs: core::ptr::null_mut(),
+            modules: ModuleResponse { revision: 0, module_count: 0, modules: core::ptr::null_mut() },
+            module_files: core::ptr::null_mut(),
+            module_ptrs: core::ptr::null_mut(),
         }
     }
 }
@@ -300,6 +322,14 @@ pub unsafe fn fill_requests(
         } else if [rid0, rid1] == KERNEL_ADDRESS_ID {
             *slot = (&mut handover.kaddr as *mut KernelAddressResponse as u64) + HHDM_OFFSET;
             filled += 1;
+        } else if [rid0, rid1] == MODULE_ID {
+            // 模块 File/指针数组由 modules::load_from_iso 在 EBS 前填好（仅当
+            // 内核声明本请求时才会加载；BORUIX 不声明 → 零行为变化）。
+            if !handover.module_ptrs.is_null() {
+                handover.modules.modules = (handover.module_ptrs as u64 + HHDM_OFFSET) as *mut *mut File;
+            }
+            *slot = (&mut handover.modules as *mut ModuleResponse as u64) + HHDM_OFFSET;
+            filled += 1;
         } else if [rid0, rid1] == SMP_ID {
             // cpus 指针数组 + SmpInfo 数组由 smp 模块在 kick 前填好。
             handover.smp.cpus = (handover.smp_ptrs as u64 + HHDM_OFFSET) as *mut *mut SmpInfo;
@@ -312,6 +342,29 @@ pub unsafe fn fill_requests(
     }
 }
 
+/// 扫描内核映像是否声明了指定请求标记（COMMON_MAGIC + id 的 48B 标记）。
+/// M8 用于判定是否要加载模块：内核不声明 → 不读、不分配、零行为变化。
+///
+/// SAFETY：image_base..image_base+image_size 必须是已装载的内核映像区间。
+pub unsafe fn has_request(image_base: u64, image_size: u64, id: [u64; 2]) -> bool {
+    let image = unsafe { core::slice::from_raw_parts(image_base as *const u8, image_size as usize) };
+    let mut off = 0usize;
+    while off + 32 <= image.len() {
+        let m0 = u64::from_le_bytes(image[off..off + 8].try_into().unwrap());
+        let m1 = u64::from_le_bytes(image[off + 8..off + 16].try_into().unwrap());
+        if m0 == COMMON_MAGIC[0] && m1 == COMMON_MAGIC[1] {
+            let i0 = u64::from_le_bytes(image[off + 16..off + 24].try_into().unwrap());
+            let i1 = u64::from_le_bytes(image[off + 24..off + 32].try_into().unwrap());
+            if i0 == id[0] && i1 == id[1] {
+                return true;
+            }
+            off += 48;
+            continue;
+        }
+        off += 8;
+    }
+    false
+}
 /// BaseRevision 特殊处理：id 前缀不同于请求标记（无 COMMON_MAGIC），
 /// 结构是 id(16) + revision(8) = 24B；支持的 revision 原位写 0。
 ///

@@ -283,7 +283,13 @@ pub unsafe fn final_ebs_and_jump(
     // 4) 内核映像里扫描请求标记（image_base 是物理；EBS 前恒等映射还活着——
     //    直接物理地址访问）。
     let filled = boruix::fill_requests(hd.kaddr.physical_base, hd.file_struct.length, hd);
-    let base_ok = boruix::fill_base_revision(hd.kaddr.physical_base, hd.file_struct.length, 0); // rev 0 基线
+    // BaseRevision：请求版本 ≤ 我们声明的协议版本时原位写 0（0 = 支持，见
+    // brxlimine-rs `BaseRevision::is_supported`）；超出则保持非 0 表示不支持。
+    let base_ok = boruix::fill_base_revision(
+        hd.kaddr.physical_base,
+        hd.file_struct.length,
+        crate::config::LIMINE_BASE_REVISION,
+    );
     crate::serial::write(format_args!("[m4] requests filled={} baserev={}\n", filled, base_ok));
 
     // 5) EBS（map_key）→ 跳转。EBS 失败重试上限内重取（规范 §7.4 惯例）。

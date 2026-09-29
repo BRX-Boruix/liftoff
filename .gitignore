@@ -10,3 +10,4 @@ _commit_m*.txt
 _m*.txt
 __pycache__/
 tools/_qmp_*.py
+tools/modtest/*.elf

@@ -15,6 +15,7 @@ mod elf;
 mod ext2;
 mod handover;
 mod iso9660;
+mod modules;
 mod paging;
 mod serial;
 mod smp;
@@ -267,12 +268,24 @@ fn m2b(bs: &efi::BootServices) {
                 match elf::load(blob.as_slice(), bs) {
                     Ok(lr) => {
                         report_load(&lr);
+                        // M8: 只有声明了 ModuleRequest 的内核才加载模块
+                        // （BORUIX 不声明 → 不读文件、不分配，行为零变化）。
+                        let mods = if unsafe {
+                            boruix::has_request(lr.image_base, lr.image_size, boruix::MODULE_ID)
+                        } {
+                            match modules::load_from_iso(bs, &vol, &mut dev) {
+                                Ok(m) => m,
+                                Err(s) => m4_fail("modules", s),
+                            }
+                        } else {
+                            modules::LoadedModules::EMPTY
+                        };
                         // M4: 全量交接（BORUIX v1）。
                         // 1) ELF 文件原始内容拷到 LoaderData 永久区（File.base 语义；
                         //    PoolBuf 是 BootServicesData，EBS 后不可依赖）。
                         match copy_persistent(bs, blob.as_slice()) {
                             Ok(file_base) => {
-                                m4_handover(bs, &lr, file_base, n as u64);
+                                m4_handover(bs, &lr, file_base, n as u64, mods);
                             }
                             Err(s) => m4_fail("persist blob", s),
                         }
@@ -362,7 +375,13 @@ fn m4_fail(what: &str, code: usize) -> ! {
 }
 
 /// 全量交接主链。调用后不返回（成功跳内核；失败停机）。
-fn m4_handover(bs: &efi::BootServices, lr: &elf::LoadResult, file_base: *mut u8, file_len: u64) -> ! {
+fn m4_handover(
+    bs: &efi::BootServices,
+    lr: &elf::LoadResult,
+    file_base: *mut u8,
+    file_len: u64,
+    mods: modules::LoadedModules,
+) -> ! {
     serial::write(format_args!("[m4] handover begin\n"));
 
     // 0) 内核几何：物理落位 + 高链接 vbase（来自 ELF vbase）。
@@ -480,6 +499,10 @@ fn m4_handover(bs: &efi::BootServices, lr: &elf::LoadResult, file_base: *mut u8,
         fb_phys,
     );
     // 5c) SMP 区指针（SmpInfo 在页首，指针数组在页 +256）。
+    // M8: 模块响应（内核未声明请求时 count=0、指针为空）。
+    hd.module_files = mods.files;
+    hd.module_ptrs = mods.ptrs;
+    hd.modules.module_count = mods.count as u64;
     hd.smp_infos = smp_page as *mut boruix::SmpInfo;
     hd.smp_ptrs = (smp_page + 256) as *mut *mut boruix::SmpInfo;
     hd.file_struct.base = (file_base as u64 + boruix::HHDM_OFFSET) as *mut u8;
