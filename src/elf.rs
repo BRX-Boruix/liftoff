@@ -58,6 +58,8 @@ pub mod err {
     pub const BAD_PHDR: usize = 0x35;
     pub const SEG_TOO_BIG: usize = 0x36;
     pub const NO_LOAD: usize = 0x37;
+    /// PIE 重定位处理失败（无 PT_DYNAMIC/DT_RELA 越界/类型非 RELATIVE）。
+    pub const NO_RELA: usize = 0x3A;
     pub const OVERLAP: usize = 0x38;
     pub const ALLOC_FAIL: usize = 0x39;
 }
@@ -204,20 +206,23 @@ pub fn load(blob: &[u8], bs: &efi::BootServices) -> Result<LoadResult, usize> {
 
     let image_size = max_end - min_vaddr;
     let pages = ((image_size + PAGE_SIZE - 1) / PAGE_SIZE) as usize;
-
-    // 连续物理映像：单次 AllocateAnyPages（§7.2 返回连续页块）。
-    let mut image_base: u64 = 0;
+    // 2MB 对齐预留：多分配 512 页，取块内 2MB 对齐子区（大页要求物理 2MB 对齐，
+    // AllocateAnyPages 只保证 4KiB 对齐——不对齐会让切 CR3 后首个内核页取指 #PF）。
+    const HUGE_ALIGN_PAGES: usize = 512; // 512*4KiB = 2MiB
+    let alloc_pages = pages + HUGE_ALIGN_PAGES;
+    let mut alloc_base: u64 = 0;
     let status = unsafe {
         (bs.allocate_pages)(
             efi::ALLOCATE_ANY_PAGES,
             efi::MEMORY_LOADER_DATA,
-            pages,
-            &mut image_base,
+            alloc_pages,
+            &mut alloc_base,
         )
     };
     if efi::is_error(status) {
         return Err(err::ALLOC_FAIL);
     }
+    let image_base = (alloc_base + 0x1F_FFFF) & !0x1F_FFFF;
 
     // 映像区整体清零（空洞与 BSS 同源，杜绝陈旧内存泄漏进内核）。
     let image = unsafe {
@@ -244,6 +249,116 @@ pub fn load(blob: &[u8], bs: &efi::BootServices) -> Result<LoadResult, usize> {
         total_sum = total_sum.wrapping_add(sum);
     }
 
+
+    // 第三遍：PIE 重定位（R_X86_64_RELATIVE）。内核是 DYN/PIE（readelf Type:
+    // DYN），.rela.dyn 3138 条 RELATIVE——GOT/字面量槽在文件里为 0，约定由
+    // loader 填（brxLimine elf.c 916..1039 同款）。不做此步，kmain 的
+    // `mov rsp,[rip+..]` 读 __kstack_top 得 0 → rsp=0 → push #PF
+    // （CR2=0xfffffffffffffff8，QMP 抓拍实锤）。
+    // 高半链接（vbase=0xffffffff80000000）恒等装载时 load_bias=0，
+    // 槽值 = addend（即链接期符号虚地址）。
+    if e_type == ET_DYN {
+        const PT_DYNAMIC: u32 = 2;
+        const DT_NULL: u64 = 0;
+        const DT_RELA: u64 = 7;
+        const DT_RELASZ: u64 = 8;
+        const DT_RELAENT: u64 = 9;
+        const R_X86_64_RELATIVE: u64 = 8;
+        let mut dyn_va: u64 = 0;
+        let mut dyn_sz: u64 = 0;
+        for i in 0..e_phnum as usize {
+            let ph = parse_phdr(blob, e_phoff as usize + i * PHDR_SIZE)?;
+            if ph.p_type == PT_DYNAMIC {
+                dyn_va = ph.p_vaddr;
+                dyn_sz = ph.p_filesz;
+                break;
+            }
+        }
+        if dyn_va == 0 || dyn_sz == 0 {
+            return Err(err::NO_RELA);
+        }
+        let mut dyn_rel: u64 = 0;
+        let mut found = false;
+        for i in 0..n_loads {
+            let ph = &loads[i];
+            if dyn_va >= ph.p_vaddr && dyn_va + dyn_sz <= ph.p_vaddr + ph.p_memsz {
+                dyn_rel = dyn_va - min_vaddr;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(err::NO_RELA);
+        }
+        // 3b) 解析 dynamic 数组（16B/项：tag+val）。
+        let dynb = &image[dyn_rel as usize..(dyn_rel + dyn_sz) as usize];
+        let mut rela_va: u64 = 0;
+        let mut relasz: u64 = 0;
+        let mut relaent: u64 = 0;
+        let mut k = 0usize;
+        while k + 16 <= dynb.len() {
+            let tag = u64::from_le_bytes(dynb[k..k + 8].try_into().unwrap());
+            if tag == DT_NULL {
+                break;
+            }
+            let val = u64::from_le_bytes(dynb[k + 8..k + 16].try_into().unwrap());
+            if tag == DT_RELA {
+                rela_va = val;
+            } else if tag == DT_RELASZ {
+                relasz = val;
+            } else if tag == DT_RELAENT {
+                relaent = val;
+            }
+            k += 16;
+        }
+        if rela_va == 0 || relasz == 0 || relaent != 24 {
+            return Err(err::NO_RELA);
+        }
+        // rela_va（链接 va）→ image 内偏移。
+        let mut rela_rel: u64 = 0;
+        let mut found = false;
+        for i in 0..n_loads {
+            let ph = &loads[i];
+            if rela_va >= ph.p_vaddr && rela_va + relasz <= ph.p_vaddr + ph.p_memsz {
+                rela_rel = rela_va - min_vaddr;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(err::NO_RELA);
+        }
+        // 3c) 逐条 RELATIVE：slot(image_base+r_offset-vbase) = addend。
+        // relab 借用 image（不可变）与写回冲突——全部走裸指针（单线程引导期，
+        // rela 区与 slot 区可能重叠无法拆借用）。
+        let image_ptr = image.as_mut_ptr();
+        let relab = unsafe {
+            core::slice::from_raw_parts(image_ptr.add(rela_rel as usize), relasz as usize)
+        };
+        let mut o = 0usize;
+        while o + 24 <= relab.len() {
+            let r_offset = u64::from_le_bytes(relab[o..o + 8].try_into().unwrap());
+            let r_info = u64::from_le_bytes(relab[o + 8..o + 16].try_into().unwrap());
+            if r_info & 0xFFFF_FFFF == R_X86_64_RELATIVE {
+                let addend = u64::from_le_bytes(relab[o + 16..o + 24].try_into().unwrap());
+                if r_offset < min_vaddr {
+                    return Err(err::NO_RELA);
+                }
+                let slot_rel = r_offset - min_vaddr;
+                if slot_rel + 8 > image.len() as u64 {
+                    return Err(err::NO_RELA);
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        addend.to_le_bytes().as_ptr(),
+                        image_ptr.add(slot_rel as usize),
+                        8,
+                    );
+                }
+            }
+            o += relaent as usize;
+        }
+    }
     Ok(LoadResult {
         image_base,
         image_size,

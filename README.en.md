@@ -10,17 +10,18 @@ BORUIX's bootloader: reads the kernel ELF under UEFI and hands over control.
 - Reads `/boot/kernel` from an ISO9660 disc (liveCD mode)
 - Passes the memory map, framebuffer, RSDP and SMP information to the kernel
 - x86-64 UEFI only
-- Current status: M3 done. An ELF64 loader is implemented: once the optical chain reads the kernel
-  ELF, it validates, allocates one contiguous physical image, places segments with BSS zeroing,
-  and reports the layout and checksums on serial (expectations derived by tools/elf_oracle.py).
-  Next: M4, ExitBootServices and protocol handoff.
+- Current status: M4 done. The kernel now boots for real: liftoff validates and loads the ELF64
+  image, applies PIE R_X86_64_RELATIVE relocations, hands off the Limine-semantic subset protocol
+  (BaseRevision/HHDM/Memmap/Framebuffer/KernelFile/KernelAddress), builds 4-level huge-page tables,
+  exits boot services and jumps to the kernel — BORUIX kmain runs to completion of its init chain
+  (verified under QEMU/OVMF). Unconsumed requests such as SMP/RSDP are left for later milestones.
 
 ## Known limitations
 
 - No BIOS boot
 - No Multiboot 1/2, Linux, or chainload support
 - No boot menu; the boot entry is a single fixed kernel
-- The kernel ELF must be statically linked
+- The kernel ELF must be a statically linked PIE (relocations handled by the bootloader)
 
 ## Building
 

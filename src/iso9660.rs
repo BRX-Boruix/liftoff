@@ -58,14 +58,34 @@ impl BlockRead for UefiBlock<'_> {
         if blocks == 0 {
             return Ok(());
         }
-        let mut tmp = PoolBuf::new(self.bs, blocks * bs as usize)?;
-        // SAFETY: tmp 缓冲来自本次分配，read_blocks 按块填入。
-        let status = unsafe { (self.bio.read_blocks)(self.bio, self.media_id, first, tmp.len(), tmp.as_slice().as_mut_ptr()) };
-        if efi::is_error(status) {
-            return Err(status);
+        // 大读拆窗（≤32 块/次，64KB@2KB 块）：OVMF 的 ATAPI DMA 对超大单次
+        // 传输会挂起——M4 boot 变体读 4.3MB 内核时实测（240s 无返回）。
+        const MAX_BLOCKS_PER_CALL: usize = 32;
+        let mut done = 0usize; // 已复制的字节数
+        let mut block = first;
+        while done < buf.len() {
+            let want = buf.len() - done;
+            // 尾窗不越过媒体最后一块（read_blocks 越界返回 INVALID_PARAMETER）。
+            let last_block = unsafe { (*self.bio.media).last_block };
+            let span_blocks = (((want + bs as usize - 1) / bs as usize) + 1)
+                .min(MAX_BLOCKS_PER_CALL)
+                .min((last_block - block + 1) as usize);
+            let span_bytes = span_blocks * bs as usize;
+            let mut tmp = PoolBuf::new(self.bs, span_bytes)?;
+            // SAFETY: tmp 缓冲来自本次分配，read_blocks 按块填入。
+            let status = unsafe {
+                (self.bio.read_blocks)(self.bio, self.media_id, block, span_bytes, tmp.as_slice().as_mut_ptr())
+            };
+            if efi::is_error(status) {
+                return Err(status);
+            }
+            // 本窗口内属于 buf 的字节区间：首块可能有 skip（仅首窗）。
+            let src_off = if done == 0 { (off - first * bs) as usize } else { 0 };
+            let take = (span_bytes - src_off).min(want);
+            buf[done..done + take].copy_from_slice(&tmp.as_slice()[src_off..src_off + take]);
+            done += take;
+            block += span_blocks as u64;
         }
-        let skip = (off - first * bs) as usize;
-        buf.copy_from_slice(&tmp[skip..skip + buf.len()]);
         Ok(())
     }
 }

@@ -8,11 +8,14 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod boruix;
 mod config;
 mod efi;
 mod elf;
 mod ext2;
+mod handover;
 mod iso9660;
+mod paging;
 mod serial;
 
 use core::panic::PanicInfo;
@@ -56,6 +59,8 @@ pub extern "efiapi" fn efi_main(
     image_handle: efi::Handle,
     system_table: *mut core::ffi::c_void,
 ) -> usize {
+    // M4：EBS 需要句柄，入口单点登记（此后只读）。
+    unsafe { efi::set_image_handle(image_handle) };
     serial::init();
     serial::write(format_args!("[liftoff] M2b entry\n"));
 
@@ -219,8 +224,7 @@ fn m2b(bs: &efi::BootServices) {
         };
         let ok = Str64::from("M2B: mount ok");
         contract(&ok);
-
-
+    
         match vol.open_path(bs, &mut dev, config::ISO_KERNEL_PATH) {
             Ok(f) => {
                 let mut blob = match iso9660::PoolBuf::new(bs, ISO_BUF) {
@@ -246,7 +250,18 @@ fn m2b(bs: &efi::BootServices) {
 
                 // M3: 装载内核 ELF（读到什么装什么——验收链路对内容形状闭环）。
                 match elf::load(blob.as_slice(), bs) {
-                    Ok(lr) => report_load(&lr),
+                    Ok(lr) => {
+                        report_load(&lr);
+                        // M4: 全量交接（BORUIX v1）。
+                        // 1) ELF 文件原始内容拷到 LoaderData 永久区（File.base 语义；
+                        //    PoolBuf 是 BootServicesData，EBS 后不可依赖）。
+                        match copy_persistent(bs, blob.as_slice()) {
+                            Ok(file_base) => {
+                                m4_handover(bs, &lr, file_base, n as u64);
+                            }
+                            Err(s) => m4_fail("persist blob", s),
+                        }
+                    }
                     Err(s) => {
                         let mut l = Str64::new();
                         let _ = l.push_str("M3: reject status=0x");
@@ -268,6 +283,171 @@ fn m2b(bs: &efi::BootServices) {
     // 未找到任何可挂载的 ISO 卷：0x11 是 iso9660 模块"探测失败"内部码。
     let fail = Str64::from("M2B: mount failed status=0x11");
     contract(&fail);
+}
+
+// ================================ M4
+// 全量交接：响应区 → 扫描填充 → 页表 → GOP → 内存映射 → EBS → 跳 kmain。
+
+/// 把 ELF blob 拷进 EfiLoaderData 永久区（连续单块，File.base 语义）。
+fn copy_persistent(bs: &efi::BootServices, blob: &[u8]) -> Result<*mut u8, usize> {
+    let pages = (blob.len() + 0xFFF) / 0x1000;
+    let mut addr: u64 = 0;
+    let status = unsafe {
+        (bs.allocate_pages)(efi::ALLOCATE_ANY_PAGES, efi::MEMORY_LOADER_DATA, pages, &mut addr)
+    };
+    if efi::is_error(status) {
+        return Err(0xC0);
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(blob.as_ptr(), addr as *mut u8, blob.len());
+    }
+    Ok(addr as *mut u8)
+}
+
+/// M4 契约行（m4 前缀区别于 M3）。
+fn m4_fail(what: &str, code: usize) -> ! {
+    let mut l = Str64::new();
+    let _ = l.push_str("M4: fail ");
+    let _ = l.push_str(what);
+    let _ = l.push_str(" 0x");
+    push_byte_hex(&mut l, code as u8);
+    contract(&l);
+    // M4 失败即交接失败，无退路：停机（串口已记录）。
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+    }
+}
+
+/// 全量交接主链。调用后不返回（成功跳内核；失败停机）。
+fn m4_handover(bs: &efi::BootServices, lr: &elf::LoadResult, file_base: *mut u8, file_len: u64) -> ! {
+    serial::write(format_args!("[m4] handover begin\n"));
+
+    // 0) 内核几何：物理落位 + 高链接 vbase（来自 ELF vbase）。
+    let kphys = lr.image_base;
+    let kvbase = lr.vbase;
+    let ksize = (lr.image_size + 0x1F_FFFF) & !0x1F_FFFF; // 2MB 对齐向上
+
+    // 1) RAM 上界：装内核时只分配了一块；完整 RAM 图要等 GetMemoryMap。
+    //    页表覆盖用保守上界：先取一次内存映射（EBS 前可重取），取 CONVENTIONAL
+    //    最大 physical_start+pages*4096。
+    let mut probe = [0u8; efi::MEMMAP_BUF_SIZE];
+    let (probe_map, probe_key, probe_desc_size) = match get_memory_map(bs, &mut probe) {
+        Ok(x) => x,
+        Err(s) => m4_fail("GetMemoryMap probe", s),
+    };
+    let _ = probe_key;
+    let mut ram_top: u64 = 0;
+    for i in 0..probe_map.len() / probe_desc_size {
+        let d = unsafe { &*(probe_map.as_ptr().add(i * probe_desc_size) as *const efi::MemoryDescriptor) };
+        if d.mem_type == efi::MEM_EFI_CONVENTIONAL {
+            let top = d.physical_start + d.number_of_pages * 4096;
+            if top > ram_top {
+                ram_top = top;
+            }
+        }
+    }
+    // 2MB 对齐向上（页表大页粒度）
+    ram_top = (ram_top + 0x1F_FFFF) & !0x1F_FFFF;
+    if ram_top == 0 {
+        m4_fail("no conventional ram", 0xC1);
+    }
+    serial::write(format_args!("[m4] ram_top={:#x}\n", ram_top));
+
+    // 3) GOP 帧缓冲（非致命：内核 framebuffer response 为 NULL 时走退化）。
+    let fb = efi::locate_protocol::<efi::GraphicsOutput>(bs, &efi::GOP_GUID).ok();
+    let fb_mode_ref: Option<&efi::GraphicsOutputMode> = fb
+        .filter(|p| !p.is_null())
+        .and_then(|p| unsafe { (&*p).mode.as_ref() });
+    // 帧缓冲物理上界（QEMU 的 fb BAR 在 RAM 顶端之外，HHDM 映射必须覆盖）。
+    let mut fb_end: u64 = ram_top;
+    if let Some(mode) = fb_mode_ref {
+        let fb_base = mode.frame_buffer_base;
+        fb_end = ((fb_base + 16 * 1024 * 1024) + 0x1F_FFFF) & !0x1F_FFFF;
+    }
+
+    // 2) 页表（恒等 + LAPIC + HHDM(含 fb) + 内核高区）。必须知道 fb 端界后再建。
+    let tables = match paging::build(bs, ram_top, fb_end, kphys, ksize, kvbase) {
+        Ok(t) => t,
+        Err(s) => m4_fail("paging", s),
+    };
+    serial::write(format_args!("[m4] pml4={:#x}\n", tables.pml4_phys));
+    let mut handover_data = match fb_mode_ref {
+        Some(mode) => {
+            let info = unsafe { &*mode.info };
+            let fbstruct = boruix::Framebuffer {
+                // Limine 语义：address 是 HHDM 虚地址（内核直接解引用）。
+                address: (mode.frame_buffer_base + boruix::HHDM_OFFSET) as *mut u8,
+                width: info.horizontal_resolution as u64,
+                height: info.vertical_resolution as u64,
+                pitch: (info.pixels_per_scan_line * 4) as u64,
+                bpp: 32,
+                memory_model: 1, // RGB
+                red_mask_size: 8,
+                red_mask_shift: if info.pixel_format == efi::PIXEL_BGRX { 16 } else { 0 },
+                green_mask_size: 8,
+                green_mask_shift: 8,
+                blue_mask_size: 8,
+                blue_mask_shift: if info.pixel_format == efi::PIXEL_BGRX { 0 } else { 16 },
+                reserved: [0; 7],
+                edid_size: 0,
+                edid: core::ptr::null_mut(),
+            };
+            Some(fbstruct)
+        }
+        None => None,
+    };
+
+    // 4) RSDP：ACPI 2.0 由 EFI configuration table 找（略——M4 子集：查 config
+//    table 属 RunTimeServices 遍历，内核 ACPI 在 NULL RSDP 时退化为无 ACPI；
+//    QEMU acpi 在 EBS 后也能从 BIOS 区扫到——这里先给 NULL，内核 acpi::init 有
+//    Option 退化。TODO(M5)：configuration table 遍历补全 RSDP 传递。）
+    let rsdp_ptr: *mut u8 = core::ptr::null_mut();
+    let _ = rsdp_ptr;
+
+    // 5) 响应区（LoaderData 单块）。
+    let kernel_len = file_len;
+    let mut hd = boruix::Handover::build(
+        crate::boruix::HHDM_OFFSET,
+        core::ptr::null_mut(), // memmap entries 由 EBS 前最后一张图填充
+        0,
+        handover_data.take().unwrap_or_else(|| boruix::Framebuffer {
+            address: core::ptr::null_mut(), width: 0, height: 0, pitch: 0, bpp: 0,
+            memory_model: 0, red_mask_size: 0, red_mask_shift: 0, green_mask_size: 0,
+            green_mask_shift: 0, blue_mask_size: 0, blue_mask_shift: 0, reserved: [0; 7],
+            edid_size: 0, edid: core::ptr::null_mut(),
+        }),
+        core::ptr::null_mut(),
+        kphys, kvbase, kernel_len,
+    );
+    hd.file_struct.base = (file_base as u64 + boruix::HHDM_OFFSET) as *mut u8;
+
+    // 6) 最终内存映射 + 填充 + 扫描 + EBS + 跳转（EBS 后无串口日志）。
+    unsafe {
+        handover::final_ebs_and_jump(bs, &mut hd, tables.pml4_phys, handover_entry_phys(lr));
+    }
+}
+
+/// entry 物理地址 = entry 虚地址 - vbase + phys_base。
+fn handover_entry_phys(lr: &elf::LoadResult) -> u64 {
+    lr.entry - lr.vbase + lr.image_base
+}
+
+/// 取内存映射（单次，缓冲预分配）。返回 (切片, map_key, desc_size)。
+fn get_memory_map<'a>(
+    bs: &efi::BootServices,
+    buf: &'a mut [u8],
+) -> Result<(&'a [u8], usize, usize), usize> {
+    let mut size: usize = buf.len();
+    let mut key: usize = 0;
+    let mut dsize: usize = 0;
+    let mut dver: u32 = 0;
+    let status = unsafe {
+        (bs.get_memory_map)(&mut size, buf.as_mut_ptr(), &mut key, &mut dsize, &mut dver)
+    };
+    if efi::is_error(status) {
+        return Err(0xC2);
+    }
+    Ok((&buf[..size], key, dsize))
 }
 
 /// M3 装载报告：把 LoadResult 逐行打成串口契约行（与 elf_oracle.py 同源）。

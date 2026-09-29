@@ -10,16 +10,18 @@ BORUIX 的引导程序：在 UEFI 环境下读取内核 ELF 并交接控制权�
 - 从 ISO9660 光盘读取 `/boot/kernel`，对应 liveCD 模式
 - 将内存映射、帧缓冲、RSDP、SMP 信息交给内核
 - 仅支持 x86-64 UEFI
-- 当前状态：M3 完成。ELF64 装载器已实现：光盘链读到内核 ELF 后完成校验、
-  连续物理映像分配、段落位与 BSS 清零，串口报告段布局与校验和（期望值由
-  tools/elf_oracle.py 同源计算）。下一步 M4：ExitBootServices + 协议交接。
+- 当前状态：M4 完成。内核已可真实引导：liftoff 完成 ELF64 校验装载、PIE
+  R_X86_64_RELATIVE 重定位、Limine 语义子集协议交接（BaseRevision/HHDM/
+  Memmap/Framebuffer/KernelFile/KernelAddress）、4 级大页页表与
+  ExitBootServices，跳转内核后 BORUIX kmain 正常运行（驱动/内存/调度全链
+  已在 QEMU/OVMF 实机验证）。SMP/RSDP 等未消费请求留待后续里程碑。
 
 ## 已知限制
 
 - 不支持 BIOS 引导
 - 不支持 Multiboot 1/2、Linux、chainload 等其它引导协议
 - 不提供启动菜单，启动项固定为单一内核
-- 内核 ELF 须为静态链接
+- 内核 ELF 须为静态链接的 PIE（重定位由 bootloader 处理）
 
 ## 构建
 

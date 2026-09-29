@@ -20,6 +20,25 @@ use core::ffi::c_void;
 /// EFI_SUCCESS。
 pub const EFI_SUCCESS: usize = 0;
 
+/// 本映像的 UEFI 句柄（efi_main 入口单点写入，EBS 时经 image_handle_global 读）。
+/// 引导期单核串行执行，无并发面。
+static mut IMAGE_HANDLE: Handle = core::ptr::null_mut();
+// 上面的 mutable static 读取在 2024 edition 需 unsafe 块——读口已包。
+
+/// 单点登记（efi_main 首行调用）。
+/// # Safety
+/// 仅 efi_main 在其他任何 UEFI 调用前调用一次。
+pub unsafe fn set_image_handle(h: Handle) {
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(IMAGE_HANDLE), h);
+    }
+}
+
+/// EBS 需要的句柄读取口（handover 模块唯一消费者）。
+pub fn image_handle_global() -> Handle {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(IMAGE_HANDLE)) }
+}
+
 /// 错误位：EFI_STATUS 最高位。
 pub const EFI_ERROR_BIT: usize = 0x8000_0000_0000_0000;
 
@@ -494,4 +513,119 @@ pub fn wide_nul<'a>(s: &str, buf: &'a mut [Char16]) -> Option<&'a [Char16]> {
     }
     buf[n] = 0;
     Some(&buf[..n + 1])
+}
+// ---------------------------------------------------------------- GOP（M4）
+
+/// EFI_GRAPHICS_OUTPUT_PROTOCOL（§11.9；3 槽 = 24 字节，Blt 槽不消费不声明
+/// —— 不行，repr(C) 截断会错位：GOP 是 QueryMode/SetMode/Mode/Blt 四槽，
+/// 全部声明才能保证 Mode 偏移 16 正确）。
+#[repr(C)]
+pub struct GraphicsOutput {
+    pub query_mode: unsafe extern "efiapi" fn(
+        this: &GraphicsOutput, mode_number: u32, size_of_info: *mut usize, info: *mut *mut GraphicsOutputModeInfo,
+    ) -> usize,
+    pub set_mode: unsafe extern "efiapi" fn(this: &GraphicsOutput, mode_number: u32) -> usize,
+    pub blt: unsafe extern "efiapi" fn(
+        this: &GraphicsOutput, buffer: *mut c_void, op: u32, sx: usize, sy: usize, dx: usize, dy: usize, w: usize, h: usize, delta: usize,
+    ) -> usize,
+    /// 规范槽位序：QueryMode/SetMode/Blt/Mode —— mode 在 24（首轮错排成 16，
+    /// 断言拦不下（结构大小不变），运行期 info 指针读出垃圾才暴露）。
+    pub mode: *mut GraphicsOutputMode,
+}
+
+const _: () = assert!(core::mem::size_of::<GraphicsOutput>() == 32);
+const _: () = assert!(core::mem::offset_of!(GraphicsOutput, mode) == 24);
+
+/// EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE（§11.9）。
+#[repr(C)]
+pub struct GraphicsOutputMode {
+    pub max_mode: u32,
+    pub mode: u32,
+    pub info: *mut GraphicsOutputModeInfo,
+    pub size_of_info: usize,
+    pub frame_buffer_base: u64,
+    pub frame_buffer_size: u64,
+}
+
+const _: () = assert!(core::mem::offset_of!(GraphicsOutputMode, frame_buffer_base) == 24);
+const _: () = assert!(core::mem::size_of::<GraphicsOutputMode>() == 40);
+
+/// EFI_GRAPHICS_OUTPUT_MODE_INFORMATION（§11.9）。
+#[repr(C)]
+pub struct GraphicsOutputModeInfo {
+    pub version: u32,
+    pub horizontal_resolution: u32,
+    pub vertical_resolution: u32,
+    /// EFI_GRAPHICS_PIXEL_FORMAT：RGBX=0 BGRX=1 BitMask=2 BltOnly=3。
+    pub pixel_format: u32,
+    /// EFI_PIXEL_BITMASK。
+    pub pixel_information: [u32; 4],
+    pub pixels_per_scan_line: u32,
+}
+
+// version(4)+hres(4)+vres(4)+format(4)+bitmask(16)+scanline(4) = 36，对齐 4 无尾垫。
+const _: () = assert!(core::mem::size_of::<GraphicsOutputModeInfo>() == 36);
+
+/// pixel_format 常量（§11.9）。
+pub const PIXEL_RGBX: u32 = 0;
+pub const PIXEL_BGRX: u32 = 1;
+pub const PIXEL_BITMASK: u32 = 2;
+pub const PIXEL_BLT_ONLY: u32 = 3;
+
+/// GOP GUID {9042A9DE-23DC-4A38-96FB-7ADED080516A}（§11.9）。
+pub const GOP_GUID: Guid = Guid {
+    data1: 0x9042A9DE,
+    data2: 0x23DC,
+    data3: 0x4A38,
+    data4: [0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A],
+};
+
+// ---------------------------------------------------------------- 内存映射与 EBS（M4）
+
+/// EBS 失败重试上限（§7.4：失败后 map 可能失效，须重取重试）。
+pub const EBS_MAX_RETRIES: usize = 4;
+
+/// 内存映射缓冲：OVMF 实测约 60..90 项 × 40B，64KiB 留 10 倍余量。
+pub const MEMMAP_BUF_SIZE: usize = 64 * 1024;
+
+/// EFI_MEMORY_DESCRIPTOR 消费切片（§7.2）＝ 40 字节。
+#[repr(C)]
+pub struct MemoryDescriptor {
+    pub mem_type: u32,
+    pub _pad: u32,
+    pub physical_start: u64,
+    pub virtual_start: u64,
+    pub number_of_pages: u64,
+    pub attribute: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<MemoryDescriptor>() == 40);
+
+/// EFI_MEMORY_TYPE（§7.2）。
+pub const MEM_EFI_RESERVED: u32 = 0;
+pub const MEM_EFI_LOADER_CODE: u32 = 1;
+pub const MEM_EFI_LOADER_DATA: u32 = 2;
+pub const MEM_EFI_BOOT_SERVICES_CODE: u32 = 3;
+pub const MEM_EFI_BOOT_SERVICES_DATA: u32 = 4;
+pub const MEM_EFI_RUNTIME_SERVICES_CODE: u32 = 5;
+pub const MEM_EFI_RUNTIME_SERVICES_DATA: u32 = 6;
+pub const MEM_EFI_CONVENTIONAL: u32 = 7;
+pub const MEM_EFI_UNUSABLE: u32 = 8;
+pub const MEM_EFI_ACPI_RECLAIM: u32 = 9;
+pub const MEM_EFI_ACPI_NVS: u32 = 10;
+pub const MEM_EFI_MEMORY_MAPPED_IO: u32 = 11;
+pub const MEM_EFI_MEMORY_MAPPED_IO_PORT: u32 = 12;
+pub const MEM_EFI_PAL_CODE: u32 = 13;
+pub const MEM_EFI_PERSISTENT: u32 = 14;
+/// LocateProtocol 单协议定位（§7.3；BootServices.locate_protocol 槽位）。
+/// 返回协议实例指针（不存活校验——固件保证）。
+pub fn locate_protocol<T>(bs: &BootServices, guid: &Guid) -> Result<*mut T, usize> {
+    let mut out: *mut c_void = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.locate_protocol)(guid as *const Guid as *const c_void, core::ptr::null_mut(), &mut out)
+    };
+    if is_error(status) {
+        return Err(status);
+    }
+    Ok(out as *mut T)
 }

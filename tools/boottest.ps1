@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory = $false)][string[]]$Expect = @(),
     [string[]]$NotExpect = @(),
     [int]$TimeoutSec = 45,
-    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad")][string]$Variant = "normal"
+    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot")][string]$Variant = "normal"
 )
 $ErrorActionPreference = "Stop"
 
@@ -57,7 +57,7 @@ switch ($Variant) {
 # directory (mount ok, open must report not-found).
 $iso = $null
 $media = "fat"
-if ($Variant -like "iso*" -or $Variant -like "elf-*") {
+if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot") {
     $media = "iso"
     $payload = Join-Path $liftoff "target\m2b-payload.bin"
     $iso = Join-Path $liftoff "target\m2b.iso"
@@ -78,6 +78,11 @@ if ($Variant -like "iso*" -or $Variant -like "elf-*") {
         (New-Object Random 99).NextBytes($blob)
         [System.IO.File]::WriteAllBytes($payload, $blob)
         python (Join-Path $PSScriptRoot "mkiso.py") --kernel $payload --out $iso --volident BADELF
+    } elseif ($Variant -eq "boot") {
+        # Full handover: real kernel ELF, liftoff builds paging + BORUIX v1
+        # responses, exits boot services and jumps. Kernel prints its banner.
+        $kernelElf = Join-Path $liftoff "target\kernel.elf"
+        python (Join-Path $PSScriptRoot "mkiso.py") --kernel $kernelElf --out $iso --volident LIFTOFF_BOOT
     } elseif ($Variant -eq "elf-iso") {
         # Real kernel ELF packed as KERNEL/KERNIMG.BIN; expectations derive from
         # elf_oracle.py at run time (the ELF changes with every kernel rebuild).
