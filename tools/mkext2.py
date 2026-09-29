@@ -1,34 +1,38 @@
 #!/usr/bin/env python3
 """Deterministic EXT2 fixture builder for liftoff acceptance tests.
 
-Layout (1 KiB blocks, rev 1, inode size 128, single block group):
-  block 0        boot pad (1024 B)
-  block 1        superblock (at byte offset 1024)
-  block 2        group descriptor table
-  block 3        block bitmap (unused by liftoff, left zero)
-  block 4        inode bitmap (unused by liftoff, left zero)
-  block 5..6     inode table (16 inodes)
-  block 7..      directory blocks, then indirect tables, then file data
+Layout (1 KiB blocks, rev 1, inode size 128, **multi-group**):
+  block 0            boot pad (1024 B)
+  block 1            superblock (at byte offset 1024)
+  block 2            group descriptor table (one 32 B entry per group)
+  block 3..          per group: block bitmap, inode bitmap, inode table (2 blocks)
+  then               directory blocks, indirect tables, file data
+
+Multi-group metadata matters because the kernel mounts the boot partition
+read-write in install mode: build_skeleton allocates inodes and blocks, so the
+bitmaps, per-group free counts and the group descriptors must describe reality
+(zeroed bitmaps made the kernel stop before printing its install-mode root line).
 
 M10: arbitrary single-level tree via --extra ISO/PATH=HOST_FILE.
-M13: files up to ~64 MiB (direct 12 + single indirect 256 + double indirect 256^2)
-so a real 8.9 MiB kernel can live on the fixture, plus min_blocks for sizing the
-filesystem inside a partition.
-All bytes deterministic; identical inputs give identical images.
+M13: double indirect blocks (files up to ~64 MiB) so a real 8.9 MiB kernel fits,
+and min_blocks to size the filesystem inside a partition.
+All bytes deterministic for a given input.
 """
 import struct, argparse
 
 BS = 1024
 EXT2_MAGIC = 0xEF53
 INODE_SIZE = 128
-INODES = 16
-INODE_TABLE_BLOCKS = (INODES * INODE_SIZE + BS - 1) // BS
-BLOCK_BITMAP = 3
-INODE_BITMAP = 4
-INODE_TABLE = 5
-DATA_START = INODE_TABLE + INODE_TABLE_BLOCKS
+
+# EXT2 经典约束：块位图必须装进一个块 → 每组块数 ≤ 8 × 块大小（1KiB 块 → 8192）。
+BLOCKS_PER_GROUP = 8192
+INODES_PER_GROUP = 16
+INODE_TABLE_BLOCKS = (INODES_PER_GROUP * INODE_SIZE + BS - 1) // BS
+GROUP_META_BLOCKS = 2 + INODE_TABLE_BLOCKS          # 块位图 + inode 位图 + inode 表
+GDT_BLOCK = 2
+FIRST_META_BLOCK = 3
 DIRECT = 12
-MIN_DISK_BLOCKS = 2048  # 2 MiB floor, keeps the M2c fixture size stable
+MIN_DISK_BLOCKS = 2048
 
 
 def de(name: str, ino: int, ft: int, rec: int) -> bytes:
@@ -62,6 +66,10 @@ def build(kernel: bytes, extras, flat: bool = False, min_blocks: int = MIN_DISK_
     for d, n, data in extras:
         dirs.setdefault(d, []).append((n, data))
 
+    groups = max(1, (min_blocks + BLOCKS_PER_GROUP - 1) // BLOCKS_PER_GROUP)
+    data_start = FIRST_META_BLOCK + groups * GROUP_META_BLOCKS
+    inodes_count = groups * INODES_PER_GROUP
+
     # Inode assignment: 2 = root, then dirs and files in sorted order.
     ino_of = {"": 2}
     next_ino = 11
@@ -73,17 +81,13 @@ def build(kernel: bytes, extras, flat: bool = False, min_blocks: int = MIN_DISK_
         for n, _ in sorted(dirs[d]):
             file_ino[(d, n)] = next_ino
             next_ino += 1
-    assert next_ino <= INODES + 1, "too many inodes for the fixture"
+    assert next_ino <= inodes_count + 1, "too many inodes for the fixture"
 
-    # Block assignment: directory blocks first, then indirect tables, then data.
-    used_blocks = set(range(DATA_START))
-    used_inodes = set(range(1, next_ino))   # inode 1 保留（坏块），2..next_ino-1 已用   # 0 引导垫 / 1 SB / 2 GDT / 3 块位图 / 4 inode 位图 / 5.. inode 表
+    # Block assignment: directory blocks, then indirect tables, then data.
+    cur = data_start
     dir_blocks = {}
-    cur = DATA_START
-    order = [""] + sorted(dirs)
-    for d in order:
+    for d in [""] + sorted(dirs):
         dir_blocks[d] = cur
-        used_blocks.add(cur)
         cur += 1
     ind_block = {}
     dind_block = {}
@@ -105,13 +109,22 @@ def build(kernel: bytes, extras, flat: bool = False, min_blocks: int = MIN_DISK_
                 cur += nl1
             data_blocks[key] = list(range(cur, cur + nb))
             cur += nb
-            used_blocks.update(data_blocks[key])
-            if key in ind_block:
-                used_blocks.add(ind_block[key])
-            if key in dind_block:
-                used_blocks.add(dind_block[key])
-                used_blocks.update(dind_l1[key])
     total_blocks = max(cur, min_blocks)
+    if (total_blocks + BLOCKS_PER_GROUP - 1) // BLOCKS_PER_GROUP != groups:
+        raise SystemExit("fixture outgrew its block-group count")
+
+    # 占用集合：元数据块 + 目录块 + 间接表 + 数据块；inode 1 保留（坏块）。
+    used_blocks = set(range(data_start))
+    used_blocks.update(dir_blocks.values())
+    for key, blocks in data_blocks.items():
+        used_blocks.update(blocks)
+        if key in ind_block:
+            used_blocks.add(ind_block[key])
+        if key in dind_block:
+            used_blocks.add(dind_block[key])
+            used_blocks.update(dind_l1[key])
+    used_inodes = set(range(1, next_ino))
+
     img = bytearray(total_blocks * BS)
 
     def w32(off, v):
@@ -122,43 +135,52 @@ def build(kernel: bytes, extras, flat: bool = False, min_blocks: int = MIN_DISK_
 
     # Superblock @1024
     sb = BS
-    w32(sb + 0, INODES)                 # s_inodes_count
-    w32(sb + 4, total_blocks)           # s_blocks_count
-    w32(sb + 20, 1)                     # s_first_data_block
-    w32(sb + 24, 0)                     # s_log_block_size (1024)
-    w32(sb + 28, 0)                     # s_log_frag_size
-    w32(sb + 32, 8192)                  # s_blocks_per_group
-    w32(sb + 40, 1024)                  # s_inodes_per_group
-    w16(sb + 56, EXT2_MAGIC)
-    w32(sb + 76, 1)                     # s_rev_level
-    w16(sb + 88, INODE_SIZE)
+    w32(sb + 0, inodes_count)                 # s_inodes_count
+    w32(sb + 4, total_blocks)                 # s_blocks_count
     w32(sb + 12, total_blocks - len(used_blocks))   # s_free_blocks_count
-    w32(sb + 16, INODES - len(used_inodes))         # s_free_inodes_count
+    w32(sb + 16, inodes_count - len(used_inodes))   # s_free_inodes_count
+    w32(sb + 20, 1)                           # s_first_data_block
+    w32(sb + 24, 0)                           # s_log_block_size (1024)
+    w32(sb + 28, 0)                           # s_log_frag_size
+    w32(sb + 32, BLOCKS_PER_GROUP)            # s_blocks_per_group
+    w32(sb + 40, INODES_PER_GROUP)            # s_inodes_per_group
+    w16(sb + 56, EXT2_MAGIC)
+    w32(sb + 76, 1)                           # s_rev_level
+    w16(sb + 88, INODE_SIZE)
 
-    # Group descriptor table @block 2
-    gd = 2 * BS
-    w32(gd + 0, BLOCK_BITMAP)
-    w32(gd + 4, INODE_BITMAP)
-    w32(gd + 8, INODE_TABLE)
-
-    # 位图与空闲计数：内核安装模式把启动分区**读写**挂为根，build_skeleton 会在
-    # 其上创建骨架目录（分配 inode/块）。位图全零会让分配器看到「全部空闲」——
-    # 与真实 mkfs 镜像不一致，实测内核在挂根前即停住。此处按实际占用写位图。
-    bb = bytearray(BS)
-    for b in used_blocks:
-        bb[b // 8] |= 1 << (b % 8)
-    img[BLOCK_BITMAP * BS:(BLOCK_BITMAP + 1) * BS] = bb
-    ib = bytearray(BS)
-    for i in used_inodes:
-        ib[(i - 1) // 8] |= 1 << ((i - 1) % 8)
-    img[INODE_BITMAP * BS:(INODE_BITMAP + 1) * BS] = ib
-    w16(gd + 12, total_blocks - len(used_blocks))   # bg_free_blocks_count
-    w16(gd + 14, INODES - len(used_inodes))         # bg_free_inodes_count
-
-    itab = INODE_TABLE * BS
+    # 组描述符表（每组 32 B）与各组位图 / 空闲计数。
+    for g in range(groups):
+        goff = GDT_BLOCK * BS + g * 32
+        bb = FIRST_META_BLOCK + g * GROUP_META_BLOCKS
+        w32(goff + 0, bb)                     # bg_block_bitmap
+        w32(goff + 4, bb + 1)                 # bg_inode_bitmap
+        w32(goff + 8, bb + 2)                 # bg_inode_table
+        gstart = g * BLOCKS_PER_GROUP
+        gend = min(gstart + BLOCKS_PER_GROUP, total_blocks)
+        used_b = sum(1 for b in used_blocks if gstart <= b < gend)
+        w16(goff + 12, (gend - gstart) - used_b)
+        lo = g * INODES_PER_GROUP + 1
+        hi = (g + 1) * INODES_PER_GROUP
+        used_i = sum(1 for i in used_inodes if lo <= i <= hi)
+        w16(goff + 14, INODES_PER_GROUP - used_i)
+        bm = bytearray(BS)
+        for b in used_blocks:
+            if gstart <= b < gstart + BLOCKS_PER_GROUP:
+                i = b - gstart
+                bm[i // 8] |= 1 << (i % 8)
+        img[bb * BS:(bb + 1) * BS] = bm
+        im = bytearray(BS)
+        for i in used_inodes:
+            if lo <= i <= hi:
+                j = i - lo
+                im[j // 8] |= 1 << (j % 8)
+        img[(bb + 1) * BS:(bb + 2) * BS] = im
 
     def inode(ino: int) -> int:
-        return itab + (ino - 1) * INODE_SIZE
+        g = (ino - 1) // INODES_PER_GROUP
+        idx = (ino - 1) % INODES_PER_GROUP
+        table = FIRST_META_BLOCK + g * GROUP_META_BLOCKS + 2
+        return table * BS + idx * INODE_SIZE
 
     def write_dir_inode(ino: int, size: int, block: int):
         off = inode(ino)
@@ -195,14 +217,12 @@ def build(kernel: bytes, extras, flat: bool = False, min_blocks: int = MIN_DISK_
             start = i * BS
             img[off_b:off_b + len(data[start:start + BS])] = data[start:start + BS]
 
-    # Root inode + root directory
+    # 根目录与各子目录
     write_dir_inode(2, BS, dir_blocks[""])
     root_entries = [(".", 2, 2), ("..", 2, 2)]
     for d in sorted(dirs):
         root_entries.append((d, ino_of[d], 2))
     img[dir_blocks[""] * BS:(dir_blocks[""] + 1) * BS] = pack_dir(root_entries)
-
-    # Subdirectories + files
     for d in sorted(dirs):
         write_dir_inode(ino_of[d], BS, dir_blocks[d])
         entries = [(".", ino_of[d], 2), ("..", 2, 2)]
