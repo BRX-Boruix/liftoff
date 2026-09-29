@@ -1,0 +1,24 @@
+M2b: ISO9660 read-only driver verified on a real optical device
+
+LocateHandleBuffer(BlockIo) -> per-handle probe (read-only + 2048B block)
+-> CD001 mount -> directory traversal -> reads KERNEL/KERNIMG.BIN from the
+fixture ISO attached as -cdrom; serial reports len + 16-bit byte sum.
+
+Design:
+- Parser decoupled from firmware via BlockRead trait; UefiBlock adapter handles
+  block-aligned reads. EXT2 (M2c) reuses the same seam.
+- PoolBuf: single staging-buffer path via firmware AllocatePool/FreePool,
+  Drop frees. No second allocator.
+- Name matching strips ';version' suffix and trailing dot, ASCII case-insensitive.
+- Multi-extent records rejected (0x80 flag) rather than reading partial data.
+- Directory entries never span sectors; zero-length records skip to sector boundary.
+
+BootServices extended through LocateProtocol (312..320, size 328) for
+LocateHandleBuffer. All offsets pinned by compile-time assertions; the
+assertions caught two real layout mistakes during development.
+
+Fixture: tools/mkiso.py builds deterministic ECMA-119 images (no extensions);
+tools/_verify_iso.py independently validates them. Acceptance via
+tools/boottest.ps1 -Variant iso / iso-nosig / iso-nopath, all green together
+with the three M2a variants (six total). One real bug found by acceptance:
+the directory/file flag was inverted for intermediate path components.

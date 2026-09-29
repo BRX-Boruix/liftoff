@@ -7,7 +7,7 @@
 //! 字段会使声明截断点之后的布局失真，后续成员无法继续追加。allow 只覆盖
 //! 结构体字段（随里程碑逐步启用），不覆盖任何函数；每个里程碑结束时
 //! 用到的字段必须真的被读到，否则属于死代码。
-//! BootServices 只声明到 ExitBootServices（偏移 232..240）：其后的
+//! BootServices 声明到 LocateProtocol（偏移 320..328，size 328）：再往后的
 //! InstallMultipleProtocolInterfaces / UninstallMultipleProtocolInterfaces
 //! 是 C 变参函数，Rust 的 efiapi ABI 无法声明，触及对应能力时再以
 //! 裸地址 + 手工调用约定处理。
@@ -132,9 +132,49 @@ pub struct BootServices {
         unsafe extern "efiapi" fn(image: Handle, status: usize, exit_size: usize, exit_data: *mut Char16) -> usize,
     pub unload_image: unsafe extern "efiapi" fn(image: Handle) -> usize,
     pub exit_boot_services: unsafe extern "efiapi" fn(image: Handle, map_key: usize) -> usize,
+
+    // 杂项服务（§7.8-7.9）
+    pub get_next_monotonic_count: unsafe extern "efiapi" fn(count: *mut u64) -> usize,
+    pub stall: unsafe extern "efiapi" fn(microseconds: usize),
+    pub set_watchdog_timer: unsafe extern "efiapi" fn(
+        watchdog_timeout: usize, watchdog_code: u64, data_size: usize, watchdog_data: *mut Char16,
+    ) -> usize,
+
+    // 控制器与协议打开（§7.10-7.11）
+    pub connect_controller: unsafe extern "efiapi" fn(
+        controller: Handle, driver_image: Handle, remaining_device_path: *mut c_void, recursive: bool,
+    ) -> usize,
+    pub disconnect_controller:
+        unsafe extern "efiapi" fn(controller: Handle, driver_image: Handle, child: Handle) -> usize,
+    pub open_protocol: unsafe extern "efiapi" fn(
+        handle: Handle,
+        protocol: *const c_void,
+        out_interface: *mut *mut c_void,
+        agent: Handle,
+        controller: Handle,
+        attributes: u32,
+    ) -> usize,
+    pub close_protocol:
+        unsafe extern "efiapi" fn(handle: Handle, protocol: *const c_void, agent: Handle, controller: Handle) -> usize,
+    pub open_protocol_information: unsafe extern "efiapi" fn(
+        handle: Handle, protocol: *const c_void, entry_buffer: *mut *mut c_void, entry_count: *mut usize,
+    ) -> usize,
+    pub protocols_per_handle: unsafe extern "efiapi" fn(
+        handle: Handle, protocol_buffer: *mut *mut *mut Guid, protocol_buffer_count: *mut usize,
+    ) -> usize,
+    pub locate_handle_buffer: unsafe extern "efiapi" fn(
+        search_type: u32,
+        protocol: *const c_void,
+        search_key: *mut c_void,
+        no_handles: *mut usize,
+        buffer: *mut *mut Handle,
+    ) -> usize,
+    pub locate_protocol: unsafe extern "efiapi" fn(
+        protocol: *const c_void, registration: *mut c_void, out_interface: *mut *mut c_void,
+    ) -> usize,
 }
 
-const _: () = assert!(core::mem::size_of::<BootServices>() == 240);
+const _: () = assert!(core::mem::size_of::<BootServices>() == 328);
 
 // ---------------------------------------------------------------- 控制台输出
 
@@ -232,6 +272,13 @@ pub const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid {
     data3: 0x11D2,
     data4: [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
 };
+/// {964E5B21-6459-11D2-8E39-00A0C969723B}，EFI_BLOCK_IO_PROTOCOL。
+pub const BLOCK_IO_GUID: Guid = Guid {
+    data1: 0x964E_5B21,
+    data2: 0x6459,
+    data3: 0x11D2,
+    data4: [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+};
 
 // ---------------------------------------------------------------- 镜像与文件
 
@@ -268,6 +315,9 @@ pub struct SimpleFileSystem {
 }
 
 const _: () = assert!(core::mem::size_of::<SimpleFileSystem>() == 16);
+
+/// EFI_LOCATE_SEARCH_TYPE：ByProtocol（枚举值 2）。
+pub const SEARCH_BY_PROTOCOL: u32 = 2;
 
 /// Open 的打开模式：只读。
 /// （完整集合：READ=1 | WRITE=2 | CREATE=0x8000_0000_0000_0000，§13.2）
@@ -315,6 +365,89 @@ impl Drop for FileGuard {
             unsafe {
                 ((*self.0).close)(&*self.0);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 块设备
+
+/// EFI_BLOCK_IO_MEDIA（§13.9，x64 布局）。
+///
+/// 字段顺序即规范定义：MediaId(u32) 后是 5 个 BOOLEAN(u8) 再 BlockSize，
+/// 编译期断言钉死 LogicalPartition 的偏移——M2b 的光驱判定依赖 ReadOnly
+/// 与 BlockSize==2048，M4 的 BootSource 依赖 LogicalPartition。
+#[repr(C)]
+pub struct BlockIoMedia {
+    pub media_id: u32,
+    pub removable_media: bool,
+    pub media_present: bool,
+    pub logical_partition: bool,
+    pub read_only: bool,
+    pub write_caching: bool,
+    pub block_size: u32,
+    pub io_align: u32,
+    pub last_block: u64,
+    // revision 2/3 扩展字段（LowestAlignedLba 等）本工程未触达，不声明；
+    // 但 Media 结构由固件分配，读取止于 last_block 是安全的。
+}
+
+const _: () = assert!(core::mem::offset_of!(BlockIoMedia, logical_partition) == 6);
+const _: () = assert!(core::mem::offset_of!(BlockIoMedia, read_only) == 7);
+const _: () = assert!(core::mem::offset_of!(BlockIoMedia, block_size) == 12);
+const _: () = assert!(core::mem::offset_of!(BlockIoMedia, last_block) == 24);
+
+/// EFI_BLOCK_IO_PROTOCOL（§13.9，revision + media 指针 + 4 成员 = 48 字节）。
+#[repr(C)]
+pub struct BlockIo {
+    pub revision: u64,
+    pub media: *mut BlockIoMedia,
+    pub reset: unsafe extern "efiapi" fn(this: &BlockIo, extended_verification: bool) -> usize,
+    pub read_blocks: unsafe extern "efiapi" fn(
+        this: &BlockIo, media_id: u32, lba: u64, buffer_size: usize, buffer: *mut u8,
+    ) -> usize,
+    pub write_blocks: unsafe extern "efiapi" fn(
+        this: &BlockIo, media_id: u32, lba: u64, buffer_size: usize, buffer: *const u8,
+    ) -> usize,
+    pub flush_blocks: unsafe extern "efiapi" fn(this: &BlockIo) -> usize,
+}
+
+const _: () = assert!(core::mem::size_of::<BlockIo>() == 48);
+
+/// 固件池句柄缓冲守卫（S18）：包住 LocateHandleBuffer 返回的缓冲。
+/// Drop 即 FreePool；句柄数与缓冲同生共死，不暴露裸指针让调用方自理。
+pub struct HandleBuffer<'a> {
+    bs: &'a BootServices,
+    handles: &'a mut [Handle],
+    raw: *mut c_void,
+}
+
+impl<'a> HandleBuffer<'a> {
+    /// 打包 LocateHandleBuffer 的两个出参。缓冲为空属固件异常，返回 None。
+    /// # Safety
+    /// buf 必须是本次 no_handles 对应的固件池缓冲，未做其他别名。
+    pub unsafe fn wrap(
+        bs: &'a BootServices,
+        raw: *mut c_void,
+        no_handles: usize,
+    ) -> Option<HandleBuffer<'a>> {
+        if raw.is_null() {
+            return None;
+        }
+        let handles = unsafe { core::slice::from_raw_parts_mut(raw as *mut Handle, no_handles) };
+        Some(HandleBuffer { bs, handles, raw })
+    }
+
+    pub fn handles(&self) -> &[Handle] {
+        self.handles
+    }
+}
+
+impl Drop for HandleBuffer<'_> {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            // 释放失败无恢复路径：缓冲区只读，固件表若损坏，后续调用同样会失败。
+            // （M4 引入内存映射后重审。）
+            unsafe { (self.bs.free_pool)(self.raw) };
         }
     }
 }

@@ -11,6 +11,10 @@ pub const KERNEL_PATH: &str = "/boot/kernel";
 /// 验收脚本 boottest.ps1 以同名常量生成内容并预计算校验和。
 pub const TEST_FILE: &str = "m2a.txt";
 
+/// M2b 阶段 ISO 内的内核路径（fixture 布局：/KERNEL/KERNIMG.BIN）。
+/// 未来 xorriso 生成的真实 liveCD 沿用此布局与大小写不敏感匹配。
+pub const ISO_KERNEL_PATH: &str = "KERNEL/KERNIMG.BIN";
+
 // ----------------------------------------------------------------
 // 引导协议（阶段一：复用 Limine 协议）
 //

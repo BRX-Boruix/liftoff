@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory = $true)][string[]]$Expect,
     [string[]]$NotExpect = @(),
     [int]$TimeoutSec = 45,
-    [ValidateSet("normal", "missing", "empty")][string]$Variant = "normal"
+    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath")][string]$Variant = "normal"
 )
 $ErrorActionPreference = "Stop"
 
@@ -50,6 +50,30 @@ switch ($Variant) {
     "empty"   { [System.IO.File]::WriteAllBytes($fixture, [byte[]]@()) }
 }
 
+# ISO9660 variants: build the fixture ISO with the project's own deterministic
+# builder (mkiso.py) and attach it as -cdrom. iso-nosig is a non-ISO blob (the
+# CD001 probe must fail); iso-nopath is a valid ISO whose root has no KERNEL
+# directory (mount ok, open must report not-found).
+$iso = $null
+$media = "fat"
+if ($Variant -like "iso*") {
+    $media = "iso"
+    $payload = Join-Path $liftoff "target\m2b-payload.bin"
+    $iso = Join-Path $liftoff "target\m2b.iso"
+    if ($Variant -eq "iso") {
+        [System.IO.File]::WriteAllBytes($payload, [System.Text.Encoding]::ASCII.GetBytes("LIFTOFF-M2B-KERNEL" + [char]10 + "0123456789ABCDEF" + [char]10))
+        python (Join-Path $PSScriptRoot "mkiso.py") --kernel $payload --out $iso --volident LIFTOFF_M2B
+    } elseif ($Variant -eq "iso-nosig") {
+        $blob = New-Object byte[] 65536
+        (New-Object Random 20260215).NextBytes($blob)
+        [System.IO.File]::WriteAllBytes($iso, $blob)
+    } elseif ($Variant -eq "iso-nopath") {
+        [System.IO.File]::WriteAllBytes($payload, [System.Text.Encoding]::ASCII.GetBytes("LIFTOFF-M2B-KERNEL" + [char]10 + "0123456789ABCDEF" + [char]10))
+        python (Join-Path $PSScriptRoot "mkiso.py") --kernel $payload --out $iso --volident EMPTYROOT --flat
+    }
+    if (-not (Test-Path $iso)) { Write-Output "FAIL: iso fixture not built"; exit 2 }
+}
+
 $log = Join-Path $liftoff "target\serial.log"
 $qerr = Join-Path $liftoff "target\qemu.err.log"
 Remove-Item $log, $qerr -ErrorAction SilentlyContinue
@@ -62,6 +86,7 @@ $qargs = @(
     "-display", "none",
     "-no-reboot"
 )
+if ($media -eq "iso") { $qargs = @("-cdrom", $iso) + $qargs }
 $p = Start-Process -FilePath $qemuExe -ArgumentList $qargs -PassThru -RedirectStandardError $qerr
 try {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
