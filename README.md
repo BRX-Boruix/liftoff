@@ -15,7 +15,7 @@ BORUIX 的引导程序：在 UEFI 环境下读取内核 ELF 并交接控制权�
 
 ## 当前状态
 
-M11 完成。两条启动链、模块与多核均已在 QEMU/OVMF 上端到端验证（16 个变体回归全绿）：
+M12 完成。两条启动链、模块、多核与 x2APIC 均已在 QEMU/OVMF 上端到端验证：
 
 - **liveCD**（ISO9660）：`boot` 变体 —— 内核全链；
 - **安装模式**（MBR 分区 + EXT2）：`ext-boot` 变体 —— 读取盘上 24.6 MB 内核
@@ -23,9 +23,11 @@ M11 完成。两条启动链、模块与多核均已在 QEMU/OVMF 上端到端�
   并把该 EXT2 分区挂为根；
 - **模块**：`mod`（ISO）与 `ext-mod`（EXT2）—— 同一份清单、同一装配逻辑，
   仅当内核声明 `ModuleRequest` 时按需加载；
-- **多核**：`smp4` 变体（`-smp 4`）—— 3 个 AP 全部由 liftoff 启动并被内核接管。
+- **多核**：`smp4` 变体（`-smp 4`）—— 3 个 AP 全部由 liftoff 启动并被内核接管；
+- **x2APIC**：`x2apic` 变体（`-cpu qemu64,+x2apic -smp 4`）—— CPU 支持时切到 MSR
+  访问、以 `SmpResponse.flags` bit0 告知内核，4 核仍全部上线；默认 CPU 无 x2APIC 时
+  自动回退 MMIO（`smp4` 变体即覆盖回退路径）。
 
-x2APIC 属内核侧同步项（内核 LAPIC 目前只有 MMIO 路径），因此目前只走 xAPIC。
 
 ## 已知限制
 
@@ -53,7 +55,8 @@ liftoff、liftoff 真的把内核送起来，断言才会通过。
 
 ```
 pwsh tools/boottest.ps1 -Variant boot      # liveCD 全链（-smp 2）
-pwsh tools/boottest.ps1 -Variant smp4      # 4 核全部上线
+pwsh tools/boottest.ps1 -Variant smp4      # 4 核全部上线（xAPIC 回退路径）
+pwsh tools/boottest.ps1 -Variant x2apic    # 4 核 + x2APIC（-cpu qemu64,+x2apic）
 pwsh tools/boottest.ps1 -Variant mod       # 模块（ISO）
 pwsh tools/boottest.ps1 -Variant ext-mod   # 模块（EXT2）
 pwsh tools/boottest.ps1 -Variant ext-boot  # 安装模式全链（需 systemdisk.img）

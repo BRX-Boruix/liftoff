@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory = $false)][string[]]$Expect = @(),
     [string[]]$NotExpect = @(),
     [int]$TimeoutSec = 45,
-    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot", "mod", "ext-boot", "ext-mod", "smp4")][string]$Variant = "normal"
+    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot", "mod", "ext-boot", "ext-mod", "smp4", "x2apic")][string]$Variant = "normal"
 )
 $ErrorActionPreference = "Stop"
 
@@ -57,7 +57,7 @@ switch ($Variant) {
 # directory (mount ok, open must report not-found).
 $iso = $null
 $media = "fat"
-if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot" -or $Variant -eq "mod" -or $Variant -eq "smp4") {
+if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot" -or $Variant -eq "mod" -or $Variant -eq "smp4" -or $Variant -eq "x2apic") {
     $media = "iso"
     $payload = Join-Path $liftoff "target\m2b-payload.bin"
     $iso = Join-Path $liftoff "target\m2b.iso"
@@ -78,7 +78,7 @@ if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot" -or
         (New-Object Random 99).NextBytes($blob)
         [System.IO.File]::WriteAllBytes($payload, $blob)
         python (Join-Path $PSScriptRoot "mkiso.py") --kernel $payload --out $iso --volident BADELF
-    } elseif ($Variant -eq "boot" -or $Variant -eq "smp4") {
+    } elseif ($Variant -eq "boot" -or $Variant -eq "smp4" -or $Variant -eq "x2apic") {
         # Full handover: real kernel ELF, liftoff builds paging + BORUIX v1
         # responses, exits boot services and jumps. Kernel prints its banner.
         # smp4 uses the same image with -smp 4 (M11 AP scale-out).
@@ -127,6 +127,29 @@ if ($Variant -eq "smp4") {
         "[mm] HHDM offset: 0xffff800000000000",
         "[acpi] RSDP rev=2",
         "LazyBuddy init done",
+        "[smp] BSP lapic_id=0",
+        "[smp] fired AP lapic_id=1",
+        "[smp] fired AP lapic_id=2",
+        "[smp] fired AP lapic_id=3",
+        "[smp] AP online, lapic_id=1",
+        "[smp] AP online, lapic_id=2",
+        "[smp] AP online, lapic_id=3",
+        "[kmain] SMP done, 4 cpus online (target 4)",
+        "[m6] x2apic supported=false enabled=false"   # 默认 qemu64 CPU：xAPIC 回退路径
+    )
+}
+if ($Variant -eq "x2apic") {
+    # M12: x2APIC path. -cpu max exposes x2APIC, so liftoff switches the LAPIC
+    # to MSR access, reports it in the SMP response flags, and the kernel picks
+    # the same mode ([lapic] x2APIC mode) - four CPUs must still come online.
+    $autoExpect = @(
+        "Hello, BORUIX!",
+        "Kernel M0 is running.",
+        "[mm] HHDM offset: 0xffff800000000000",
+        "[acpi] RSDP rev=2",
+        "LazyBuddy init done",
+        "[m6] x2apic supported=true enabled=true",
+        "[lapic] x2APIC mode: MSR access",
         "[smp] BSP lapic_id=0",
         "[smp] fired AP lapic_id=1",
         "[smp] fired AP lapic_id=2",
@@ -231,6 +254,12 @@ $effExpect = $Expect
 if ($autoExpect) { $effExpect = @($Expect) + $autoExpect }
 if ($Variant -eq "boot") { $qargs = @("-smp", "2") + $qargs }
 if ($Variant -eq "smp4") { $qargs = @("-smp", "4") + $qargs }
+if ($Variant -eq "x2apic") {
+    # Minimal CPU model plus exactly the x2APIC feature: isolates the MSR LAPIC
+    # path from the extra features -cpu max would expose (which trip unrelated
+    # kernel-side issues).
+    $qargs = @("-smp", "4", "-cpu", "qemu64,+x2apic") + $qargs
+}
 if ($media -eq "iso") { $qargs = @("-cdrom", $iso) + $qargs }
 if ($media -eq "ext") { $qargs = $qargs + @("-drive", "format=raw,file=$extimg") }
 $p = Start-Process -FilePath $qemuExe -ArgumentList $qargs -PassThru -RedirectStandardError $qerr

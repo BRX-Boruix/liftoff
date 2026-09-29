@@ -15,8 +15,8 @@ BORUIX's bootloader: reads the kernel ELF under UEFI and hands over control.
 
 ## Status
 
-M11 is done. Both boot chains, modules and multi-core are verified end to end under
-QEMU/OVMF (a 16-variant regression suite):
+M12 is done. Both boot chains, modules, multi-core and x2APIC are verified end to end
+under QEMU/OVMF:
 
 - **liveCD** (ISO9660): the `boot` variant - the full kernel chain;
 - **install mode** (MBR partition + EXT2): the `ext-boot` variant - reads the 24.6 MiB
@@ -25,10 +25,12 @@ QEMU/OVMF (a 16-variant regression suite):
 - **modules**: `mod` (ISO) and `ext-mod` (EXT2) - one module list and one assembler,
   loaded on demand only when the kernel declares `ModuleRequest`;
 - **multi-core**: the `smp4` variant (`-smp 4`) - all three APs are started by liftoff and
-  taken over by the kernel.
+  taken over by the kernel;
+- **x2APIC**: the `x2apic` variant (`-cpu qemu64,+x2apic -smp 4`) - when the CPU supports
+  it, liftoff switches the LAPIC to MSR access, tells the kernel through `SmpResponse.flags`
+  bit0, and four CPUs still come online; CPUs without x2APIC fall back to MMIO
+  automatically (the `smp4` variant covers that fallback path).
 
-x2APIC needs matching kernel-side work (the kernel LAPIC is MMIO-only today), so xAPIC is
-used for now.
 
 ## Known limitations
 
@@ -57,7 +59,8 @@ Requirements: `pwsh`, Python 3, QEMU (including `share/edk2-x86_64-code.fd`), an
 
 ```
 pwsh tools/boottest.ps1 -Variant boot      # liveCD, full chain (-smp 2)
-pwsh tools/boottest.ps1 -Variant smp4      # four CPUs online
+pwsh tools/boottest.ps1 -Variant smp4      # four CPUs online (xAPIC fallback path)
+pwsh tools/boottest.ps1 -Variant x2apic    # four CPUs with x2APIC (-cpu qemu64,+x2apic)
 pwsh tools/boottest.ps1 -Variant mod       # modules over ISO
 pwsh tools/boottest.ps1 -Variant ext-mod   # modules over EXT2
 pwsh tools/boottest.ps1 -Variant ext-boot  # install mode, full chain (needs systemdisk.img)

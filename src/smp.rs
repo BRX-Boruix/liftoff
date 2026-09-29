@@ -7,12 +7,128 @@
 
 use crate::boruix;
 use crate::efi;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-/// LAPIC MMIO 基址（xAPIC；QEMU/OVMF 默认非 x2APIC）。
+/// LAPIC MMIO 基址（xAPIC 模式；x2APIC 模式改经 MSR 访问）。
 pub const LAPIC_BASE: u64 = 0xFEE0_0000;
 const LAPIC_ICR_LOW: u64 = LAPIC_BASE + 0x300;
 const LAPIC_ICR_HIGH: u64 = LAPIC_BASE + 0x310;
 const LAPIC_ID_REG: u64 = LAPIC_BASE + 0x20;
+const LAPIC_SVR_REG: u64 = LAPIC_BASE + 0xF0;
+const LAPIC_TPR_REG: u64 = LAPIC_BASE + 0x80;
+
+/// IA32_APIC_BASE MSR（SDM Vol3 §10.4.3）：bit11 = APIC 全局使能，bit10 = x2APIC。
+const MSR_APIC_BASE: u32 = 0x1B;
+const APIC_BASE_ENABLE: u64 = 1 << 11;
+const APIC_BASE_X2APIC: u64 = 1 << 10;
+
+/// x2APIC MSR 编号 = 0x800 + 寄存器偏移/16（SDM Vol3 §10.12.1.2）。
+const MSR_X2APIC_ID: u32 = 0x802;
+const MSR_X2APIC_TPR: u32 = 0x808;
+const MSR_X2APIC_SVR: u32 = 0x80F;
+/// x2APIC ICR：单次 64 位写，目标 id 在高 32 位（SDM Vol3 §10.12.9）。
+const MSR_X2APIC_ICR: u32 = 0x830;
+
+/// 本核 APIC 访问模式：true = x2APIC（MSR），false = xAPIC（MMIO）。
+static X2APIC: AtomicBool = AtomicBool::new(false);
+
+/// 当前是否处于 x2APIC 模式（经 [`x2apic_try_enable`] 置位）。
+pub fn is_x2apic() -> bool {
+    X2APIC.load(Ordering::Acquire)
+}
+
+fn msr_read(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi,
+            options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+fn msr_write(msr: u32, val: u64) {
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") msr, in("eax") val as u32, in("edx") (val >> 32) as u32,
+            options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// CPUID leaf 1 ECX bit 21 = x2APIC 支持（SDM Vol2 CPUID）。
+/// rbx 是 LLVM 保留寄存器：按内核 cpu.rs 同款「中转-取出-恢复」写法处理。
+fn x2apic_supported() -> bool {
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, rbx",
+            "cpuid",
+            "mov {ebx:e}, ebx",
+            "mov rbx, {tmp}",
+            tmp = out(reg) _,
+            ebx = out(reg) _,
+            inout("eax") 1u32 => _,
+            out("ecx") ecx,
+            out("edx") _,
+            options(nomem, nostack),
+        );
+    }
+    ecx & (1 << 21) != 0
+}
+
+/// 本核 LAPIC id（xAPIC：MMIO 0x20 高 8 位；x2APIC：MSR 0x802 全 32 位）。
+fn lapic_id() -> u32 {
+    if is_x2apic() {
+        return msr_read(MSR_X2APIC_ID) as u32;
+    }
+    unsafe { (core::ptr::read_volatile(LAPIC_ID_REG as *const u32) >> 24) as u32 }
+}
+
+/// SVR 软件使能 + 伪中断向量 0xFF，TPR 清 0（SDM Vol3 §10.4.7）。
+fn lapic_enable() {
+    if is_x2apic() {
+        let svr = msr_read(MSR_X2APIC_SVR) as u32;
+        msr_write(MSR_X2APIC_SVR, (svr | 0x1FF) as u64);
+        msr_write(MSR_X2APIC_TPR, 0);
+    } else {
+        unsafe {
+            let svr = core::ptr::read_volatile(LAPIC_SVR_REG as *const u32);
+            core::ptr::write_volatile(LAPIC_SVR_REG as *mut u32, svr | 0x1FF);
+            core::ptr::write_volatile(LAPIC_TPR_REG as *mut u32, 0);
+        }
+    }
+}
+
+/// CPU 支持时切到 x2APIC 并返回 true；否则保持 xAPIC 返回 false。
+///
+/// 依据：CPUID.1:ECX[21] 支持性；IA32_APIC_BASE bit10 使能（bit11 全局使能）。
+/// 切换后 LAPIC 一律经 MSR 访问——x2APIC 下 0xFEE00000 的 MMIO 窗口不再代表
+/// LAPIC；内核据 SmpResponse.flags bit0 选择同一模式（brxlimine-rs lib.rs 552）。
+fn x2apic_try_enable() -> bool {
+    if !x2apic_supported() {
+        return false;
+    }
+    let base = msr_read(MSR_APIC_BASE);
+    msr_write(MSR_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
+    if msr_read(MSR_APIC_BASE) & APIC_BASE_X2APIC == 0 {
+        return false; // 复核失败：保持 xAPIC
+    }
+    X2APIC.store(true, Ordering::Release);
+    true
+}
+
+/// ICR 投递：x2APIC 单次 64 位 MSR 写；xAPIC 先写高半（目标）再写低半
+/// （触发发送）并等投递完成位清零（SDM Vol3 §10.6.1）。
+fn icr_send(dest: u32, low: u32) {
+    if is_x2apic() {
+        msr_write(MSR_X2APIC_ICR, ((dest as u64) << 32) | low as u64);
+        return;
+    }
+    unsafe {
+        core::ptr::write_volatile(LAPIC_ICR_HIGH as *mut u32, dest << 24);
+        core::ptr::write_volatile(LAPIC_ICR_LOW as *mut u32, low);
+        while core::ptr::read_volatile(LAPIC_ICR_LOW as *const u32) & (1 << 12) != 0 {}
+    }
+}
 
 /// MADT（signature "APIC"）表头（ACPI spec 5.2.11，SDT 通用头 36B）。
 #[repr(C)]
@@ -28,11 +144,47 @@ struct SdtHeader {
     creator_revision: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<SdtHeader>() == 36);/// 从 RSDP 拷贝（物理地址）遍历 XSDT 找 MADT，返回 enabled LAPIC id 列表。
-/// 全程物理地址直读（恒等映射期）。失败返回空表（SMP 退化单核）。
-pub fn madt_lapic_ids(rsdp_phys: u64) -> [u32; MAX_CPUS] {
-    let mut ids = [0u32; MAX_CPUS];
+const _: () = assert!(core::mem::size_of::<SdtHeader>() == 36);
+
+/// 从 MADT 表项区收集指定 type 的 enabled CPU id（type 0 = Processor Local
+/// APIC，type 9 = Processor Local x2APIC，ACPI spec §5.2.12.2/§5.2.12.12），
+/// 返回收集数。flags bit0 = enabled。
+unsafe fn collect_madt(madt: usize, len: usize, target: u8, ids: &mut [u32; MAX_CPUS]) -> usize {
+    unsafe {
     let mut n = 0usize;
+    let mut off = 44usize;
+    while off + 2 <= len {
+        let etype = core::ptr::read((madt + off) as *const u8);
+        let elen = core::ptr::read((madt + off + 1) as *const u8) as usize;
+        if elen < 2 {
+            break; // 规范不允许；防御死循环
+        }
+        if etype == target {
+            if target == 9 && elen >= 16 {
+                let flags = core::ptr::read_unaligned((madt + off + 8) as *const u32);
+                if flags & 1 != 0 && n < MAX_CPUS {
+                    ids[n] = core::ptr::read_unaligned((madt + off + 4) as *const u32);
+                    n += 1;
+                }
+            } else if target == 0 && elen >= 8 {
+                let flags = core::ptr::read_unaligned((madt + off + 4) as *const u32);
+                if flags & 1 != 0 && n < MAX_CPUS {
+                    ids[n] = core::ptr::read((madt + off + 3) as *const u8) as u32;
+                    n += 1;
+                }
+            }
+        }
+        off += elen;
+    }
+    n
+    }
+}
+
+/// 从 RSDP 拷贝（物理地址）遍历 XSDT 找 MADT，返回 enabled CPU id 列表。
+/// `want_x2apic` 时优先取 type 9（x2APIC）条目；固件只发布 type 0 时回退
+/// type 0（id < 256 时两者数值一致）。全程物理直读（恒等映射期）。
+pub fn madt_lapic_ids(rsdp_phys: u64, want_x2apic: bool) -> [u32; MAX_CPUS] {
+    let mut ids = [0u32; MAX_CPUS];
     if rsdp_phys == 0 {
         return ids;
     }
@@ -55,33 +207,24 @@ pub fn madt_lapic_ids(rsdp_phys: u64) -> [u32; MAX_CPUS] {
                 continue;
             }
             let th = &*(t_phys as *const SdtHeader);
-            if th.signature != [0x41, 0x50, 0x49, 0x43] { // "APIC"
-                continue;
+            if th.signature != [0x41, 0x50, 0x49, 0x43] {
+                continue; // "APIC"
             }
-            // MADT entry 区（44 字节头之后）：type 0 = Processor Local APIC
-            // entry：type u8 | len u8 | acpi_uid u8 | apic_id u8 | flags u32
-            let mut off = 44usize;
-            while off + 2 <= th.length as usize {
-                let etype = core::ptr::read((t_phys as usize + off) as *const u8);
-                let elen = core::ptr::read((t_phys as usize + off + 1) as *const u8);
-                if elen < 2 {
-                    break; // 规范不允许；防御死循环
-                }
-                if etype == 0 && elen >= 8 {
-                    let flags = core::ptr::read_unaligned((t_phys as usize + off + 4) as *const u32);
-                    if flags & 1 != 0 && n < MAX_CPUS { // bit0 processor enabled
-                        let apic_id = core::ptr::read((t_phys as usize + off + 3) as *const u8);
-                        ids[n] = apic_id as u32;
-                        n += 1;
-                    }
-                }
-                off += elen as usize;
+            let madt = t_phys as usize;
+            let len = th.length as usize;
+            let mut n = 0usize;
+            if want_x2apic {
+                n = collect_madt(madt, len, 9, &mut ids);
             }
+            if n == 0 {
+                n = collect_madt(madt, len, 0, &mut ids);
+            }
+            let _ = n;
+            return ids; // MADT 唯一
         }
     }
     ids
 }
-
 /// AP 上限（QEMU -smp 2..4 足够；超出截断）。
 pub const MAX_CPUS: usize = 8;
 /// 16-bit real mode entry bytes. abs32 slot relocated at build time.
@@ -150,15 +293,6 @@ pub const AP_STACK_PAGES: u64 = 16;
 const INIT_DELAY_LOOPS: u32 = 200_000;
 const SIPI_DELAY_LOOPS: u32 = 20_000;
 
-/// ICR send via xAPIC MMIO: high half first, then low half.
-unsafe fn icr_send(high: u32, low: u32) {
-    unsafe {
-        core::ptr::write_volatile(LAPIC_ICR_HIGH as *mut u32, high);
-        core::ptr::write_volatile(LAPIC_ICR_LOW as *mut u32, low);
-        let icr = LAPIC_ICR_LOW as *const u32;
-        while core::ptr::read_volatile(icr) & (1 << 12) != 0 {}
-    }
-}
 
 /// busy delay via port writes (no timer after EBS).
 fn delay(loops: u32) {
@@ -168,9 +302,17 @@ fn delay(loops: u32) {
 }
 pub unsafe fn prepare(bs: &efi::BootServices, pml4_phys: u64, rsdp_phys: u64, hd: &mut boruix::Handover) -> usize {
     unsafe {
-    let ids = madt_lapic_ids(rsdp_phys);
-    let bsp = (core::ptr::read_volatile(LAPIC_ID_REG as *const u32) >> 24) as u32;
+    // M12：CPU 支持时切到 x2APIC（MSR 访问）；内核据 SmpResponse.flags bit0
+    // 选择同一模式（x2APIC = MSR，xAPIC = MMIO，brxlimine-rs lib.rs 552）。
+    let x2 = x2apic_try_enable();
+    let ids = madt_lapic_ids(rsdp_phys, x2);
+    let bsp = lapic_id();
     hd.smp.bsp_lapic_id = bsp;
+    hd.smp.flags = if x2 { 1 } else { 0 };
+    crate::serial::write(format_args!(
+        "[m6] x2apic supported={} enabled={} bsp_lapic={}\n",
+        x2apic_supported(), x2, bsp
+    ));
     let bsp_info = &mut *hd.smp_infos;
     bsp_info.processor_id = bsp;
     bsp_info.lapic_id = bsp;
@@ -243,11 +385,9 @@ pub static mut AP_LAPIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 /// AP lands in trampoline, parks on goto_address polling (HHDM valid now).
 pub unsafe fn start_aps(hd: &boruix::Handover) {
     unsafe {
-        // SVR（0xF0）bit8 = APIC 软件使能：未使能时 ICR 写入被忽略（SDM 10.4.7），
-        // 防御 OVMF 收尾留 PIC 模式；伪中断向量 0xFF，TPR（0x80）清 0 保证投递。
-        let svr = core::ptr::read_volatile((LAPIC_BASE + 0xF0) as *const u32);
-        core::ptr::write_volatile((LAPIC_BASE + 0xF0) as *mut u32, svr | 0x1FF);
-        core::ptr::write_volatile((LAPIC_BASE + 0x80) as *mut u32, 0);
+        // SVR bit8 = APIC 软件使能（未使能时 ICR 写入被忽略，SDM §10.4.7）、
+        // 伪中断向量 0xFF、TPR 清 0；模式感知（x2APIC 走 MSR）。
+        lapic_enable();
         let n = hd.smp.cpu_count as usize;
         let mut ap_index = 0usize;
         for i in 0..n {
@@ -255,10 +395,10 @@ pub unsafe fn start_aps(hd: &boruix::Handover) {
             if (*info).lapic_id == hd.smp.bsp_lapic_id { continue; }
             // INIT IPI：delivery=5(INIT)、level assert、edge、目标 = 该 AP 的 LAPIC id
             let lid = AP_LAPIC_IDS[ap_index];
-            icr_send(lid << 24, 0x00004500);
+            icr_send(lid, 0x00004500);
             delay(INIT_DELAY_LOOPS);
             let vec = (TRAMP_PAGES[ap_index] >> 12) as u32;
-            icr_send(lid << 24, 0x00004600 | vec);
+            icr_send(lid, 0x00004600 | vec);
             delay(SIPI_DELAY_LOOPS);
             icr_send(lid << 24, 0x00004600 | vec);
             delay(SIPI_DELAY_LOOPS);
