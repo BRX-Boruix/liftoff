@@ -6,21 +6,26 @@ BORUIX 的引导程序：在 UEFI 环境下读取内核 ELF 并交接控制权�
 
 ## 功能
 
-- 从 EXT2 分区读取 `/boot/kernel`，对应安装模式
-- 从 ISO9660 光盘读取 `/boot/kernel`，对应 liveCD 模式
-- 将内存映射、帧缓冲、RSDP、SMP 信息交给内核
+- 从 ISO9660 光盘读取 `/boot/kernel`（liveCD 模式）
+- 从 MBR 分区内的 EXT2 读取 `/boot/kernel`（安装模式）
+- 向内核交接 Limine 语义子集协议：BaseRevision、HHDM、内存映射、帧缓冲、
+  RSDP、SMP、模块、内核文件、内核地址
+- 启动全部辅助处理器（AP）并交付 Limine 的模块请求
 - 仅支持 x86-64 UEFI
-- 当前状态：M11 完成。两种启动方式、模块与多核都已端到端跑通：
-  - **liveCD**（ISO9660）：`boot` 变体 —— 内核全链；
-  - **安装模式**（MBR 分区 + EXT2）：`ext-boot` 变体 —— 读盘上 24.6MB 内核
-    （含二级间接块）、完整交接，内核按 liftoff 填的 `mbr_disk_id`/`partition_index`
-    识别启动盘并把该 EXT2 分区挂为根；
-  - **模块**：`mod`（ISO）与 `ext-mod`（EXT2）—— 同一份清单、同一装配逻辑，
-    按需加载（仅内核声明 ModuleRequest 时）；
-  - **多核**：`smp4` 变体（`-smp 4`）—— 3 个 AP 全部由 liftoff 启动并被内核接管，
-    `[kmain] SMP done, 4 cpus online`。
-  - 协议面：BaseRevision/HHDM/Memmap/Framebuffer/RSDP/SMP/Modules/KernelFile/
-    KernelAddress；x2APIC 属内核侧同步项，暂只走 xAPIC。
+
+## 当前状态
+
+M11 完成。两条启动链、模块与多核均已在 QEMU/OVMF 上端到端验证（16 个变体回归全绿）：
+
+- **liveCD**（ISO9660）：`boot` 变体 —— 内核全链；
+- **安装模式**（MBR 分区 + EXT2）：`ext-boot` 变体 —— 读取盘上 24.6 MB 内核
+  （含二级间接块），内核据 liftoff 填的 `mbr_disk_id`/`partition_index` 识别启动盘，
+  并把该 EXT2 分区挂为根；
+- **模块**：`mod`（ISO）与 `ext-mod`（EXT2）—— 同一份清单、同一装配逻辑，
+  仅当内核声明 `ModuleRequest` 时按需加载；
+- **多核**：`smp4` 变体（`-smp 4`）—— 3 个 AP 全部由 liftoff 启动并被内核接管。
+
+x2APIC 属内核侧同步项（内核 LAPIC 目前只有 MMIO 路径），因此目前只走 xAPIC。
 
 ## 已知限制
 
@@ -35,21 +40,51 @@ BORUIX 的引导程序：在 UEFI 环境下读取内核 ELF 并交接控制权�
 cargo build --release --target x86_64-unknown-uefi
 ```
 
-产物为 `target/x86_64-unknown-uefi/release/liftoff.efi`，需放入 FAT 分区的 `EFI/BOOT/` 下。
+产物为 `target/x86_64-unknown-uefi/release/liftoff.efi`，需放入 FAT 分区的
+`EFI/BOOT/BOOTX64.EFI`。
+
+## 验收
+
+`tools/boottest.ps1` 在 QEMU + OVMF 上真实引导并断言串口输出——只有固件真的装载了
+liftoff、liftoff 真的把内核送起来，断言才会通过。
+
+前置：`pwsh`、Python 3、QEMU（含 `share/edk2-x86_64-code.fd`），并在工作区根目录的
+`.env` 中设置 `QEMU_DIR`。
+
+```
+pwsh tools/boottest.ps1 -Variant boot      # liveCD 全链（-smp 2）
+pwsh tools/boottest.ps1 -Variant smp4      # 4 核全部上线
+pwsh tools/boottest.ps1 -Variant mod       # 模块（ISO）
+pwsh tools/boottest.ps1 -Variant ext-mod   # 模块（EXT2）
+pwsh tools/boottest.ps1 -Variant ext-boot  # 安装模式全链（需 systemdisk.img）
+pwsh tools/boottest.ps1 -Variant elf-iso   # ELF 装载契约（期望值由 elf_oracle.py 同源计算）
+```
+
+部分变体需要外部产物：
+
+- `boot` / `smp4`：`target/kernel.elf`（BORUIX 内核的构建产物）
+- `ext-boot`：工作区根目录的 `systemdisk.img`（由 [`tools`](https://github.com/BRX-Boruix/tools)
+  仓库的 `python main.py build --systemdisk` 生成）
+- `mod` / `ext-mod`：脚本会用 `rustc` 现场构建 `tools/modtest`（需 `x86_64-unknown-none` 目标）
 
 ## 仓库布局
 
-- `src/main.rs` —— UEFI 入口与 M2a 文件读取链
-- `src/efi.rs` —— 手写最小 UEFI 绑定，布局有编译期断言
+- `src/main.rs` —— UEFI 入口、各里程碑启动链与交接编排
+- `src/efi.rs` —— 手写最小 UEFI 绑定（布局有编译期断言）
 - `src/serial.rs` —— COM1 串口输出，观测主通道
-- `src/iso9660.rs` —— ISO9660 只读解析器（块读取经 trait 注入）
-- `src/ext2.rs` —— EXT2 只读解析器（同一 trait 缝，布局对齐内核侧取证）
-- `src/elf.rs` —— ELF64 装载器（校验 + 连续物理映像 + BSS 清零）
-- `tools/elf_oracle.py` —— ELF 装载期望值计算器（与驱动同源规则）
-- `tools/mkext2.py` —— 确定性 EXT2 fixture 构建器
-- `src/config.rs` —— 内核路径与协议版本常量
-- `tools/boottest.ps1` —— QEMU OVMF 真实引导验收脚本（构建、摆 ESP、断言串口）
-- `tools/mkiso.py` —— 确定性 ISO9660 fixture 构建器
+- `src/iso9660.rs` —— ISO9660 只读解析器 + BlockIo 适配（分块读、媒体边界保护）
+- `src/ext2.rs` —— EXT2 只读解析器（分区偏移；直块 / 一级 / 二级间接）
+- `src/elf.rs` —— ELF64 装载器（校验 + 连续物理映像 + BSS 清零 + PIE 重定位）
+- `src/paging.rs` —— 4 级大页页表（恒等 + HHDM + 内核高区）
+- `src/boruix.rs` —— 协议常量/结构与请求标记扫描
+- `src/handover.rs` —— ExitBootServices、内存映射转换与跳转
+- `src/smp.rs` —— MADT 枚举、三段式 AP trampoline、INIT-SIPI
+- `src/modules.rs` —— 模块装配（ISO/EXT2 共用）
+- `src/config.rs` —— 内核路径、协议版本与模块清单常量
+- `tools/boottest.ps1` —— QEMU + OVMF 真实引导验收（16 个变体）
+- `tools/mkiso.py` / `tools/mkext2.py` —— 确定性 ISO9660 / EXT2 fixture 构建器
+- `tools/elf_oracle.py` / `tools/modtest_oracle.py` —— 期望值计算（与驱动同源规则）
+- `tools/modtest/` —— 模块协议验收用的独立消费者内核
 
 ## 相关项目
 
