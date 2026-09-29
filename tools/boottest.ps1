@@ -167,13 +167,14 @@ if ($Variant -eq "mod" -or $Variant -eq "ext-mod") {
     $autoExpect = @($oracleOut | Where-Object { $_ -match '^MOD: ' } | ForEach-Object { $_.Substring(5) })
     if ($autoExpect.Count -lt 8) { Write-Output "FAIL: modtest oracle produced too few lines"; exit 2 }
 }
-# ext-boot (M9): install mode end to end from a real MBR system disk. Every line
-# proves a distinct stage: MBR/partition selection, EXT2 mount at the partition
-# offset, the 24 MiB kernel read (indirect blocks), ELF handover, and the kernel
-# choosing install mode from the BootSource we filled.
+# ext-boot (M9/M13): install-mode end to end from an MBR system disk that this
+# script builds itself (tools/mksysdisk.py). Every line proves a distinct stage:
+# MBR/partition selection, EXT2 mount at the partition offset, the kernel read
+# through double indirect blocks, ELF handover, and the kernel choosing install
+# mode from the BootSource we filled.
 if ($Variant -eq "ext-boot") {
     # Device-independent anchors: disk id + partition index + start LBA come
-    # from the MBR we parsed; the kernel echoes them back in install mode.
+    # from the MBR we wrote; the kernel echoes them back in install mode.
     $autoExpect = @(
         "[m2c] mbr disk_id=0x424f5255 partition=1 start_lba=2048",
         "M2C: mount ok",
@@ -188,26 +189,17 @@ if ($Variant -eq "ext-boot") {
         "LazyBuddy init done"
     )
 }
-
-# EXT2 variants: whole-disk fixture from mkext2.py attached as a plain raw drive.
-# ext: /BOOT/KERNIMG.BIN present; ext-nosig: non-EXT2 blob (magic must fail);
-# ext-nopath: valid EXT2 whose root has no BOOT directory.
-$extimg = $null
 if ($Variant -eq "ext-boot") {
-    # M9: real install disk. Built by the project toolchain:
-    #   python tools/main.py build --systemdisk
+    # M13: build the install disk here instead of requiring a workspace artifact.
+    # Same layout the project toolchain produces (MBR disk id 0x424F5255,
+    # partition 1 at LBA 2048, EXT2 with /boot/kernel), so the anchors below
+    # stay byte-for-byte identical to the ones verified against systemdisk.img.
     $media = "ext"
-    $candidates = @(
-        (Join-Path (Split-Path -Parent $liftoff) "systemdisk.img"),
-        (Join-Path $liftoff "target\systemdisk.img")
-    )
-    $src = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $src) {
-        Write-Output "FAIL: systemdisk.img not found (build with tools/main.py build --systemdisk)"
-        exit 2
-    }
+    $kernelElf = Join-Path $liftoff "target\kernel.elf"
+    if (-not (Test-Path $kernelElf)) { Write-Output "FAIL: target/kernel.elf missing (build the BORUIX kernel first)"; exit 2 }
     $extimg = Join-Path $liftoff "target\systemdisk.img"
-    Copy-Item $src $extimg -Force
+    python (Join-Path $PSScriptRoot "mksysdisk.py") --kernel $kernelElf --out $extimg | Out-Null
+    if (-not (Test-Path $extimg)) { Write-Output "FAIL: mksysdisk produced no image"; exit 2 }
 } elseif ($Variant -like "ext*") {
     $media = "ext"
     $payload = Join-Path $liftoff "target\m2c-payload.bin"
@@ -238,6 +230,7 @@ if ($Variant -eq "ext-boot") {
     if (-not (Test-Path $extimg)) { Write-Output "FAIL: ext fixture not built"; exit 2 }
 }
 
+$snapshot = $null
 $log = Join-Path $liftoff "target\serial.log"
 $qerr = Join-Path $liftoff "target\qemu.err.log"
 Remove-Item $log, $qerr -ErrorAction SilentlyContinue
@@ -252,6 +245,10 @@ $qargs = @(
 )
 $effExpect = $Expect
 if ($autoExpect) { $effExpect = @($Expect) + $autoExpect }
+if ($effExpect.Count -eq 0) {
+    # 无断言的变体绝不能报 PASS：那会让"测试没跑"伪装成"测试通过"。
+    Write-Output "FAIL: variant $Variant produced no expectations"; exit 2
+}
 if ($Variant -eq "boot") { $qargs = @("-smp", "2") + $qargs }
 if ($Variant -eq "smp4") { $qargs = @("-smp", "4") + $qargs }
 if ($Variant -eq "x2apic") {
@@ -273,7 +270,12 @@ try {
             if ($probe) {
                 $allFound = $true
                 foreach ($e in $effExpect) { if (-not $probe.Contains($e)) { $allFound = $false; break } }
-                if ($allFound) { break }
+                if ($allFound) {
+                    # 命中即快照：QEMU 被强杀时 -serial file: 的缓冲可能未落盘，
+                    # 事后重读会拿到截断日志（实测只剩 87 字节）。
+                    $snapshot = $probe
+                    break
+                }
             }
         }
     }
@@ -282,7 +284,7 @@ try {
     $p.WaitForExit()
 }
 
-$content = if (Test-Path $log) { Get-Content $log -Raw } else { "" }
+$content = if ($snapshot) { $snapshot } elseif (Test-Path $log) { Get-Content $log -Raw } else { "" }
 $failed = $false
 foreach ($e in $effExpect) {
     if ($content.Contains($e)) { Write-Output ("PASS: contains " + $e) }

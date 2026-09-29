@@ -10,8 +10,10 @@ Layout (1 KiB blocks, rev 1, inode size 128, single block group):
   block 5..6     inode table (16 inodes)
   block 7..      directory blocks, then indirect tables, then file data
 
-M10: arbitrary single-level tree via --extra ISO/PATH=HOST_FILE, and files
-larger than 12 KiB (direct blocks + one single indirect block).
+M10: arbitrary single-level tree via --extra ISO/PATH=HOST_FILE.
+M13: files up to ~64 MiB (direct 12 + single indirect 256 + double indirect 256^2)
+so a real 8.9 MiB kernel can live on the fixture, plus min_blocks for sizing the
+filesystem inside a partition.
 All bytes deterministic; identical inputs give identical images.
 """
 import struct, argparse
@@ -51,8 +53,9 @@ def pack_dir(entries) -> bytes:
     return out
 
 
-def build(kernel: bytes, extras, flat: bool = False) -> bytes:
-    """kernel -> BOOT/KERNIMG.BIN (omitted when flat); extras: [(dir, name, data)]."""
+def build(kernel: bytes, extras, flat: bool = False, min_blocks: int = MIN_DISK_BLOCKS) -> bytes:
+    """kernel -> BOOT/KERNIMG.BIN (omitted when flat, e.g. when the caller wants the
+    canonical install path boot/kernel via extras); extras: [(dir, name, data)]."""
     dirs = {}          # dir name -> [(name, data)]
     if not flat:
         dirs["BOOT"] = [("KERNIMG.BIN", kernel)]
@@ -73,23 +76,42 @@ def build(kernel: bytes, extras, flat: bool = False) -> bytes:
     assert next_ino <= INODES + 1, "too many inodes for the fixture"
 
     # Block assignment: directory blocks first, then indirect tables, then data.
+    used_blocks = set(range(DATA_START))
+    used_inodes = set(range(1, next_ino))   # inode 1 保留（坏块），2..next_ino-1 已用   # 0 引导垫 / 1 SB / 2 GDT / 3 块位图 / 4 inode 位图 / 5.. inode 表
     dir_blocks = {}
     cur = DATA_START
     order = [""] + sorted(dirs)
     for d in order:
         dir_blocks[d] = cur
+        used_blocks.add(cur)
         cur += 1
     ind_block = {}
+    dind_block = {}
+    dind_l1 = {}
     data_blocks = {}
     for d in sorted(dirs):
         for n, data in sorted(dirs[d]):
+            key = (d, n)
             nb = (len(data) + BS - 1) // BS
             if nb > DIRECT:
-                ind_block[(d, n)] = cur
+                ind_block[key] = cur
                 cur += 1
-            data_blocks[(d, n)] = list(range(cur, cur + nb))
+            if nb > DIRECT + 256:
+                # 二级间接：l2 表（每项一个 l1 表块）+ 每个 l1 表 256 个数据块号
+                dind_block[key] = cur
+                cur += 1
+                nl1 = (nb - DIRECT - 256 + 255) // 256
+                dind_l1[key] = list(range(cur, cur + nl1))
+                cur += nl1
+            data_blocks[key] = list(range(cur, cur + nb))
             cur += nb
-    total_blocks = max(cur, MIN_DISK_BLOCKS)
+            used_blocks.update(data_blocks[key])
+            if key in ind_block:
+                used_blocks.add(ind_block[key])
+            if key in dind_block:
+                used_blocks.add(dind_block[key])
+                used_blocks.update(dind_l1[key])
+    total_blocks = max(cur, min_blocks)
     img = bytearray(total_blocks * BS)
 
     def w32(off, v):
@@ -110,12 +132,28 @@ def build(kernel: bytes, extras, flat: bool = False) -> bytes:
     w16(sb + 56, EXT2_MAGIC)
     w32(sb + 76, 1)                     # s_rev_level
     w16(sb + 88, INODE_SIZE)
+    w32(sb + 12, total_blocks - len(used_blocks))   # s_free_blocks_count
+    w32(sb + 16, INODES - len(used_inodes))         # s_free_inodes_count
 
     # Group descriptor table @block 2
     gd = 2 * BS
     w32(gd + 0, BLOCK_BITMAP)
     w32(gd + 4, INODE_BITMAP)
     w32(gd + 8, INODE_TABLE)
+
+    # 位图与空闲计数：内核安装模式把启动分区**读写**挂为根，build_skeleton 会在
+    # 其上创建骨架目录（分配 inode/块）。位图全零会让分配器看到「全部空闲」——
+    # 与真实 mkfs 镜像不一致，实测内核在挂根前即停住。此处按实际占用写位图。
+    bb = bytearray(BS)
+    for b in used_blocks:
+        bb[b // 8] |= 1 << (b % 8)
+    img[BLOCK_BITMAP * BS:(BLOCK_BITMAP + 1) * BS] = bb
+    ib = bytearray(BS)
+    for i in used_inodes:
+        ib[(i - 1) // 8] |= 1 << ((i - 1) % 8)
+    img[INODE_BITMAP * BS:(INODE_BITMAP + 1) * BS] = ib
+    w16(gd + 12, total_blocks - len(used_blocks))   # bg_free_blocks_count
+    w16(gd + 14, INODES - len(used_inodes))         # bg_free_inodes_count
 
     itab = INODE_TABLE * BS
 
@@ -137,10 +175,21 @@ def build(kernel: bytes, extras, flat: bool = False) -> bytes:
             w32(off + 40 + i * 4, b)
         if len(blocks) > DIRECT:
             w32(off + 40 + 12 * 4, ind_block[key])
-            rest = blocks[DIRECT:]
+            rest = blocks[DIRECT:DIRECT + 256]
             tbl = b"".join(struct.pack("<I", b) for b in rest)
             base = ind_block[key] * BS
             img[base:base + len(tbl)] = tbl
+        if len(blocks) > DIRECT + 256:
+            w32(off + 40 + 13 * 4, dind_block[key])
+            l2 = b"".join(struct.pack("<I", b) for b in dind_l1[key])
+            base = dind_block[key] * BS
+            img[base:base + len(l2)] = l2
+            rest = blocks[DIRECT + 256:]
+            for i, l1b in enumerate(dind_l1[key]):
+                chunk = rest[i * 256:(i + 1) * 256]
+                t = b"".join(struct.pack("<I", b) for b in chunk)
+                b0 = l1b * BS
+                img[b0:b0 + len(t)] = t
         for i, b in enumerate(blocks):
             off_b = b * BS
             start = i * BS
@@ -181,7 +230,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--flat", action="store_true", help="root without BOOT dir (negative test)")
+    ap.add_argument("--flat", action="store_true",
+                    help="skip the default BOOT/KERNIMG.BIN (caller supplies files via --extra)")
     ap.add_argument("--extra", action="append", default=[], help="ISO/PATH=HOST_FILE (repeatable)")
     a = ap.parse_args()
     with open(a.kernel, "rb") as f:

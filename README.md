@@ -66,8 +66,9 @@ pwsh tools/boottest.ps1 -Variant elf-iso   # ELF 装载契约（期望值由 elf
 部分变体需要外部产物：
 
 - `boot` / `smp4`：`target/kernel.elf`（BORUIX 内核的构建产物）
-- `ext-boot`：工作区根目录的 `systemdisk.img`（由 [`tools`](https://github.com/BRX-Boruix/tools)
-  仓库的 `python main.py build --systemdisk` 生成）
+- `ext-boot`：**无需外部产物** —— 脚本用 `tools/mksysdisk.py` 自建系统盘（MBR 磁盘签名
+  0x424F5255、分区 1 起始 LBA 2048、EXT2 内 `/boot/kernel`），布局与项目工具链产出的
+  `systemdisk.img` 逐字段一致
 - `mod` / `ext-mod`：脚本会用 `rustc` 现场构建 `tools/modtest`（需 `x86_64-unknown-none` 目标）
 
 ## 仓库布局

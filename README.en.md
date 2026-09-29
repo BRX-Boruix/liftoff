@@ -70,8 +70,9 @@ pwsh tools/boottest.ps1 -Variant elf-iso   # ELF load contract (expectations fro
 Some variants need external artifacts:
 
 - `boot` / `smp4`: `target/kernel.elf` (a BORUIX kernel build)
-- `ext-boot`: `systemdisk.img` at the workspace root (produced by
-  `python main.py build --systemdisk` in the [`tools`](https://github.com/BRX-Boruix/tools) repo)
+- `ext-boot`: **no external artifact** - the script builds the system disk itself with
+  `tools/mksysdisk.py` (MBR disk signature 0x424F5255, partition 1 at LBA 2048, EXT2 holding
+  `/boot/kernel`), matching the layout the project toolchain produces field by field
 - `mod` / `ext-mod`: the script builds `tools/modtest` on the spot with `rustc`
   (needs the `x86_64-unknown-none` target)
 
