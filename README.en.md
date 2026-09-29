@@ -24,7 +24,7 @@ BORUIX's bootloader: reads the kernel ELF under UEFI and hands over control.
 cargo build --release --target x86_64-unknown-uefi
 ```
 
-The output is `target/x86_64-unknown-uefi/release/liftoff.efi`, which goes on a FAT partition.
+The output is `target/x86_64-unknown-uefi/release/liftoff.efi`, which goes under `EFI/BOOT/` on a FAT partition.
 
 ## Repository layout
 
@@ -39,3 +39,6 @@ The output is `target/x86_64-unknown-uefi/release/liftoff.efi`, which goes on a 
 ## License
 
 MIT License, copyright Yang Borui. See [LICENSE](LICENSE).
+## Status
+
+M1 done: entry signature check and dual-channel serial/console output verified under QEMU OVMF. Filesystem and kernel loading not yet implemented.

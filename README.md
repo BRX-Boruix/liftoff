@@ -24,7 +24,7 @@ BORUIX 的引导程序：在 UEFI 环境下读取内核 ELF 并交接控制权�
 cargo build --release --target x86_64-unknown-uefi
 ```
 
-产物为 `target/x86_64-unknown-uefi/release/liftoff.efi`，需放入 FAT 分区。
+产物为 `target/x86_64-unknown-uefi/release/liftoff.efi`，需放入 FAT 分区的 `EFI/BOOT/` 下。
 
 ## 仓库布局
 

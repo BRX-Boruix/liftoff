@@ -1,39 +1,70 @@
 //! Liftoff —— BORUIX 的 UEFI 引导程序。
 //!
-//! 职责：读取 EXT2 分区上的内核 ELF，按 Limine 协议填好请求响应，跳转内核入口。
-//!
-//! 当前为骨架：仅验证 UEFI 目标可编译并可被固件加载。
+//! 阶段一（M1）：入口签名校验 + 双通道输出。
+//! 后续里程碑见 wiki/contributor/liftoff.md。
 
 #![no_std]
 #![no_main]
 
+mod config;
+mod efi;
+mod serial;
+
+use core::fmt::Write as _;
 use core::panic::PanicInfo;
 
-mod config;
+/// 宽字符缓冲容量：足够容纳最长的状态行。
+const WIDE_BUF: usize = 256;
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    // 骨架阶段：无控制台，直接停机。
-    // TODO(M2): 接 UEFI Simple Text Output 输出 panic 信息与位置。
+fn panic(info: &PanicInfo) -> ! {
+    serial::write(format_args!("[liftoff] PANIC: {info}\n"));
     loop {
         core::hint::spin_loop();
     }
 }
 
-/// UEFI 入口。
-///
-/// 固件以 Microsoft x64 调用约定调用此函数，
-/// 参数为 EFI_HANDLE image_handle 与 EFI_SYSTEM_TABLE 指针。
-///
-/// TODO(M1): 接收并校验两个参数，取得 BootServices / RuntimeServices。
+/// 经固件控制台输出。失败静默：串口才是观测主通道。
+fn con_out(table: &efi::SystemTable, text: &str) {
+    let con = table.con_out;
+    if con.is_null() {
+        return;
+    }
+    let mut buf = efi::alloc_vec::Vec::<u16, WIDE_BUF>::new();
+    for c in text.encode_utf16() {
+        buf.push(c);
+    }
+    buf.push(0);
+    unsafe {
+        let con_ref = &*con;
+        (con_ref.output_string)(con_ref, buf.as_slice().as_ptr());
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(
-    _image_handle: *mut core::ffi::c_void,
-    _system_table: *mut core::ffi::c_void,
+    image_handle: *mut core::ffi::c_void,
+    system_table: *mut core::ffi::c_void,
 ) -> usize {
-    // TODO(M1): 打开 Simple File System / Block I/O 协议。
-    // TODO(M2): 挂载 EXT2，读取 config::KERNEL_PATH。
-    // TODO(M3): 解析 ELF，映射段。
-    // TODO(M4): 构造 Limine 请求响应，退出引导服务，跳转内核。
-    config::EFI_SUCCESS
+    serial::init();
+
+    serial::write(format_args!("[liftoff] M1 entry\n"));
+    serial::write(format_args!(
+        "[liftoff] image_handle={:#x} system_table={:#x}\n",
+        image_handle as usize, system_table as usize
+    ));
+
+    // 系统表签名校验：不符则只能走串口报告并停机。
+    let Some(table) = efi::SystemTable::from_ptr(system_table) else {
+        serial::write(format_args!("[liftoff] system table signature mismatch, halting\n"));
+        return efi::EFI_ERROR;
+    };
+
+    serial::write(format_args!("[liftoff] signature ok\n"));
+    con_out(table, "Liftoff M1: console + serial alive\r\n");
+
+    let rev = table.hdr.revision;
+    serial::write(format_args!("[liftoff] firmware table revision {rev}\n"));
+
+    efi::EFI_SUCCESS
 }
