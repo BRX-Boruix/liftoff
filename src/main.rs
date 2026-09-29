@@ -17,6 +17,7 @@ mod handover;
 mod iso9660;
 mod paging;
 mod serial;
+mod smp;
 
 use core::panic::PanicInfo;
 
@@ -452,6 +453,16 @@ fn m4_handover(bs: &efi::BootServices, lr: &elf::LoadResult, file_base: *mut u8,
         core::ptr::null_mut()
     };
 
+
+    // 5b) SMP page: 8 SmpInfo (32B each) + pointer array, single page;
+    //     BootloaderReclaimable semantics keep it out of the kernel free list.
+    let mut smp_page: u64 = 0;
+    unsafe {
+        let st_smp = (bs.allocate_pages)(efi::ALLOCATE_ANY_PAGES, efi::MEMORY_LOADER_DATA, 1, &mut smp_page);
+        if efi::is_error(st_smp) { m4_fail("smp page", st_smp); }
+        core::slice::from_raw_parts_mut(smp_page as *mut u8, 4096).fill(0);
+    }
+
     // 5) 响应区（LoaderData 单块）。
     let kernel_len = file_len;
     let mut hd = boruix::Handover::build(
@@ -468,11 +479,14 @@ fn m4_handover(bs: &efi::BootServices, lr: &elf::LoadResult, file_base: *mut u8,
         kphys, kvbase, kernel_len,
         fb_phys,
     );
+    // 5c) SMP 区指针（SmpInfo 在页首，指针数组在页 +256）。
+    hd.smp_infos = smp_page as *mut boruix::SmpInfo;
+    hd.smp_ptrs = (smp_page + 256) as *mut *mut boruix::SmpInfo;
     hd.file_struct.base = (file_base as u64 + boruix::HHDM_OFFSET) as *mut u8;
 
     // 6) 最终内存映射 + 填充 + 扫描 + EBS + 跳转（EBS 后无串口日志）。
     unsafe {
-        handover::final_ebs_and_jump(bs, &mut hd, tables.pml4_phys, handover_entry_phys(lr));
+        handover::final_ebs_and_jump(bs, &mut hd, tables.pml4_phys, handover_entry_phys(lr), rsdp_phys);
     }
 }
 

@@ -26,6 +26,8 @@ pub const FRAMEBUFFER_ID: [u64; 2] = [0x9d5827dcd881dd75, 0xa3148604f6fab11b];
 pub const RSDP_ID: [u64; 2] = [0xc5e77b6b397e7b43, 0x27637845accdcf3c];
 pub const KERNEL_FILE_ID: [u64; 2] = [0xad97e90e83f1ed67, 0x31eb5d1c5ff23b69];
 pub const KERNEL_ADDRESS_ID: [u64; 2] = [0x71ba76863cc55f63, 0xb2644a48c516a487];
+/// SMP 请求 id（brxlimine-rs lib.rs 584 make_struct!）。
+pub const SMP_ID: [u64; 2] = [0x95a67b819a1b857e, 0xa0b61b723b6a73e0];
 
 /// HHDM 偏移（Limine x86_64 语义）。
 pub const HHDM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
@@ -136,6 +138,32 @@ pub struct KernelAddressResponse {
     pub virtual_base: u64,
 }
 
+/// SmpInfo（brxlimine-rs lib.rs 531，32B）：每 CPU 一个，AP 停在
+/// goto_address=0 的 HLT 轮询里，原子写非零即跳转（RDI=&SmpInfo，64KiB 栈）。
+#[repr(C)]
+pub struct SmpInfo {
+    pub processor_id: u32,
+    pub lapic_id: u32,
+    pub reserved: u64,
+    pub goto_address: u64,
+    pub extra_argument: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<SmpInfo>() == 32);
+
+/// SmpResponse（brxlimine-rs lib.rs 550）。cpus 是指针数组（ArrayPtr，
+/// memmap 同款语义——内核逐槽解引用）。
+#[repr(C)]
+pub struct SmpResponse {
+    pub revision: u64,
+    pub flags: u32,
+    pub bsp_lapic_id: u32,
+    pub cpu_count: u64,
+    pub cpus: *mut *mut SmpInfo,
+}
+
+const _: () = assert!(core::mem::size_of::<SmpResponse>() == 32);
+
 /// media_type：Limine 语义（内核 main.rs LIMINE_MEDIA_*）。
 pub const MEDIA_OPTICAL: u32 = 1;
 
@@ -155,6 +183,9 @@ pub struct Handover {
     /// 帧缓冲物理基址（loader 内部 memmap 剥离用；fb_struct.address 是
     /// HHDM 虚地址，协议语义不可逆推物理）。0 = 无 GOP。
     pub fb_phys: u64,
+    pub smp: SmpResponse,
+    pub smp_infos: *mut SmpInfo,
+    pub smp_ptrs: *mut *mut SmpInfo,
 }
 
 impl Handover {
@@ -200,6 +231,15 @@ impl Handover {
                 physical_base: kernel_base,
                 virtual_base: kernel_vbase,
             },
+            smp: SmpResponse {
+                revision: 0,
+                flags: 0,
+                bsp_lapic_id: 0,
+                cpu_count: 0,
+                cpus: core::ptr::null_mut(),
+            },
+            smp_infos: core::ptr::null_mut(),
+            smp_ptrs: core::ptr::null_mut(),
         }
     }
 }
@@ -259,6 +299,11 @@ pub unsafe fn fill_requests(
             filled += 1;
         } else if [rid0, rid1] == KERNEL_ADDRESS_ID {
             *slot = (&mut handover.kaddr as *mut KernelAddressResponse as u64) + HHDM_OFFSET;
+            filled += 1;
+        } else if [rid0, rid1] == SMP_ID {
+            // cpus 指针数组 + SmpInfo 数组由 smp 模块在 kick 前填好。
+            handover.smp.cpus = (handover.smp_ptrs as u64 + HHDM_OFFSET) as *mut *mut SmpInfo;
+            *slot = (&mut handover.smp as *mut SmpResponse as u64) + HHDM_OFFSET;
             filled += 1;
         }
         off += 48; // 命中或未知请求标记都跳过整个标记体

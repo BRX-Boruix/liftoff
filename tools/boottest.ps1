@@ -103,7 +103,7 @@ if ($Variant -eq "elf-iso") {
 # stage works: banner (jump), HHDM offset (protocol), RSDP rev=2 (M5 config
 # table), pmm sizing on a sane map (memmap pointer-array semantics).
 if ($Variant -eq "boot") {
-    $autoExpect = @("Hello, BORUIX!", "Kernel M0 is running.", "[mm] HHDM offset: 0xffff800000000000", "[acpi] RSDP rev=2", "LazyBuddy init done")
+    $autoExpect = @("Hello, BORUIX!", "Kernel M0 is running.", "[mm] HHDM offset: 0xffff800000000000", "[acpi] RSDP rev=2", "LazyBuddy init done", "[smp] BSP lapic_id=0", "[smp] fired AP lapic_id=1", "[smp] AP online, lapic_id=1")
 }
 
 # EXT2 variants: whole-disk fixture from mkext2.py attached as a plain raw drive.
@@ -142,6 +142,7 @@ $qargs = @(
 )
 $effExpect = $Expect
 if ($autoExpect) { $effExpect = @($Expect) + $autoExpect }
+if ($Variant -eq "boot") { $qargs = @("-smp", "2") + $qargs }
 if ($media -eq "iso") { $qargs = @("-cdrom", $iso) + $qargs }
 if ($media -eq "ext") { $qargs = $qargs + @("-drive", "format=raw,file=$extimg") }
 $p = Start-Process -FilePath $qemuExe -ArgumentList $qargs -PassThru -RedirectStandardError $qerr

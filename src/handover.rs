@@ -139,14 +139,25 @@ pub fn convert_memmap(
 /// 自建 GDT。far ret 在 LLVM Intel 语法下编码不可靠（实测静默），近跳更小。
 /// rdx/rbx 在 asm 内作临时寄存器——必须显式 clobber，否则编译器把局部值
 /// 放进去会被踩坏（第一版未声明导致跳转后随机三重故障）。
-pub unsafe fn jump_kernel(pml4_phys: u64, entry_phys: u64) -> ! {
+/// 切 CR3（我们的 pml4：恒等 + LAPIC + HHDM + 内核高区）。切后恒等映射仍活，
+/// OVMF 栈（ram 内）继续可用——start_aps 依赖这一点在切换后执行。
+pub unsafe fn switch_cr3(pml4_phys: u64) {
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, rax",
+            in("rax") pml4_phys,
+            options(nomem, nostack, preserves_flags),
+        )
+    }
+}
+
+/// 已切 CR3 后调用；只负责最终 jmp（cli + cld + jmp）。
+pub unsafe fn jump_kernel(entry_phys: u64) -> ! {
     unsafe {
         core::arch::asm!(
             "cli",
             "cld",
-            "mov cr3, rsi",
             "jmp rax",
-            in("rsi") pml4_phys,
             in("rax") entry_phys,
             options(noreturn, nostack),
         )
@@ -161,6 +172,7 @@ pub unsafe fn final_ebs_and_jump(
     hd: &mut boruix::Handover,
     pml4_phys: u64,
     entry: u64,
+    rsdp_phys: u64,
 ) -> ! {
     unsafe {
     crate::serial::write(format_args!("[m4] final stage\n"));
@@ -234,6 +246,40 @@ pub unsafe fn final_ebs_and_jump(
     hd.memmap.entry_count = n as u64;
     crate::serial::write(format_args!("[m4] memmap converted n={}\n", n));
 
+    // 3b) SMP: MADT walk + AP resource alloc + SmpInfo/Response fill (pre-EBS).
+    let aps = crate::smp::prepare(bs, pml4_phys, rsdp_phys, hd);
+    crate::serial::write(format_args!("[m4] smp prepared aps={}\n", aps));
+    crate::serial::write(format_args!("[m4] smp page={:#x}\n", hd.smp_infos as u64));
+
+    // 3c) 分配全部完成后**重取**最终内存映射（prepare 新分配的页必须
+    //     以非 usable 类型进快照——否则内核 pmm 会覆盖 trampoline/栈
+    //     /SmpInfo 页。第一次快照在分配前，必须作废重转。）
+    {
+        let mut size2: usize = buf.len();
+        let mut key2: usize = 0;
+        let mut dsz2: usize = 0;
+        let mut dver2: u32 = 0;
+        let st2 = (bs.get_memory_map)(&mut size2, buf.as_mut_ptr(), &mut key2, &mut dsz2, &mut dver2);
+        if efi::is_error(st2) {
+            crate::serial::write(format_args!("[m4] remap failed\n"));
+            loop { core::arch::asm!("hlt", options(nomem, nostack)); }
+        }
+        let nd2 = size2 / dsz2;
+        for i in 0..nd2.min(128) {
+            descs[i] = core::ptr::read(buf.as_ptr().add(i * dsz2) as *const efi::MemoryDescriptor);
+        }
+        let n2 = match crate::handover::convert_memmap(&descs[..nd2.min(128)], entries, 128, kbase_al, kend, fb_base, fb_size) {
+            Ok(n2) => n2,
+            Err(_) => 0,
+        };
+        for i in 0..n2 {
+            let slot_phys = struct_base + (i as u64) * 24;
+            core::ptr::write(ptrs.add(i), slot_phys + boruix::HHDM_OFFSET);
+        }
+        hd.memmap.entries = (entries_addr + boruix::HHDM_OFFSET) as *mut boruix::MemmapEntry;
+        hd.memmap.entry_count = n2 as u64;
+        crate::serial::write(format_args!("[m4] memmap reconverted n={}\n", n2));
+    }
     // 4) 内核映像里扫描请求标记（image_base 是物理；EBS 前恒等映射还活着——
     //    直接物理地址访问）。
     let filled = boruix::fill_requests(hd.kaddr.physical_base, hd.file_struct.length, hd);
@@ -246,7 +292,12 @@ pub unsafe fn final_ebs_and_jump(
         let status = (bs.exit_boot_services)(crate::efi::image_handle_global(), key);
         if !efi::is_error(status) {
             crate::serial::write(format_args!("[m4] EBS ok, jumping entry={:#x}\n", entry));
-            jump_kernel(pml4_phys, entry);
+            // 切到我们的页表（OVMF EBS 后栈在恒等映射内，本函数可继续）。
+            switch_cr3(pml4_phys);
+            // AP 启动必须在切页表后：trampoline 的 HHDM 轮询依赖我们的页表，
+            // 且 OVMF EBS 流程会把已收编的 AP 重新挂起（QMP cpu_reset 实锤）。
+            crate::smp::start_aps(hd);
+            jump_kernel(entry);
         }
         // map 已变：重取
         let mut size: usize = buf.len();

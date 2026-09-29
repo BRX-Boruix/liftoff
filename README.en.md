@@ -10,13 +10,13 @@ BORUIX's bootloader: reads the kernel ELF under UEFI and hands over control.
 - Reads `/boot/kernel` from an ISO9660 disc (liveCD mode)
 - Passes the memory map, framebuffer, RSDP and SMP information to the kernel
 - x86-64 UEFI only
-- Current status: M5 done. The kernel now boots for real: liftoff validates and loads the ELF64
-  image, applies PIE R_X86_64_RELATIVE relocations, hands off the Limine-semantic subset protocol
-  (BaseRevision/HHDM/Memmap/Framebuffer/RSDP/KernelFile/KernelAddress), builds 4-level huge-page
-  tables, exits boot services and jumps to the kernel — BORUIX kmain runs its full init chain:
-  pmm pool setup, ACPI RSDP-to-XSDT-to-FADT/HPET/S5 parsing, the driver framework and PCI
-  enumeration, all verified under QEMU/OVMF. Unconsumed requests such as SMP are left for later
-  milestones.
+- Current status: M6 done. The kernel boots for real with SMP: liftoff validates and loads the
+  ELF64 image, applies PIE R_X86_64_RELATIVE relocations, hands off the Limine-semantic subset
+  (BaseRevision/HHDM/Memmap/Framebuffer/RSDP/SMP/KernelFile/KernelAddress), builds 4-level
+  huge-page tables and exits boot services. APs are enumerated from MADT, brought up through a
+  three-stage trampoline (real mode to long mode) via INIT-SIPI, parked polling goto_address, and
+  released by the kernel into its AP entry. The full kmain chain (pmm/ACPI/drivers/PCI) and both
+  CPUs coming online are verified under QEMU/OVMF with -smp 2.
 
 ## Known limitations
 
