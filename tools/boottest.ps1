@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory = $false)][string[]]$Expect = @(),
     [string[]]$NotExpect = @(),
     [int]$TimeoutSec = 45,
-    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot", "mod")][string]$Variant = "normal"
+    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot", "mod", "ext-boot")][string]$Variant = "normal"
 )
 $ErrorActionPreference = "Stop"
 
@@ -124,12 +124,48 @@ if ($Variant -eq "mod") {
     $autoExpect = @($oracleOut | Where-Object { $_ -match '^MOD: ' } | ForEach-Object { $_.Substring(5) })
     if ($autoExpect.Count -lt 8) { Write-Output "FAIL: modtest oracle produced too few lines"; exit 2 }
 }
+# ext-boot (M9): install mode end to end from a real MBR system disk. Every line
+# proves a distinct stage: MBR/partition selection, EXT2 mount at the partition
+# offset, the 24 MiB kernel read (indirect blocks), ELF handover, and the kernel
+# choosing install mode from the BootSource we filled.
+if ($Variant -eq "ext-boot") {
+    # Device-independent anchors: disk id + partition index + start LBA come
+    # from the MBR we parsed; the kernel echoes them back in install mode.
+    $autoExpect = @(
+        "[m2c] mbr disk_id=0x424f5255 partition=1 start_lba=2048",
+        "M2C: mount ok",
+        "[m9] kernel path=/boot/kernel",
+        "M3: segs=3 entry=",
+        "Hello, BORUIX!",
+        "Kernel M0 is running.",
+        "[mm] HHDM offset: 0xffff800000000000",
+        "[acpi] RSDP rev=2",
+        "[boot] install mode detected: boot disk mbr_disk_id=0x424f5255 partition_index=1",
+        "partition lba=2048 (EXT2)",
+        "LazyBuddy init done"
+    )
+}
 
 # EXT2 variants: whole-disk fixture from mkext2.py attached as a plain raw drive.
 # ext: /BOOT/KERNIMG.BIN present; ext-nosig: non-EXT2 blob (magic must fail);
 # ext-nopath: valid EXT2 whose root has no BOOT directory.
 $extimg = $null
-if ($Variant -like "ext*") {
+if ($Variant -eq "ext-boot") {
+    # M9: real install disk. Built by the project toolchain:
+    #   python tools/main.py build --systemdisk
+    $media = "ext"
+    $candidates = @(
+        (Join-Path (Split-Path -Parent $liftoff) "systemdisk.img"),
+        (Join-Path $liftoff "target\systemdisk.img")
+    )
+    $src = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $src) {
+        Write-Output "FAIL: systemdisk.img not found (build with tools/main.py build --systemdisk)"
+        exit 2
+    }
+    $extimg = Join-Path $liftoff "target\systemdisk.img"
+    Copy-Item $src $extimg -Force
+} elseif ($Variant -like "ext*") {
     $media = "ext"
     $payload = Join-Path $liftoff "target\m2c-payload.bin"
     $extimg = Join-Path $liftoff "target\m2c.img"

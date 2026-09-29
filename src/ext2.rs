@@ -73,9 +73,48 @@ impl Inode {
     }
 }
 
+/// 间接表缓存（二级间接路径命中率最高：l2 每 256 块读一次、l1 每 256 块读一次）。
+struct MapCache {
+    l2_phys: u32,
+    l2: [u8; 1024],
+    l1_phys: u32,
+    l1: [u8; 1024],
+}
+
+impl MapCache {
+    const EMPTY: MapCache = MapCache { l2_phys: 0, l2: [0u8; 1024], l1_phys: 0, l1: [0u8; 1024] };
+
+    fn load_l2(&mut self, dev: &mut dyn BlockRead, vol: &Volume, phys: u32) -> Result<(), usize> {
+        if self.l2_phys != phys {
+            vol.read_block(dev, phys, &mut self.l2)?;
+            self.l2_phys = phys;
+        }
+        Ok(())
+    }
+
+    fn l2_entry(&self, idx: usize) -> u32 {
+        let o = idx * 4;
+        u32::from_le_bytes([self.l2[o], self.l2[o + 1], self.l2[o + 2], self.l2[o + 3]])
+    }
+
+    fn l1_of(&mut self, dev: &mut dyn BlockRead, vol: &Volume, phys: u32) -> Result<(), usize> {
+        if self.l1_phys != phys {
+            vol.read_block(dev, phys, &mut self.l1)?;
+            self.l1_phys = phys;
+        }
+        Ok(())
+    }
+
+    fn l1_entry(&self, idx: usize) -> u32 {
+        let o = idx * 4;
+        u32::from_le_bytes([self.l1[o], self.l1[o + 1], self.l1[o + 2], self.l1[o + 3]])
+    }
+}
 /// 已挂载卷。
 pub struct Volume {
     sb: Superblock,
+    /// 文件系统在设备内的起始字节（MBR 分区盘用；整盘挂载为 0）。
+    base: u64,
 }
 
 /// 打开的文件。
@@ -83,12 +122,24 @@ pub struct File {
     inode: Inode,
 }
 
+impl File {
+    /// 文件字节数（调用方据此分配读取缓冲）。
+    pub fn size(&self) -> u32 {
+        self.inode.size
+    }
+}
+
 impl Volume {
     /// 挂载：读 SB@1024（绝对偏移——1024B 块的 SB 就在字节 1024），
     /// 魔数与几何 sanity 全过才返回卷。
     pub fn mount(dev: &mut dyn BlockRead) -> Result<Volume, usize> {
+        Self::mount_at(dev, 0)
+    }
+
+    /// 在设备内 `base` 字节处挂载（MBR 分区：base = 分区起始 LBA × 512）。
+    pub fn mount_at(dev: &mut dyn BlockRead, base: u64) -> Result<Volume, usize> {
         let mut sb_raw = [0u8; 1024];
-        dev.read_at(1024, &mut sb_raw)?;
+        dev.read_at(base + 1024, &mut sb_raw)?;
         let magic = u16::from_le_bytes([sb_raw[56], sb_raw[57]]);
         if magic != EXT2_MAGIC {
             return Err(err::BAD_MAGIC);
@@ -114,6 +165,7 @@ impl Volume {
             return Err(err::CORRUPT_SB);
         }
         Ok(Volume {
+            base,
             sb: Superblock {
                 inodes_count,
                 blocks_count,
@@ -131,7 +183,7 @@ impl Volume {
             return Err(err::BAD_INO);
         }
         let group = (ino - 1) / self.sb.inodes_per_group;
-        let gdt_off = (self.sb.first_data_block as u64 + 1) * BS + group as u64 * 32;
+        let gdt_off = self.base + (self.sb.first_data_block as u64 + 1) * BS + group as u64 * 32;
         let mut gd = [0u8; 32];
         dev.read_at(gdt_off, &mut gd)?;
         let inode_table = u32::from_le_bytes([gd[8], gd[9], gd[10], gd[11]]);
@@ -139,7 +191,7 @@ impl Volume {
             return Err(err::CORRUPT_SB);
         }
         let idx = (ino - 1) % self.sb.inodes_per_group;
-        let abs = inode_table as u64 * BS + idx as u64 * self.sb.inode_size as u64;
+        let abs = self.base + inode_table as u64 * BS + idx as u64 * self.sb.inode_size as u64;
         // inode 原始区只取前 100 字节（mode..i_block 数组止于 100）
         let mut raw = [0u8; 100];
         dev.read_at(abs, &mut raw)?;
@@ -155,30 +207,54 @@ impl Volume {
         })
     }
 
-    /// 逻辑块号 → 物理块号。直块 12 + 一级间接（每块 256 指针）。
-    fn map_logical(&self, dev: &mut dyn BlockRead, inode: &Inode, logical: u32) -> Result<u32, usize> {
+    /// 逻辑块号 → 物理块号：直块 12 + 一级间接 256 + 二级间接 256²（每块
+    /// 1024B 块 256 个 u32 指针）。超出即 INDIRECT2_UNSUPPORTED（> 64.3MiB）。
+    ///
+    /// `cache` 缓存最近用到的间接表，避免每个数据块都重读指针块（真实内核
+    /// 24.6MB 在 1KiB 块下是 24576 次映射——无缓存会多出数万次 BlockIo）。
+    fn map_logical(
+        &self,
+        dev: &mut dyn BlockRead,
+        inode: &Inode,
+        logical: u32,
+        cache: &mut MapCache,
+    ) -> Result<u32, usize> {
         if (logical as usize) < 12 {
             return Ok(inode.blocks[logical as usize]);
         }
         let rem = logical - 12;
-        if rem >= 256 {
+        if rem < 256 {
+            // 一级间接
+            let l1 = inode.blocks[12];
+            if l1 == 0 {
+                return Ok(0); // 稀疏
+            }
+            cache.l1_of(dev, self, l1)?;
+            return Ok(cache.l1_entry(rem as usize));
+        }
+        let rem2 = rem - 256;
+        const PER_BLOCK: u32 = 256;
+        if rem2 >= PER_BLOCK * PER_BLOCK {
             return Err(err::INDIRECT2_UNSUPPORTED);
         }
-        let l1 = inode.blocks[12];
-        if l1 == 0 {
+        let l2 = inode.blocks[13];
+        if l2 == 0 {
             return Ok(0); // 稀疏
         }
-        let mut tbl = [0u8; 1024];
-        self.read_block(dev, l1, &mut tbl)?;
-        let o = rem as usize * 4;
-        Ok(u32::from_le_bytes([tbl[o], tbl[o + 1], tbl[o + 2], tbl[o + 3]]))
+        cache.load_l2(dev, self, l2)?;
+        let l1 = cache.l2_entry((rem2 / PER_BLOCK) as usize);
+        if l1 == 0 {
+            return Ok(0);
+        }
+        cache.l1_of(dev, self, l1)?;
+        Ok(cache.l1_entry((rem2 % PER_BLOCK) as usize))
     }
 
     fn read_block(&self, dev: &mut dyn BlockRead, phys: u32, buf: &mut [u8]) -> Result<(), usize> {
         if phys == 0 || phys as u64 >= self.sb.blocks_count as u64 {
             return Err(err::BLOCK_RANGE);
         }
-        dev.read_at(phys as u64 * BS, &mut buf[..1024])
+        dev.read_at(self.base + phys as u64 * BS, &mut buf[..1024])
     }
 
     /// 读 inode 数据到 buf，返回实际读取字节数（EOF 截断；稀疏洞读零）。
@@ -191,11 +267,12 @@ impl Volume {
         let want = core::cmp::min(buf.len(), inode.size as usize);
         let mut done = 0usize;
         let mut scratch = [0u8; 1024];
+        let mut cache = MapCache::EMPTY;
         while done < want {
             let logical = (done / 1024) as u32;
             let in_block = done % 1024;
             let take = core::cmp::min(want - done, 1024 - in_block);
-            let phys = self.map_logical(dev, inode, logical)?;
+            let phys = self.map_logical(dev, inode, logical, &mut cache)?;
             if phys == 0 {
                 for b in &mut buf[done..done + take] {
                     *b = 0;

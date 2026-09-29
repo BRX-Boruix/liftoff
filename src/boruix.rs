@@ -179,7 +179,31 @@ pub struct ModuleResponse {
 const _: () = assert!(core::mem::size_of::<ModuleResponse>() == 24);
 
 /// media_type：Limine 语义（内核 main.rs LIMINE_MEDIA_*）。
+pub const MEDIA_GENERIC: u32 = 0;
 pub const MEDIA_OPTICAL: u32 = 1;
+
+/// 启动来源（填进 KernelFile 的 `File`；内核 `boot_source()` 据此选模式：
+/// optical → liveCD（RAMFS 根）；generic → 安装模式（按 mbr_disk_id +
+/// partition_index 找启动分区挂根）。
+#[derive(Clone, Copy)]
+pub struct BootSource {
+    pub media_type: u32,
+    /// 1-based 分区号；整盘（无分区表）为 0。
+    pub partition_index: u32,
+    /// MBR 磁盘签名（offset 0x1B8）；无 MBR 为 0。
+    pub mbr_disk_id: u32,
+}
+
+impl BootSource {
+    /// ISO9660 光学介质（liveCD）。
+    pub const OPTICAL: BootSource = BootSource { media_type: MEDIA_OPTICAL, partition_index: 0, mbr_disk_id: 0 };
+    /// 整盘 EXT2、无分区表（M2c fixture 口径）。
+    pub const DISK_WHOLE: BootSource = BootSource { media_type: MEDIA_GENERIC, partition_index: 0, mbr_disk_id: 0 };
+    /// MBR 分区盘上的第 `partition_index`（1-based）分区。
+    pub const fn disk_partition(partition_index: u32, mbr_disk_id: u32) -> BootSource {
+        BootSource { media_type: MEDIA_GENERIC, partition_index, mbr_disk_id }
+    }
+}
 
 // ---------------------------------------------------------------- 交接数据集
 
@@ -219,6 +243,7 @@ impl Handover {
         kernel_vbase: u64,
         kernel_len: u64,
         fb_phys: u64,
+        boot: BootSource,
     ) -> Handover {
         Handover {
             hhdm: HhdmResponse { revision: 0, offset: hhdm_off },
@@ -235,12 +260,12 @@ impl Handover {
                 length: kernel_len,
                 path: core::ptr::null_mut(),
                 cmdline: core::ptr::null_mut(),
-                media_type: MEDIA_OPTICAL, // liftoff liveCD 语义：ISO 启动
+                media_type: boot.media_type,
                 unused: 0,
                 tftp_ip: 0,
                 tftp_port: 0,
-                partition_index: 0,
-                mbr_disk_id: 0,
+                partition_index: boot.partition_index,
+                mbr_disk_id: boot.mbr_disk_id,
                 gpt_disk_uuid: [0; 16],
                 gpt_part_uuid: [0; 16],
                 part_uuid: [0; 16],

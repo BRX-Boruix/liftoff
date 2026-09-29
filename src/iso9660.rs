@@ -67,10 +67,17 @@ impl BlockRead for UefiBlock<'_> {
             let want = buf.len() - done;
             // 尾窗不越过媒体最后一块（read_blocks 越界返回 INVALID_PARAMETER）。
             let last_block = unsafe { (*self.bio.media).last_block };
+            let avail = (last_block as usize).saturating_sub(block as usize) + 1;
+            if avail == 0 || block > last_block {
+                return Err(0x13);
+            }
             let span_blocks = (((want + bs as usize - 1) / bs as usize) + 1)
                 .min(MAX_BLOCKS_PER_CALL)
-                .min((last_block - block + 1) as usize);
+                .min(avail);
             let span_bytes = span_blocks * bs as usize;
+            if span_blocks == 0 {
+                return Err(0x13); // 本模块内部码：读到设备末尾之外
+            }
             let mut tmp = PoolBuf::new(self.bs, span_bytes)?;
             // SAFETY: tmp 缓冲来自本次分配，read_blocks 按块填入。
             let status = unsafe {

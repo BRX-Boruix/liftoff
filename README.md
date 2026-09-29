@@ -10,13 +10,13 @@ BORUIX 的引导程序：在 UEFI 环境下读取内核 ELF 并交接控制权�
 - 从 ISO9660 光盘读取 `/boot/kernel`，对应 liveCD 模式
 - 将内存映射、帧缓冲、RSDP、SMP 信息交给内核
 - 仅支持 x86-64 UEFI
-- 当前状态：M8 完成。内核已可真实引导且带 SMP 与模块：liftoff 完成 ELF64 校验
-  装载、PIE R_X86_64_RELATIVE 重定位、Limine 语义子集协议交接（BaseRevision/
-  HHDM/Memmap/Framebuffer/RSDP/SMP/**Modules**/KernelFile/KernelAddress）、4 级
-  大页页表与 ExitBootServices；AP 经 MADT 枚举 + 三段式 trampoline + INIT-SIPI
-  启动并停泊轮询 goto_address；模块按需加载（内核声明 ModuleRequest 时）并交付
-  `ModuleResponse`。kmain 全链、双核上线与模块交付分别在 QEMU/OVMF 实机验证
-  （`boot` / `mod` 变体）。
+- 当前状态：M9 完成。两种启动方式都已端到端跑通：
+  - **liveCD**（ISO9660）：`boot` 变体 —— 内核全链 + 双核上线；
+  - **安装模式**（MBR 分区 + EXT2）：`ext-boot` 变体 —— 读盘上 24.6MB 内核
+    （含二级间接块）、完整交接，内核按 liftoff 填的 `mbr_disk_id`/`partition_index`
+    识别启动盘并把该 EXT2 分区挂为根。
+  - 协议面：BaseRevision/HHDM/Memmap/Framebuffer/RSDP/SMP/Modules/KernelFile/
+    KernelAddress（模块按需加载，仅内核声明 ModuleRequest 时）。
 
 ## 已知限制
 

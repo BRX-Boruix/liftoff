@@ -21,6 +21,7 @@ mod serial;
 mod smp;
 
 use core::panic::PanicInfo;
+use crate::iso9660::BlockRead;
 
 /// M2a 读缓冲：单次 Read 的容量（只读小测试文件）。
 const READ_BUF: usize = 512;
@@ -30,7 +31,6 @@ const ISO_BUF: usize = 16 * 1024 * 1024;
 
 /// M2c 读缓冲：EXT2 直块寻址上限 12KiB（1024B × 12 直块）。
 /// 超过即需要一级间接链支持——内核超过 12KiB 时是 M3 的扩展点。
-const EXT_BUF: usize = 12 * 1024;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -285,7 +285,7 @@ fn m2b(bs: &efi::BootServices) {
                         //    PoolBuf 是 BootServicesData，EBS 后不可依赖）。
                         match copy_persistent(bs, blob.as_slice()) {
                             Ok(file_base) => {
-                                m4_handover(bs, &lr, file_base, n as u64, mods);
+                                m4_handover(bs, &lr, file_base, n as u64, mods, boruix::BootSource::OPTICAL);
                             }
                             Err(s) => m4_fail("persist blob", s),
                         }
@@ -381,6 +381,7 @@ fn m4_handover(
     file_base: *mut u8,
     file_len: u64,
     mods: modules::LoadedModules,
+    boot: boruix::BootSource,
 ) -> ! {
     serial::write(format_args!("[m4] handover begin\n"));
 
@@ -497,6 +498,7 @@ fn m4_handover(
         rsdp_ptr,
         kphys, kvbase, kernel_len,
         fb_phys,
+        boot,
     );
     // 5c) SMP 区指针（SmpInfo 在页首，指针数组在页 +256）。
     // M8: 模块响应（内核未声明请求时 count=0、指针为空）。
@@ -594,9 +596,59 @@ fn push_rel_hex(s: &mut Str64, v: u64) {
     }
 }
 
-// ================================ M2c
-// EXT2 真实链：磁盘设备（512B 块、非只读、非分区）→ 挂载 → 读 /BOOT/KERNIMG.BIN。
+// ================================ M2c / M9
+// EXT2 真实链：整盘或 MBR 分区 → 挂载 → 读内核 ELF → **完整交接**（安装模式）。
 
+/// MBR 引导扇区签名（偏移 510）。
+const MBR_SIGNATURE: u16 = 0xAA55;
+/// MBR 磁盘签名偏移（4 字节；内核按此匹配启动盘）。
+const MBR_DISK_ID_OFF: usize = 0x1B8;
+/// MBR 分区表偏移（4 × 16 字节）。
+const MBR_PART_TABLE_OFF: usize = 0x1BE;
+/// 单个分区表项大小。
+const MBR_PART_ENTRY: usize = 16;
+
+/// MBR 分区项（只取启动所需字段）。
+struct MbrPartition {
+    /// 1-based 槽位（= 内核 `init_install` 的 `partition_index` 口径）。
+    index: u32,
+    /// 分区起始 LBA（512B 扇区）。
+    start_lba: u32,
+}
+
+/// 选启动分区：优先活动分区（status 0x80），否则第一个非空项。
+fn pick_boot_partition(mbr: &[u8; 512]) -> Option<MbrPartition> {
+    let mut first: Option<MbrPartition> = None;
+    for i in 0..4usize {
+        let o = MBR_PART_TABLE_OFF + i * MBR_PART_ENTRY;
+        let status = mbr[o];
+        let ptype = mbr[o + 4];
+        let start_lba = u32::from_le_bytes([mbr[o + 8], mbr[o + 9], mbr[o + 10], mbr[o + 11]]);
+        let sectors = u32::from_le_bytes([mbr[o + 12], mbr[o + 13], mbr[o + 14], mbr[o + 15]]);
+        if ptype == 0 || sectors == 0 || start_lba == 0 {
+            continue; // 空项
+        }
+        let part = MbrPartition { index: (i + 1) as u32, start_lba };
+        if status == 0x80 {
+            return Some(part); // 活动分区优先
+        }
+        if first.is_none() {
+            first = Some(part);
+        }
+    }
+    first
+}
+
+/// M2c/M9：EXT2 启动路径（安装模式）。
+///
+/// 挂载顺序：先试「整盘即文件系统」（M2c fixture 无 MBR 的口径，既有契约行
+/// 不变），失败再解析 MBR —— 签名 0xAA55 → 磁盘签名（offset 0x1B8）→ 选分区
+/// （活动分区优先）→ 在分区起始处挂 EXT2（M9 真实安装盘，由
+/// `tools/main.py build --systemdisk` 产出）。
+///
+/// 读到内核后走与 ISO 路径**同构**的完整交接；本次读取直接落 EfiLoaderData，
+/// 即 `File.base` 的最终位置（无需再拷一份）。BootSource 按 EXT2 语义填
+/// generic + partition_index + mbr_disk_id —— 内核据此进安装模式并按同一分区挂根。
 fn m2c(bs: &efi::BootServices) {
     let mut no_handles: usize = 0;
     let mut buf_raw: *mut efi::Handle = core::ptr::null_mut();
@@ -627,61 +679,137 @@ fn m2c(bs: &efi::BootServices) {
         // SAFETY: media 指针同上。
         let media = unsafe { &*bio.media };
         if media.logical_partition || media.read_only {
-            continue; // M2c 只挂整盘可写介质（安装盘口径）；光盘归 M2b
+            continue; // 整盘可写介质（安装盘口径）；光盘归 M2b
         }
         let mut dev = iso9660::UefiBlock::new(bs, bio);
-        let vol = match ext2::Volume::mount(&mut dev) {
-            Ok(v) => v,
-            Err(s) => {
-                // 非 EXT2 的块设备（vvfat ESP 等）静默跳过是正确语义：
-                // ext-nosig 变体依赖这条路径输出探测失败行。
-                let mut l = Str64::new();
-                let _ = l.push_str("M2C: mount failed status=0x");
-                push_byte_hex(&mut l, s as u8);
-                contract(&l);
-                continue;
+
+        // 1) 整盘 EXT2（无分区表）
+        let (vol, boot) = match ext2::Volume::mount(&mut dev) {
+            Ok(v) => (v, boruix::BootSource::DISK_WHOLE),
+            Err(s_whole) => {
+                // 2) MBR 分区盘
+                let mut mbr = [0u8; 512];
+                let is_mbr = dev.read_at(0, &mut mbr).is_ok()
+                    && u16::from_le_bytes([mbr[510], mbr[511]]) == MBR_SIGNATURE;
+                if !is_mbr {
+                    // 非 MBR 非 EXT2（vvfat ESP、ext-nosig 数据）：沿用 M2c 探测失败口径。
+                    let mut l = Str64::new();
+                    let _ = l.push_str("M2C: mount failed status=0x");
+                    push_byte_hex(&mut l, s_whole as u8);
+                    contract(&l);
+                    continue;
+                }
+                let disk_id = u32::from_le_bytes([
+                    mbr[MBR_DISK_ID_OFF],
+                    mbr[MBR_DISK_ID_OFF + 1],
+                    mbr[MBR_DISK_ID_OFF + 2],
+                    mbr[MBR_DISK_ID_OFF + 3],
+                ]);
+                let Some(part) = pick_boot_partition(&mbr) else {
+                    contract(&Str64::from("M2C: no bootable partition"));
+                    continue;
+                };
+                serial::write(format_args!(
+                    "[m2c] mbr disk_id={:#010x} partition={} start_lba={}\n",
+                    disk_id, part.index, part.start_lba
+                ));
+                match ext2::Volume::mount_at(&mut dev, part.start_lba as u64 * 512) {
+                    Ok(v) => (v, boruix::BootSource::disk_partition(part.index, disk_id)),
+                    Err(s2) => {
+                        let mut l = Str64::new();
+                        let _ = l.push_str("M2C: partition ext2 failed status=0x");
+                        push_byte_hex(&mut l, s2 as u8);
+                        contract(&l);
+                        continue;
+                    }
+                }
             }
         };
-        let ok = Str64::from("M2C: mount ok");
-        contract(&ok);
+        contract(&Str64::from("M2C: mount ok"));
 
-        match vol.open_path(&mut dev, config::EXT_KERNEL_PATH) {
-            Ok(f) => {
-                let mut blob = [0u8; EXT_BUF];
-                let n = match vol.read_file(&mut dev, &f, &mut blob) {
-                    Ok(n) => n,
-                    Err(s) => fatal("ext read", s),
-                };
-                let mut sum: u32 = 0;
-                for &b in &blob[..n] {
-                    sum = sum.wrapping_add(b as u32);
+        // 内核路径：规范安装布局 /boot/kernel 优先，其次 M2c fixture BOOT/KERNIMG.BIN。
+        let mut chosen: Option<(ext2::File, &str)> = None;
+        let mut last_err: usize = efi::EFI_NOT_FOUND;
+        for p in [config::KERNEL_PATH, config::EXT_KERNEL_PATH] {
+            match vol.open_path(&mut dev, p) {
+                Ok(f) => {
+                    chosen = Some((f, p));
+                    break;
                 }
-                let mut l = Str64::new();
-                let _ = l.push_str("M2C: len=");
-                push_dec(&mut l, n);
-                contract(&l);
-                let mut l = Str64::new();
-                let _ = l.push_str("M2C: sum=0x");
-                push_sum16(&mut l, sum);
-                contract(&l);
+                Err(e) => last_err = e,
             }
-            Err(efi::EFI_NOT_FOUND) => {
-                let mut line = Str64::new();
-                let _ = line.push_str("M2C: open failed status=0x");
-                push_status_hex(&mut line, efi::EFI_NOT_FOUND);
-                contract(&line);
+        }
+        let Some((f, path)) = chosen else {
+            // 内部错误码（如 0x25 目录项越界 / 0x28 模式不符）与 UEFI 状态区分：
+            // ext2 内部码 < 0x100，直接按字节打印；否则按 UEFI 状态打印。
+            let mut l = Str64::new();
+            let _ = l.push_str("M2C: open failed status=0x");
+            if last_err < 0x100 {
+                push_byte_hex(&mut l, last_err as u8);
+            } else {
+                push_status_hex(&mut l, last_err);
+            }
+            contract(&l);
+            return;
+        };
+
+        // 读进 EfiLoaderData 常驻区（= File.base 最终位置；大文件不受固定缓冲限制）。
+        let size = f.size() as u64;
+        let pages = ((size + 0xFFF) / 0x1000).max(1);
+        let mut blob_base: u64 = 0;
+        let st = unsafe {
+            (bs.allocate_pages)(
+                efi::ALLOCATE_ANY_PAGES,
+                efi::MEMORY_LOADER_DATA,
+                pages as usize,
+                &mut blob_base,
+            )
+        };
+        if efi::is_error(st) {
+            m4_fail("ext2 kernel pages", st);
+        }
+        let blob = unsafe { core::slice::from_raw_parts_mut(blob_base as *mut u8, size as usize) };
+        let n = match vol.read_file(&mut dev, &f, blob) {
+            Ok(n) => n,
+            Err(s) => fatal("ext read", s),
+        };
+        let mut sum: u32 = 0;
+        for &b in blob.iter() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        serial::write(format_args!("[m9] kernel path={} size={}\n", path, n));
+        let mut l = Str64::new();
+        let _ = l.push_str("M2C: len=");
+        push_dec(&mut l, n);
+        contract(&l);
+        let mut l = Str64::new();
+        let _ = l.push_str("M2C: sum=0x");
+        push_sum16(&mut l, sum);
+        contract(&l);
+
+        // 与 ISO 路径同构的完整交接（安装模式）。
+        match elf::load(&blob[..n], bs) {
+            Ok(lr) => {
+                report_load(&lr);
+                m4_handover(
+                    bs,
+                    &lr,
+                    blob_base as *mut u8,
+                    n as u64,
+                    modules::LoadedModules::EMPTY,
+                    boot,
+                );
             }
             Err(s) => {
                 let mut l = Str64::new();
-                let _ = l.push_str("M2C: open failed status=0x");
+                let _ = l.push_str("M3: reject status=0x");
                 push_byte_hex(&mut l, s as u8);
                 contract(&l);
+                return;
             }
         }
-        return; // 命中第一块 EXT2 盘即完成 M2c 验收
     }
-    let fail = Str64::from("M2C: no ext2 disk");
-    contract(&fail);
+    contract(&Str64::from("M2C: no ext2 disk"));
 }
 
 /// 单字节 hex（内部错误码契约行）。
