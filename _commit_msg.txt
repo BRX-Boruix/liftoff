@@ -1,0 +1,21 @@
+M2a: UEFI file protocol chain verified under QEMU OVMF
+
+LoadedImage -> DeviceHandle -> SimpleFileSystem -> OpenVolume -> Open -> Read
+chain reads m2a.txt from the boot medium; serial reports length and 16-bit
+byte sum, host-side script compares against precomputed values.
+
+Acceptance (tools/boottest.ps1, real OVMF boot, all green):
+- normal:  len=36 sum=0x0834
+- missing: EFI_NOT_FOUND reported, no len line (legal branch, boot not failed)
+- empty:   len=0 sum=0x0000
+
+Binding notes:
+- BootServices declared through ExitBootServices (offset 232..240, 240 bytes);
+  the two vararg members after it cannot be declared under efiapi ABI.
+- All struct sizes pinned by compile-time assertions.
+- Fixed M1 latent bug: SimpleTextOutput missed EnableCursor, shifting mode by 8;
+  M1 never dereferenced mode so it stayed hidden.
+- FileGuard: Drop closes the handle, error and success paths share one release
+  point; read-only handles only, revisit before any write handle.
+
+Zero warnings. Contract lines carry the M2A: prefix; general logs use [liftoff].

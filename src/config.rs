@@ -2,16 +2,14 @@
 //!
 //! 所有路径与协议版本集中在此，避免散落的字面量。
 
-/// UEFI 成功状态码。
-pub const EFI_SUCCESS: usize = 0;
-
 /// 内核在引导介质上的绝对路径。
 ///
 /// 两种启动模式（liveCD 的 ISO9660 / 安装模式的 EXT2）路径一致。
 pub const KERNEL_PATH: &str = "/boot/kernel";
 
-/// liftoff.conf 路径。M2 起用于覆盖 [`KERNEL_PATH`]。
-pub const CONFIG_PATH: &str = "/boot/liftoff.conf";
+/// M2a 验收用测试文件（引导介质根目录）。
+/// 验收脚本 boottest.ps1 以同名常量生成内容并预计算校验和。
+pub const TEST_FILE: &str = "m2a.txt";
 
 // ----------------------------------------------------------------
 // 引导协议（阶段一：复用 Limine 协议）
@@ -26,8 +24,6 @@ pub const CONFIG_PATH: &str = "/boot/liftoff.conf";
 /// 阶段二自拟协议将取消版本协商，改为 magic + version 精确匹配。
 pub const LIMINE_BASE_REVISION: u64 = 6;
 
-/// Limine 协议 `File.media_type`：普通磁盘介质（安装模式 / EXT2）。
-pub const MEDIA_TYPE_GENERIC: u32 = 0;
-
-/// Limine 协议 `File.media_type`：光盘介质（liveCD / ISO9660）。
-pub const MEDIA_TYPE_OPTICAL: u32 = 1;
+// Limine 协议 `File.media_type` 取值（GENERIC=0 普通磁盘 / OPTICAL=1 光盘）
+// 属 M4 契约，在 contributor 文档与本注释记录；M4 引入 File 响应结构时
+// 随使用回归本模块。

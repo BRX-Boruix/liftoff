@@ -10,6 +10,9 @@ BORUIX's bootloader: reads the kernel ELF under UEFI and hands over control.
 - Reads `/boot/kernel` from an ISO9660 disc (liveCD mode)
 - Passes the memory map, framebuffer, RSDP and SMP information to the kernel
 - x86-64 UEFI only
+- Current status: M2a done. The UEFI file protocol chain (LoadedImage, SimpleFileSystem, Open, Read)
+  is verified under QEMU OVMF: files on the boot medium are read and reported with size and checksum;
+  EXT2, ISO9660 and ELF loading are not yet implemented
 
 ## Known limitations
 
@@ -28,17 +31,18 @@ The output is `target/x86_64-unknown-uefi/release/liftoff.efi`, which goes under
 
 ## Repository layout
 
-- `src/main.rs` — UEFI entry point
+- `src/main.rs` — UEFI entry point and the M2a file read chain
+- `src/efi.rs` — hand-written minimal UEFI bindings with compile-time layout assertions
+- `src/serial.rs` — COM1 serial output, the primary observation channel
 - `src/config.rs` — kernel path and protocol version constants
+- `tools/boottest.ps1` — QEMU OVMF real-boot acceptance script (build, stage ESP, assert serial log)
 
 ## Related projects
 
 - [`kernel`](https://github.com/BRX-Boruix/kernel) — the kernel it boots
 - [`tools`](https://github.com/BRX-Boruix/tools) — builds bootable images and runs them under QEMU
+- [`wiki`](https://github.com/BRX-Boruix/wiki) — protocol planning and milestone records
 
 ## License
 
 MIT License, copyright Yang Borui. See [LICENSE](LICENSE).
-## Status
-
-M1 done: entry signature check and dual-channel serial/console output verified under QEMU OVMF. Filesystem and kernel loading not yet implemented.
