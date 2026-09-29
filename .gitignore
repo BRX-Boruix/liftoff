@@ -6,6 +6,6 @@
 /esp/
 *.img
 *.iso
-_commit_msg*.txt
-_msg*.txt
+_commit_m*.txt
+_m*.txt
 __pycache__/
