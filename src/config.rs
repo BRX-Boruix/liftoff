@@ -13,18 +13,27 @@ pub const KERNEL_PATH: &str = "/boot/kernel";
 /// liftoff.conf 路径。M2 起用于覆盖 [`KERNEL_PATH`]。
 pub const CONFIG_PATH: &str = "/boot/liftoff.conf";
 
+// ----------------------------------------------------------------
+// 引导协议（阶段一：复用 Limine 协议）
+//
+// 协议分两阶段实施，规划见 README 的「引导协议：两步走」。
+// 本模块的常量对应阶段一，与内核 `brxlimine-rs` 的口径必须一致。
+// ----------------------------------------------------------------
+
 /// 支持的 Limine 协议基础版本号。
 ///
 /// 与内核 `BaseRevision::new(6)` 保持一致：
 /// 内核声明 6，引导程序回填自身支持的最高版本，内核取较小者。
+///
+/// 注：阶段二自拟协议将取消版本协商，改为 magic + version 精确匹配。
 pub const LIMINE_BASE_REVISION: u64 = 6;
 
 /// Limine 协议 `File.media_type`：普通磁盘介质（安装模式 / EXT2）。
 ///
-/// 内核据此判定为 `BootSource::Disk`。
+/// 内核据此判定为 `BootSource::Disk`（见 `kernel/crates/kernel/src/main.rs`）。
 pub const MEDIA_TYPE_GENERIC: u32 = 0;
 
 /// Limine 协议 `File.media_type`：光盘介质（liveCD / ISO9660）。
 ///
-/// 内核据此判定为 `BootSource::LiveCd`。
+/// 内核据此判定为 `BootSource::LiveCd`（见 `kernel/crates/kernel/src/main.rs`）。
 pub const MEDIA_TYPE_OPTICAL: u32 = 1;
