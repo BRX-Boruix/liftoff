@@ -10,6 +10,7 @@
 
 mod config;
 mod efi;
+mod elf;
 mod ext2;
 mod iso9660;
 mod serial;
@@ -242,6 +243,17 @@ fn m2b(bs: &efi::BootServices) {
                 let _ = l.push_str("M2B: sum=0x");
                 push_sum16(&mut l, sum);
                 contract(&l);
+
+                // M3: 装载内核 ELF（读到什么装什么——验收链路对内容形状闭环）。
+                match elf::load(blob.as_slice(), bs) {
+                    Ok(lr) => report_load(&lr),
+                    Err(s) => {
+                        let mut l = Str64::new();
+                        let _ = l.push_str("M3: reject status=0x");
+                        push_byte_hex(&mut l, s as u8);
+                        contract(&l);
+                    }
+                }
             }
             Err(efi::EFI_NOT_FOUND) => {
                 let mut line = Str64::new();
@@ -256,6 +268,64 @@ fn m2b(bs: &efi::BootServices) {
     // 未找到任何可挂载的 ISO 卷：0x11 是 iso9660 模块"探测失败"内部码。
     let fail = Str64::from("M2B: mount failed status=0x11");
     contract(&fail);
+}
+
+/// M3 装载报告：把 LoadResult 逐行打成串口契约行（与 elf_oracle.py 同源）。
+fn report_load(lr: &elf::LoadResult) {
+    for i in 0..lr.segs {
+        let r = &lr.reports[i];
+        let mut l = Str64::new();
+        let _ = l.push_str("M3: seg");
+        push_dec(&mut l, i);
+        let _ = l.push_str(" rel=0x");
+        push_rel_hex(&mut l, r.rel);
+        let _ = l.push_str(" size=");
+        push_dec(&mut l, r.memsz as usize);
+        let _ = l.push_str(" sum16=0x");
+        push_sum16(&mut l, r.sum16 as u32);
+        contract(&l);
+    }
+    let mut l = Str64::new();
+    let _ = l.push_str("M3: segs=");
+    push_dec(&mut l, lr.segs);
+    let _ = l.push_str(" entry=0x");
+    push_rel_hex(&mut l, lr.entry);
+    contract(&l);
+    let mut l = Str64::new();
+    let _ = l.push_str("M3: vbase=0x");
+    push_rel_hex(&mut l, lr.vbase);
+    let _ = l.push_str(" image_size=");
+    push_dec(&mut l, lr.image_size as usize);
+    contract(&l);
+    // base 是运行期观测值（物理地址固件决定），oracle 无法预算，不作断言；
+    // 它同时是 M4 协议交接的锚点数据。
+    let mut l = Str64::new();
+    let _ = l.push_str("M3: base=0x");
+    push_rel_hex(&mut l, lr.image_base);
+    contract(&l);
+    let mut l = Str64::new();
+    let _ = l.push_str("M3: total_mem=");
+    push_dec(&mut l, lr.total_mem as usize);
+    let _ = l.push_str(" total_sum16=0x");
+    push_sum16(&mut l, lr.total_sum16 as u32);
+    contract(&l);
+    let mut l = Str64::new();
+    let _ = l.push_str("M3: total_sum16=0x");
+    push_sum16(&mut l, lr.total_sum16 as u32);
+    contract(&l);
+}
+
+/// 64 位值 hex（小写，无前导零省略——固定 16 位宽与 oracle 一致）。
+fn push_rel_hex(s: &mut Str64, v: u64) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut started = false;
+    for shift in (0..64).step_by(4).rev() {
+        let nib = ((v >> shift) & 0xF) as usize;
+        if nib != 0 || started || shift == 0 {
+            s.push(HEX[nib] as char);
+            started = true;
+        }
+    }
 }
 
 // ================================ M2c

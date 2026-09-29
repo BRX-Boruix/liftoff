@@ -10,9 +10,10 @@ BORUIX's bootloader: reads the kernel ELF under UEFI and hands over control.
 - Reads `/boot/kernel` from an ISO9660 disc (liveCD mode)
 - Passes the memory map, framebuffer, RSDP and SMP information to the kernel
 - x86-64 UEFI only
-- Current status: M2c done. Read-only ISO9660 and EXT2 drivers are implemented and verified against
-  real devices under QEMU OVMF (optical and disk chains: block enumeration, probe, directory
-  traversal, file read); ELF loading is not yet implemented
+- Current status: M3 done. An ELF64 loader is implemented: once the optical chain reads the kernel
+  ELF, it validates, allocates one contiguous physical image, places segments with BSS zeroing,
+  and reports the layout and checksums on serial (expectations derived by tools/elf_oracle.py).
+  Next: M4, ExitBootServices and protocol handoff.
 
 ## Known limitations
 
@@ -36,6 +37,8 @@ The output is `target/x86_64-unknown-uefi/release/liftoff.efi`, which goes under
 - `src/serial.rs` — COM1 serial output, the primary observation channel
 - `src/iso9660.rs` — read-only ISO9660 parser (block reads injected via a trait)
 - `src/ext2.rs` — read-only EXT2 parser (same trait seam, layout matched to the kernel-side reference)
+- `src/elf.rs` — ELF64 loader (validation + contiguous physical image + BSS zeroing)
+- `tools/elf_oracle.py` — ELF load expectation calculator (same rules as the driver)
 - `tools/mkext2.py` — deterministic EXT2 fixture builder
 - `src/config.rs` — kernel path and protocol version constants
 - `tools/boottest.ps1` — QEMU OVMF real-boot acceptance script (build, stage ESP, assert serial log)

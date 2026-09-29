@@ -36,6 +36,16 @@ pub const EFI_UNSUPPORTED: usize = EFI_ERROR_BIT | 3;
 /// （§13.2，Read 在文件位置处于 EOF 时返回它）。
 pub const EFI_END_OF_FILE: usize = EFI_ERROR_BIT | 18;
 
+/// EFI_ALLOCATE_TYPE：AllocateAnyPages（§7.2，值 0——固件任选地址）。
+pub const ALLOCATE_ANY_PAGES: u32 = 0;
+
+/// EFI_ALLOCATE_TYPE：AllocateAddress（§7.2，值 2——钉死调用方给定地址）。
+pub const ALLOCATE_ADDRESS: u32 = 2;
+
+/// EFI_MEMORY_TYPE：EfiLoaderData（§7.2，值 2——引导加载器装载的映像数据，
+/// ExitBootServices 后由内核继承，M4 交接语义）。
+pub const MEMORY_LOADER_DATA: u32 = 2;
+
 /// 判断状态码是否为错误。注意 END_OF_FILE 属于"错误位"但语义是正常终止。
 pub fn is_error(status: usize) -> bool {
     status & EFI_ERROR_BIT != 0

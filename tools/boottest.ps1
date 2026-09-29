@@ -7,10 +7,10 @@
 #   pwsh tools/boottest.ps1 -Variant missing -Expect "open failed status=0x800000000000000e"
 #   pwsh tools/boottest.ps1 -Variant empty   -Expect "M2A: len=0","M2A: sum=0x0000"
 param(
-    [Parameter(Mandatory = $true)][string[]]$Expect,
+    [Parameter(Mandatory = $false)][string[]]$Expect = @(),
     [string[]]$NotExpect = @(),
     [int]$TimeoutSec = 45,
-    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath")][string]$Variant = "normal"
+    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad")][string]$Variant = "normal"
 )
 $ErrorActionPreference = "Stop"
 
@@ -30,7 +30,8 @@ if (-not (Test-Path $fw)) { Write-Output "FAIL: edk2-x86_64-code.fd not found un
 
 Write-Output "== cargo build =="
 Push-Location $liftoff
-cargo build --release --target x86_64-unknown-uefi
+# EAP=Stop makes native stderr fatal when the caller redirects streams; run via
+cmd /c "cargo build --release --target x86_64-unknown-uefi 2>&1"
 $buildRc = $LASTEXITCODE
 Pop-Location
 if ($buildRc -ne 0) { Write-Output "FAIL: cargo build"; exit 2 }
@@ -56,7 +57,7 @@ switch ($Variant) {
 # directory (mount ok, open must report not-found).
 $iso = $null
 $media = "fat"
-if ($Variant -like "iso*") {
+if ($Variant -like "iso*" -or $Variant -like "elf-*") {
     $media = "iso"
     $payload = Join-Path $liftoff "target\m2b-payload.bin"
     $iso = Join-Path $liftoff "target\m2b.iso"
@@ -70,8 +71,28 @@ if ($Variant -like "iso*") {
     } elseif ($Variant -eq "iso-nopath") {
         [System.IO.File]::WriteAllBytes($payload, [System.Text.Encoding]::ASCII.GetBytes("LIFTOFF-M2B-KERNEL" + [char]10 + "0123456789ABCDEF" + [char]10))
         python (Join-Path $PSScriptRoot "mkiso.py") --kernel $payload --out $iso --volident EMPTYROOT --flat
+    } elseif ($Variant -eq "elf-bad") {
+        # ELF validation negative: deterministic pseudo-random blob (no magic).
+        # The ISO chain reads it fine; elf::load must reject with 0x30 BAD_MAGIC.
+        $blob = New-Object byte[] 4096
+        (New-Object Random 99).NextBytes($blob)
+        [System.IO.File]::WriteAllBytes($payload, $blob)
+        python (Join-Path $PSScriptRoot "mkiso.py") --kernel $payload --out $iso --volident BADELF
+    } elseif ($Variant -eq "elf-iso") {
+        # Real kernel ELF packed as KERNEL/KERNIMG.BIN; expectations derive from
+        # elf_oracle.py at run time (the ELF changes with every kernel rebuild).
+        $kernelElf = Join-Path $liftoff "target\kernel.elf"
+        python (Join-Path $PSScriptRoot "mkiso.py") --kernel $kernelElf --out $iso --volident LIFTOFF_M3
     }
     if (-not (Test-Path $iso)) { Write-Output "FAIL: iso fixture not built"; exit 2 }
+}
+
+# elf-iso: derive the assertion list from the oracle (single source of expectations).
+$autoExpect = $null
+if ($Variant -eq "elf-iso") {
+    $oracleOut = python (Join-Path $PSScriptRoot "elf_oracle.py") (Join-Path $liftoff "target\kernel.elf") 2>&1 | ForEach-Object { $_.ToString() }
+    $autoExpect = @($oracleOut | Where-Object { $_ -match '^M3: ' })
+    if ($autoExpect.Count -lt 6) { Write-Output "FAIL: oracle produced too few lines"; exit 2 }
 }
 
 # EXT2 variants: whole-disk fixture from mkext2.py attached as a plain raw drive.
@@ -108,6 +129,8 @@ $qargs = @(
     "-display", "none",
     "-no-reboot"
 )
+$effExpect = $Expect
+if ($autoExpect) { $effExpect = @($Expect) + $autoExpect }
 if ($media -eq "iso") { $qargs = @("-cdrom", $iso) + $qargs }
 if ($media -eq "ext") { $qargs = $qargs + @("-drive", "format=raw,file=$extimg") }
 $p = Start-Process -FilePath $qemuExe -ArgumentList $qargs -PassThru -RedirectStandardError $qerr
@@ -120,7 +143,7 @@ try {
             $probe = Get-Content $log -Raw -ErrorAction SilentlyContinue
             if ($probe) {
                 $allFound = $true
-                foreach ($e in $Expect) { if (-not $probe.Contains($e)) { $allFound = $false; break } }
+                foreach ($e in $effExpect) { if (-not $probe.Contains($e)) { $allFound = $false; break } }
                 if ($allFound) { break }
             }
         }
@@ -132,7 +155,7 @@ try {
 
 $content = if (Test-Path $log) { Get-Content $log -Raw } else { "" }
 $failed = $false
-foreach ($e in $Expect) {
+foreach ($e in $effExpect) {
     if ($content.Contains($e)) { Write-Output ("PASS: contains " + $e) }
     else { Write-Output ("FAIL: missing " + $e); $failed = $true }
 }
