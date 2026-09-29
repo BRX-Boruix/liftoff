@@ -10,6 +10,7 @@
 
 mod config;
 mod efi;
+mod ext2;
 mod iso9660;
 mod serial;
 
@@ -20,6 +21,10 @@ const READ_BUF: usize = 512;
 
 /// M2b 读缓冲上限：内核 ELF 上限 16MiB（当前内核 <1MiB，余量 16 倍）。
 const ISO_BUF: usize = 16 * 1024 * 1024;
+
+/// M2c 读缓冲：EXT2 直块寻址上限 12KiB（1024B × 12 直块）。
+/// 超过即需要一级间接链支持——内核超过 12KiB 时是 M3 的扩展点。
+const EXT_BUF: usize = 12 * 1024;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -72,8 +77,9 @@ pub extern "efiapi" fn efi_main(
 
     m2a(image_handle, bs);
     m2b(bs);
+    m2c(bs);
 
-    serial::write(format_args!("[liftoff] M2b done\n"));
+    serial::write(format_args!("[liftoff] M2c done\n"));
     efi::EFI_SUCCESS
 }
 
@@ -250,6 +256,103 @@ fn m2b(bs: &efi::BootServices) {
     // 未找到任何可挂载的 ISO 卷：0x11 是 iso9660 模块"探测失败"内部码。
     let fail = Str64::from("M2B: mount failed status=0x11");
     contract(&fail);
+}
+
+// ================================ M2c
+// EXT2 真实链：磁盘设备（512B 块、非只读、非分区）→ 挂载 → 读 /BOOT/KERNIMG.BIN。
+
+fn m2c(bs: &efi::BootServices) {
+    let mut no_handles: usize = 0;
+    let mut buf_raw: *mut efi::Handle = core::ptr::null_mut();
+    let status = unsafe {
+        (bs.locate_handle_buffer)(
+            efi::SEARCH_BY_PROTOCOL,
+            &efi::BLOCK_IO_GUID as *const efi::Guid as *const core::ffi::c_void,
+            core::ptr::null_mut(),
+            &mut no_handles,
+            &mut buf_raw,
+        )
+    };
+    if efi::is_error(status) {
+        fatal("locate block devices (m2c)", status);
+    }
+    // SAFETY: buf_raw 即本次 no_handles 对应的池缓冲。
+    let Some(handles) = (unsafe { efi::HandleBuffer::wrap(bs, buf_raw as *mut core::ffi::c_void, no_handles) }) else {
+        fatal("handle buffer null (m2c)", efi::EFI_UNSUPPORTED);
+    };
+
+    for &h in handles.handles() {
+        let bio_raw = match efi::protocol_of::<efi::BlockIo>(bs, h, &efi::BLOCK_IO_GUID) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // SAFETY: 协议指针由固件保证有效。
+        let bio = unsafe { &*bio_raw };
+        // SAFETY: media 指针同上。
+        let media = unsafe { &*bio.media };
+        if media.logical_partition || media.read_only {
+            continue; // M2c 只挂整盘可写介质（安装盘口径）；光盘归 M2b
+        }
+        let mut dev = iso9660::UefiBlock::new(bs, bio);
+        let vol = match ext2::Volume::mount(&mut dev) {
+            Ok(v) => v,
+            Err(s) => {
+                // 非 EXT2 的块设备（vvfat ESP 等）静默跳过是正确语义：
+                // ext-nosig 变体依赖这条路径输出探测失败行。
+                let mut l = Str64::new();
+                let _ = l.push_str("M2C: mount failed status=0x");
+                push_byte_hex(&mut l, s as u8);
+                contract(&l);
+                continue;
+            }
+        };
+        let ok = Str64::from("M2C: mount ok");
+        contract(&ok);
+
+        match vol.open_path(&mut dev, config::EXT_KERNEL_PATH) {
+            Ok(f) => {
+                let mut blob = [0u8; EXT_BUF];
+                let n = match vol.read_file(&mut dev, &f, &mut blob) {
+                    Ok(n) => n,
+                    Err(s) => fatal("ext read", s),
+                };
+                let mut sum: u32 = 0;
+                for &b in &blob[..n] {
+                    sum = sum.wrapping_add(b as u32);
+                }
+                let mut l = Str64::new();
+                let _ = l.push_str("M2C: len=");
+                push_dec(&mut l, n);
+                contract(&l);
+                let mut l = Str64::new();
+                let _ = l.push_str("M2C: sum=0x");
+                push_sum16(&mut l, sum);
+                contract(&l);
+            }
+            Err(efi::EFI_NOT_FOUND) => {
+                let mut line = Str64::new();
+                let _ = line.push_str("M2C: open failed status=0x");
+                push_status_hex(&mut line, efi::EFI_NOT_FOUND);
+                contract(&line);
+            }
+            Err(s) => {
+                let mut l = Str64::new();
+                let _ = l.push_str("M2C: open failed status=0x");
+                push_byte_hex(&mut l, s as u8);
+                contract(&l);
+            }
+        }
+        return; // 命中第一块 EXT2 盘即完成 M2c 验收
+    }
+    let fail = Str64::from("M2C: no ext2 disk");
+    contract(&fail);
+}
+
+/// 单字节 hex（内部错误码契约行）。
+fn push_byte_hex(s: &mut Str64, v: u8) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    s.push(HEX[(v >> 4) as usize] as char);
+    s.push(HEX[(v & 0xF) as usize] as char);
 }
 
 // ================================ 输出辅助（无 alloc）

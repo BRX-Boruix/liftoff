@@ -10,8 +10,9 @@ BORUIX 的引导程序：在 UEFI 环境下读取内核 ELF 并交接控制权�
 - 从 ISO9660 光盘读取 `/boot/kernel`，对应 liveCD 模式
 - 将内存映射、帧缓冲、RSDP、SMP 信息交给内核
 - 仅支持 x86-64 UEFI
-- 当前状态：M2b 完成。ISO9660 只读驱动已实现并经 QEMU OVMF 真实光盘设备验证
-  （块设备枚举 → CD001 探测 → 目录遍历 → 文件读取）；EXT2 与 ELF 加载尚未实现
+- 当前状态：M2c 完成。ISO9660 与 EXT2 只读驱动均已实现并经 QEMU OVMF 真实设备
+  验证（光盘与磁盘双链路：块设备枚举 → 探测挂载 → 目录遍历 → 文件读取）；
+  ELF 加载尚未实现
 
 ## 已知限制
 
@@ -34,6 +35,8 @@ cargo build --release --target x86_64-unknown-uefi
 - `src/efi.rs` —— 手写最小 UEFI 绑定，布局有编译期断言
 - `src/serial.rs` —— COM1 串口输出，观测主通道
 - `src/iso9660.rs` —— ISO9660 只读解析器（块读取经 trait 注入）
+- `src/ext2.rs` —— EXT2 只读解析器（同一 trait 缝，布局对齐内核侧取证）
+- `tools/mkext2.py` —— 确定性 EXT2 fixture 构建器
 - `src/config.rs` —— 内核路径与协议版本常量
 - `tools/boottest.ps1` —— QEMU OVMF 真实引导验收脚本（构建、摆 ESP、断言串口）
 - `tools/mkiso.py` —— 确定性 ISO9660 fixture 构建器

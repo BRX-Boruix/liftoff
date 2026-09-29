@@ -1,0 +1,18 @@
+M2c: EXT2 read-only driver verified on a real disk device
+
+BlockIo enumeration -> disk probe (writable, 512B block, non-partition)
+-> superblock magic 0xEF53 @1024 -> group descriptor -> inode table ->
+directory traversal /BOOT/KERNIMG.BIN; serial reports len + 16-bit byte sum.
+
+Scope (explicit, not omission): block size fixed at 1024; direct 12 blocks
++ one indirection level (L2/L3 rejected); directory data capped at one
+block; no MBR (whole-disk mount; partition parsing belongs to M4
+boot-source logic). Layout facts sourced from the kernel's ext2.rs:
+both sides are independent parsers of the same on-disk format, and the
+fixture must read correctly through either.
+
+Acceptance via tools/boottest.ps1 -Variant ext / ext-nosig / ext-nopath,
+all green together with M2a/M2b (nine variants). Fixture trap caught by
+acceptance: EXT2 directory blocks have no zero-fill tail semantics - the
+last entry's rec_len must cover the rest of the block, unlike ISO9660's
+zero-length sector-skip rule.

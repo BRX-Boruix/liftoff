@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory = $true)][string[]]$Expect,
     [string[]]$NotExpect = @(),
     [int]$TimeoutSec = 45,
-    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath")][string]$Variant = "normal"
+    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath")][string]$Variant = "normal"
 )
 $ErrorActionPreference = "Stop"
 
@@ -74,6 +74,28 @@ if ($Variant -like "iso*") {
     if (-not (Test-Path $iso)) { Write-Output "FAIL: iso fixture not built"; exit 2 }
 }
 
+# EXT2 variants: whole-disk fixture from mkext2.py attached as a plain raw drive.
+# ext: /BOOT/KERNIMG.BIN present; ext-nosig: non-EXT2 blob (magic must fail);
+# ext-nopath: valid EXT2 whose root has no BOOT directory.
+$extimg = $null
+if ($Variant -like "ext*") {
+    $media = "ext"
+    $payload = Join-Path $liftoff "target\m2c-payload.bin"
+    $extimg = Join-Path $liftoff "target\m2c.img"
+    if ($Variant -eq "ext") {
+        [System.IO.File]::WriteAllBytes($payload, [System.Text.Encoding]::ASCII.GetBytes("LIFTOFF-M2C-KERNEL" + [char]13 + [char]10 + "0123456789ABCDEF" + [char]13 + [char]10))
+        python (Join-Path $PSScriptRoot "mkext2.py") --kernel $payload --out $extimg
+    } elseif ($Variant -eq "ext-nosig") {
+        $blob = New-Object byte[] 2097152
+        (New-Object Random 20260216).NextBytes($blob)
+        [System.IO.File]::WriteAllBytes($extimg, $blob)
+    } elseif ($Variant -eq "ext-nopath") {
+        [System.IO.File]::WriteAllBytes($payload, [System.Text.Encoding]::ASCII.GetBytes("LIFTOFF-M2C-KERNEL" + [char]13 + [char]10 + "0123456789ABCDEF" + [char]13 + [char]10))
+        python (Join-Path $PSScriptRoot "mkext2.py") --kernel $payload --out $extimg --flat
+    }
+    if (-not (Test-Path $extimg)) { Write-Output "FAIL: ext fixture not built"; exit 2 }
+}
+
 $log = Join-Path $liftoff "target\serial.log"
 $qerr = Join-Path $liftoff "target\qemu.err.log"
 Remove-Item $log, $qerr -ErrorAction SilentlyContinue
@@ -87,6 +109,7 @@ $qargs = @(
     "-no-reboot"
 )
 if ($media -eq "iso") { $qargs = @("-cdrom", $iso) + $qargs }
+if ($media -eq "ext") { $qargs = $qargs + @("-drive", "format=raw,file=$extimg") }
 $p = Start-Process -FilePath $qemuExe -ArgumentList $qargs -PassThru -RedirectStandardError $qerr
 try {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)

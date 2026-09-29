@@ -15,6 +15,10 @@ pub const TEST_FILE: &str = "m2a.txt";
 /// 未来 xorriso 生成的真实 liveCD 沿用此布局与大小写不敏感匹配。
 pub const ISO_KERNEL_PATH: &str = "KERNEL/KERNIMG.BIN";
 
+/// M2c 阶段 EXT2 内的内核路径（fixture 布局：/BOOT/KERNIMG.BIN）。
+/// 未来 mke2fs 生成的安装镜像沿用此布局。
+pub const EXT_KERNEL_PATH: &str = "BOOT/KERNIMG.BIN";
+
 // ----------------------------------------------------------------
 // 引导协议（阶段一：复用 Limine 协议）
 //
