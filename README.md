@@ -14,17 +14,29 @@ BORUIX 的引导程序。UEFI 环境下通过 **Limine 引导协议**加载内�
 - 多架构（仅 x86-64 UEFI）
 - 图形菜单与主题
 - PXE / TFTP
-- ISO9660、FAT32 支持
+- FAT32 驱动（UEFI 固件已提供，无需自写）
 
 明确要做的：
 
 | 能力 | 说明 |
 |---|---|
-| EXT2 读取 | 从 EXT2 根分区读 `/boot/kernel` |
+| EXT2 读取 | 安装模式：从 EXT2 根分区读 `/boot/kernel` |
+| ISO9660 读取 | liveCD 模式：从光盘镜像读 `/boot/kernel` |
 | ELF 加载 | 解析并加载 x86-64 静态 ELF 内核 |
 | 内存映射透传 | UEFI `GetMemoryMap` → Limine memmap |
 | Limine 协议 | 填充内核所需的请求响应结构 |
 | 交接 | 建立页表、跳转内核入口 |
+
+## 两种启动模式
+
+与内核 `boot_source()` 的判定保持一致，靠 `File.media_type` 区分：
+
+| 模式 | 介质 | 文件系统 | 内核看到的 media_type |
+|---|---|---|---|
+| liveCD | ISO 光盘 | ISO9660 | `1` (optical) |
+| 安装模式 | 磁盘 | EXT2 | `0` (generic) |
+
+两种模式都必须支持——liveCD 是默认启动方式。
 
 ## 内核所需的协议请求
 
@@ -41,7 +53,8 @@ Liftoff 只需实现 BORUIX 内核实际用到的 5 个：
 ## 为什么不用 brxLimine
 
 `brxLimine`（Limine 12.5.2 fork）功能远超 BORUIX 所需：约 10 万行源码，而我们只用到其中
-的 5 个协议请求和 EXT2 加载。翻译它等于把 95% 用不到的功能一起搬过来，且永远追不上上游。
+的 5 个协议请求、EXT2 与 ISO9660 加载。翻译它等于把 95% 用不到的功能一起搬过来，
+且永远追不上上游。
 
 详见 BORUIX 仓库的 ADR 记录。
 
