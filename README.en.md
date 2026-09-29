@@ -10,14 +10,18 @@ BORUIX's bootloader: reads the kernel ELF under UEFI and hands over control.
 - Reads `/boot/kernel` from an ISO9660 disc (liveCD mode)
 - Passes the memory map, framebuffer, RSDP and SMP information to the kernel
 - x86-64 UEFI only
-- Current status: M9 done. Both boot paths work end to end:
-  - **liveCD** (ISO9660): the `boot` variant - full kernel chain with both CPUs online;
+- Current status: M11 done. Both boot paths, modules and multi-core all work end to end:
+  - **liveCD** (ISO9660): the `boot` variant - full kernel chain;
   - **install mode** (MBR partition + EXT2): the `ext-boot` variant - reads the 24.6 MiB
     kernel from disk (double indirect blocks), performs the full hand-off, and the kernel
     identifies the boot disk from the `mbr_disk_id`/`partition_index` we filled and mounts
-    that EXT2 partition as root.
+    that EXT2 partition as root;
+  - **modules**: `mod` (ISO) and `ext-mod` (EXT2) - one module list, one assembler, loaded
+    on demand (only when the kernel declares ModuleRequest);
+  - **multi-core**: the `smp4` variant (`-smp 4`) - all three APs are started by liftoff and
+    taken over by the kernel, `[kmain] SMP done, 4 cpus online`.
   - Protocol surface: BaseRevision/HHDM/Memmap/Framebuffer/RSDP/SMP/Modules/KernelFile/
-    KernelAddress (modules load on demand, only when the kernel declares ModuleRequest).
+    KernelAddress; x2APIC needs matching kernel-side LAPIC work, so xAPIC only for now.
 
 ## Known limitations
 

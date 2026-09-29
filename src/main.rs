@@ -791,14 +791,19 @@ fn m2c(bs: &efi::BootServices) {
         match elf::load(&blob[..n], bs) {
             Ok(lr) => {
                 report_load(&lr);
-                m4_handover(
-                    bs,
-                    &lr,
-                    blob_base as *mut u8,
-                    n as u64,
-                    modules::LoadedModules::EMPTY,
-                    boot,
-                );
+                // M10: 与 ISO 路径同构——只有声明了 ModuleRequest 的内核才加载
+                // 模块（BORUIX 不声明 → 不读、不分配）。
+                let mods = if unsafe {
+                    boruix::has_request(lr.image_base, lr.image_size, boruix::MODULE_ID)
+                } {
+                    match modules::load_from_ext2(bs, &vol, &mut dev) {
+                        Ok(m) => m,
+                        Err(s) => m4_fail("ext modules", s),
+                    }
+                } else {
+                    modules::LoadedModules::EMPTY
+                };
+                m4_handover(bs, &lr, blob_base as *mut u8, n as u64, mods, boot);
             }
             Err(s) => {
                 let mut l = Str64::new();

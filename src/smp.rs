@@ -183,8 +183,10 @@ pub unsafe fn prepare(bs: &efi::BootServices, pml4_phys: u64, rsdp_phys: u64, hd
         let lid = ids[i];
         if lid == bsp { continue; }
         if lid == 0 && i > 0 { break; }
-        if aps >= 4 { break; }
-        let mut tpage: u64 = 0x70000; // below OVMF AP buffer at 0x1F0000 (memory dump showed overwrite)
+        if aps >= MAX_CPUS { break; }
+        // 每 AP 一页：SIPI 向量 = 页号（必须 < 256 → 页 < 1MB），且必须避开
+        // OVMF 的 AP 重定位缓冲（0x1F0000 曾被覆写，内存 dump 实证）。
+        let mut tpage: u64 = 0x70000 + (aps as u64) * 0x1000;
         let st1 = (bs.allocate_pages)(efi::ALLOCATE_ADDRESS, efi::MEMORY_LOADER_DATA, 1, &mut tpage);
         if efi::is_error(st1) { break; }
         let mut spage: u64 = 0;
@@ -234,8 +236,8 @@ pub unsafe fn prepare(bs: &efi::BootServices, pml4_phys: u64, rsdp_phys: u64, hd
 }
 
 /// per-AP trampoline page phys / lapic id (filled by prepare).
-pub static mut TRAMP_PAGES: [u64; 4] = [0; 4];
-pub static mut AP_LAPIC_IDS: [u32; 4] = [0; 4];
+pub static mut TRAMP_PAGES: [u64; MAX_CPUS] = [0; MAX_CPUS];
+pub static mut AP_LAPIC_IDS: [u32; MAX_CPUS] = [0; MAX_CPUS];
 
 /// EBS hou + CR3 switched: INIT-SIPI per AP (Intel SDM 8.4.4).
 /// AP lands in trampoline, parks on goto_address polling (HHDM valid now).

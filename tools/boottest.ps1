@@ -10,7 +10,7 @@ param(
     [Parameter(Mandatory = $false)][string[]]$Expect = @(),
     [string[]]$NotExpect = @(),
     [int]$TimeoutSec = 45,
-    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot", "mod", "ext-boot")][string]$Variant = "normal"
+    [ValidateSet("normal", "missing", "empty", "iso", "iso-nosig", "iso-nopath", "ext", "ext-nosig", "ext-nopath", "elf-iso", "elf-bad", "boot", "mod", "ext-boot", "ext-mod", "smp4")][string]$Variant = "normal"
 )
 $ErrorActionPreference = "Stop"
 
@@ -57,7 +57,7 @@ switch ($Variant) {
 # directory (mount ok, open must report not-found).
 $iso = $null
 $media = "fat"
-if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot" -or $Variant -eq "mod") {
+if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot" -or $Variant -eq "mod" -or $Variant -eq "smp4") {
     $media = "iso"
     $payload = Join-Path $liftoff "target\m2b-payload.bin"
     $iso = Join-Path $liftoff "target\m2b.iso"
@@ -78,9 +78,10 @@ if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot" -or
         (New-Object Random 99).NextBytes($blob)
         [System.IO.File]::WriteAllBytes($payload, $blob)
         python (Join-Path $PSScriptRoot "mkiso.py") --kernel $payload --out $iso --volident BADELF
-    } elseif ($Variant -eq "boot") {
+    } elseif ($Variant -eq "boot" -or $Variant -eq "smp4") {
         # Full handover: real kernel ELF, liftoff builds paging + BORUIX v1
         # responses, exits boot services and jumps. Kernel prints its banner.
+        # smp4 uses the same image with -smp 4 (M11 AP scale-out).
         $kernelElf = Join-Path $liftoff "target\kernel.elf"
         python (Join-Path $PSScriptRoot "mkiso.py") --kernel $kernelElf --out $iso --volident LIFTOFF_BOOT
     } elseif ($Variant -eq "mod") {
@@ -117,9 +118,28 @@ if ($Variant -eq "elf-iso") {
 if ($Variant -eq "boot") {
     $autoExpect = @("Hello, BORUIX!", "Kernel M0 is running.", "[mm] HHDM offset: 0xffff800000000000", "[acpi] RSDP rev=2", "LazyBuddy init done", "[smp] BSP lapic_id=0", "[smp] fired AP lapic_id=1", "[smp] AP online, lapic_id=1")
 }
-if ($Variant -eq "mod") {
-    # M8: expectations are derived by the oracle from the same fixture bytes
-    # that mkiso packs (module paths/lengths/sums/cmdlines).
+if ($Variant -eq "smp4") {
+    # M11: four CPUs. Each line proves a distinct AP was brought up by liftoff
+    # (fired) and then taken over by the kernel (online).
+    $autoExpect = @(
+        "Hello, BORUIX!",
+        "Kernel M0 is running.",
+        "[mm] HHDM offset: 0xffff800000000000",
+        "[acpi] RSDP rev=2",
+        "LazyBuddy init done",
+        "[smp] BSP lapic_id=0",
+        "[smp] fired AP lapic_id=1",
+        "[smp] fired AP lapic_id=2",
+        "[smp] fired AP lapic_id=3",
+        "[smp] AP online, lapic_id=1",
+        "[smp] AP online, lapic_id=2",
+        "[smp] AP online, lapic_id=3",
+        "[kmain] SMP done, 4 cpus online (target 4)"
+    )
+}
+if ($Variant -eq "mod" -or $Variant -eq "ext-mod") {
+    # M8/M10: expectations are derived by the oracle from the same fixture bytes
+    # that mkiso/mkext2 pack (module paths/lengths/sums/cmdlines).
     $oracleOut = python (Join-Path $PSScriptRoot "modtest_oracle.py") --fixtures (Join-Path $liftoff "target") 2>&1 | ForEach-Object { $_.ToString() }
     $autoExpect = @($oracleOut | Where-Object { $_ -match '^MOD: ' } | ForEach-Object { $_.Substring(5) })
     if ($autoExpect.Count -lt 8) { Write-Output "FAIL: modtest oracle produced too few lines"; exit 2 }
@@ -176,6 +196,18 @@ if ($Variant -eq "ext-boot") {
         $blob = New-Object byte[] 2097152
         (New-Object Random 20260216).NextBytes($blob)
         [System.IO.File]::WriteAllBytes($extimg, $blob)
+    } elseif ($Variant -eq "ext-mod") {
+        # M10: modules over EXT2 (install mode). Payload kernel = the standalone
+        # consumer in tools/modtest; module fixtures and expectations come from
+        # modtest_oracle.py (same bytes as the ISO "mod" variant).
+        & (Join-Path $PSScriptRoot "modtest\build.ps1") | Out-Null
+        python (Join-Path $PSScriptRoot "modtest_oracle.py") --fixtures (Join-Path $liftoff "target") | Out-Null
+        $payload = Join-Path $liftoff "tools\modtest\modtest.elf"
+        if (-not (Test-Path $payload)) { Write-Output "FAIL: modtest kernel build failed"; exit 2 }
+        $alpha = Join-Path $liftoff "target\mod-alpha.bin"
+        $beta = Join-Path $liftoff "target\mod-beta.bin"
+        python (Join-Path $PSScriptRoot "mkext2.py") --kernel $payload --out $extimg `
+            --extra "MODULES/ALPHA.BIN=$alpha" --extra "MODULES/BETA.BIN=$beta" | Out-Null
     } elseif ($Variant -eq "ext-nopath") {
         [System.IO.File]::WriteAllBytes($payload, [System.Text.Encoding]::ASCII.GetBytes("LIFTOFF-M2C-KERNEL" + [char]13 + [char]10 + "0123456789ABCDEF" + [char]13 + [char]10))
         python (Join-Path $PSScriptRoot "mkext2.py") --kernel $payload --out $extimg --flat
@@ -198,6 +230,7 @@ $qargs = @(
 $effExpect = $Expect
 if ($autoExpect) { $effExpect = @($Expect) + $autoExpect }
 if ($Variant -eq "boot") { $qargs = @("-smp", "2") + $qargs }
+if ($Variant -eq "smp4") { $qargs = @("-smp", "4") + $qargs }
 if ($media -eq "iso") { $qargs = @("-cdrom", $iso) + $qargs }
 if ($media -eq "ext") { $qargs = $qargs + @("-drive", "format=raw,file=$extimg") }
 $p = Start-Process -FilePath $qemuExe -ArgumentList $qargs -PassThru -RedirectStandardError $qerr

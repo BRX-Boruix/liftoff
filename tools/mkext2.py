@@ -1,97 +1,200 @@
 #!/usr/bin/env python3
-"""Deterministic EXT2 fixture builder for liftoff M2c acceptance tests.
+"""Deterministic EXT2 fixture builder for liftoff acceptance tests.
 
-Layout mirrors kernel/crates/fs/src/ext2.rs build_image():
-  2 MiB raw disk (whole-disk FS, no MBR — the M2c drive is exposed as one
-  BlockIo device; MBR partition handling is deferred to M4 boot-source logic)
-  block size 1024, rev 1, inode_size 128
-  block 0  : boot pad + superblock @1024
-  block 2  : group descriptor table (block_bitmap=3, inode_bitmap=4, inode_table=5)
-  block 5  : inode table (root=ino2 @128, BOOT dir=ino11 @1280, file=ino12 @1408)
-  block 20 : root dir data (".", "..", BOOT)
-  block 21 : BOOT dir data (".", "..", KERNIMG.BIN)
-  block 25 : file payload (36 bytes)
-All bytes deterministic.
+Layout (1 KiB blocks, rev 1, inode size 128, single block group):
+  block 0        boot pad (1024 B)
+  block 1        superblock (at byte offset 1024)
+  block 2        group descriptor table
+  block 3        block bitmap (unused by liftoff, left zero)
+  block 4        inode bitmap (unused by liftoff, left zero)
+  block 5..6     inode table (16 inodes)
+  block 7..      directory blocks, then indirect tables, then file data
+
+M10: arbitrary single-level tree via --extra ISO/PATH=HOST_FILE, and files
+larger than 12 KiB (direct blocks + one single indirect block).
+All bytes deterministic; identical inputs give identical images.
 """
-import struct, sys, argparse
+import struct, argparse
 
 BS = 1024
-DISK_SECTORS = 4096  # 2 MiB
-
 EXT2_MAGIC = 0xEF53
+INODE_SIZE = 128
+INODES = 16
+INODE_TABLE_BLOCKS = (INODES * INODE_SIZE + BS - 1) // BS
+BLOCK_BITMAP = 3
+INODE_BITMAP = 4
+INODE_TABLE = 5
+DATA_START = INODE_TABLE + INODE_TABLE_BLOCKS
+DIRECT = 12
+MIN_DISK_BLOCKS = 2048  # 2 MiB floor, keeps the M2c fixture size stable
+
 
 def de(name: str, ino: int, ft: int, rec: int) -> bytes:
     """One directory entry: ino(4) rec_len(2) name_len(1) file_type(1) name."""
     nb = name.encode("ascii")
     r = struct.pack("<IHBB", ino, rec, len(nb), ft) + nb
-    assert len(r) <= rec
+    assert len(r) <= rec, (name, rec)
     return r + bytes(rec - len(r))
 
-def build(payload: bytes, flat: bool = False) -> bytes:
-    assert len(payload) <= BS
-    img = bytearray(DISK_SECTORS * 512)
 
-    def w32(off, v): img[off:off+4] = struct.pack("<I", v)
-    def w16(off, v): img[off:off+2] = struct.pack("<H", v)
+def pack_dir(entries) -> bytes:
+    """entries: [(name, ino, file_type)] -> one 1024 B directory block.
+
+    The final entry absorbs the remaining space (EXT2 has no trailing zero
+    padding inside a directory block)."""
+    out = b""
+    for i, (name, ino, ft) in enumerate(entries):
+        need = (8 + len(name) + 3) & ~3
+        rec = (BS - len(out)) if i == len(entries) - 1 else need
+        out += de(name, ino, ft, rec)
+    assert len(out) == BS, len(out)
+    return out
+
+
+def build(kernel: bytes, extras, flat: bool = False) -> bytes:
+    """kernel -> BOOT/KERNIMG.BIN (omitted when flat); extras: [(dir, name, data)]."""
+    dirs = {}          # dir name -> [(name, data)]
+    if not flat:
+        dirs["BOOT"] = [("KERNIMG.BIN", kernel)]
+    for d, n, data in extras:
+        dirs.setdefault(d, []).append((n, data))
+
+    # Inode assignment: 2 = root, then dirs and files in sorted order.
+    ino_of = {"": 2}
+    next_ino = 11
+    for d in sorted(dirs):
+        ino_of[d] = next_ino
+        next_ino += 1
+    file_ino = {}
+    for d in sorted(dirs):
+        for n, _ in sorted(dirs[d]):
+            file_ino[(d, n)] = next_ino
+            next_ino += 1
+    assert next_ino <= INODES + 1, "too many inodes for the fixture"
+
+    # Block assignment: directory blocks first, then indirect tables, then data.
+    dir_blocks = {}
+    cur = DATA_START
+    order = [""] + sorted(dirs)
+    for d in order:
+        dir_blocks[d] = cur
+        cur += 1
+    ind_block = {}
+    data_blocks = {}
+    for d in sorted(dirs):
+        for n, data in sorted(dirs[d]):
+            nb = (len(data) + BS - 1) // BS
+            if nb > DIRECT:
+                ind_block[(d, n)] = cur
+                cur += 1
+            data_blocks[(d, n)] = list(range(cur, cur + nb))
+            cur += nb
+    total_blocks = max(cur, MIN_DISK_BLOCKS)
+    img = bytearray(total_blocks * BS)
+
+    def w32(off, v):
+        img[off:off + 4] = struct.pack("<I", v)
+
+    def w16(off, v):
+        img[off:off + 2] = struct.pack("<H", v)
 
     # Superblock @1024
-    sb = 1024
-    w32(sb + 0, 1024)        # s_inodes_count
-    w32(sb + 4, DISK_SECTORS * 512 // BS)  # s_blocks_count = 2048
-    w32(sb + 20, 1)          # s_first_data_block
-    w32(sb + 24, 0)          # s_log_block_size (1024)
-    w32(sb + 28, 0)          # s_log_frag_size
-    w32(sb + 32, 8192)       # s_blocks_per_group
-    w32(sb + 40, 1024)       # s_inodes_per_group
-    w16(sb + 56, EXT2_MAGIC) # s_magic
-    w32(sb + 76, 1)          # s_rev_level
-    w16(sb + 88, 128)        # s_inode_size
+    sb = BS
+    w32(sb + 0, INODES)                 # s_inodes_count
+    w32(sb + 4, total_blocks)           # s_blocks_count
+    w32(sb + 20, 1)                     # s_first_data_block
+    w32(sb + 24, 0)                     # s_log_block_size (1024)
+    w32(sb + 28, 0)                     # s_log_frag_size
+    w32(sb + 32, 8192)                  # s_blocks_per_group
+    w32(sb + 40, 1024)                  # s_inodes_per_group
+    w16(sb + 56, EXT2_MAGIC)
+    w32(sb + 76, 1)                     # s_rev_level
+    w16(sb + 88, INODE_SIZE)
 
-    # GDT @block2 (offset 2*1024): inode_table=5, bitmaps 3/4
+    # Group descriptor table @block 2
     gd = 2 * BS
-    w32(gd + 0, 3)   # bg_block_bitmap
-    w32(gd + 4, 4)   # bg_inode_bitmap
-    w32(gd + 8, 5)   # bg_inode_table
+    w32(gd + 0, BLOCK_BITMAP)
+    w32(gd + 4, INODE_BITMAP)
+    w32(gd + 8, INODE_TABLE)
 
-    # Inode table @block5. inode N at 5*BS + (N-1)*128.
-    itab = 5 * BS
-    root = itab + 1 * 128
-    w16(root + 0, 0x4000 | 0o755)  # dir
-    w32(root + 4, BS)              # size
-    w32(root + 40 + 0, 20)         # block[0]
-    boot = itab + 10 * 128
-    w16(boot + 0, 0x4000 | 0o755)  # dir
-    w32(boot + 4, BS)
-    w32(boot + 40 + 0, 21)
-    kern = itab + 11 * 128
-    w16(kern + 0, 0x8000 | 0o644)  # regular file
-    w32(kern + 4, len(payload))
-    w32(kern + 40 + 0, 25)
+    itab = INODE_TABLE * BS
 
-    # Directory data blocks
-    if flat:
-        # 最后一项 rec_len 必须覆盖到块尾（EXT2 目录块无尾部零填充语义）
-        root_entries = de(".", 2, 2, 12) + de("..", 2, 2, BS - 12)
-    else:
-        root_entries = de(".", 2, 2, 12) + de("..", 2, 2, 12) + de("BOOT", 11, 2, BS - 24)
-    rootd = root_entries
-    img[20*BS:21*BS] = rootd + bytes(BS - len(rootd))
-    bootd = de(".", 11, 2, 12) + de("..", 2, 2, 12) + de("KERNIMG.BIN", 12, 1, BS - 24)
-    img[21*BS:22*BS] = bootd + bytes(BS - len(bootd))
-    img[25*BS:25*BS+len(payload)] = payload
+    def inode(ino: int) -> int:
+        return itab + (ino - 1) * INODE_SIZE
+
+    def write_dir_inode(ino: int, size: int, block: int):
+        off = inode(ino)
+        w16(off + 0, 0x4000 | 0o755)
+        w32(off + 4, size)
+        w32(off + 40, block)
+
+    def write_file_inode(ino: int, data: bytes, key) -> None:
+        off = inode(ino)
+        w16(off + 0, 0x8000 | 0o644)
+        w32(off + 4, len(data))
+        blocks = data_blocks[key]
+        for i, b in enumerate(blocks[:DIRECT]):
+            w32(off + 40 + i * 4, b)
+        if len(blocks) > DIRECT:
+            w32(off + 40 + 12 * 4, ind_block[key])
+            rest = blocks[DIRECT:]
+            tbl = b"".join(struct.pack("<I", b) for b in rest)
+            base = ind_block[key] * BS
+            img[base:base + len(tbl)] = tbl
+        for i, b in enumerate(blocks):
+            off_b = b * BS
+            start = i * BS
+            img[off_b:off_b + len(data[start:start + BS])] = data[start:start + BS]
+
+    # Root inode + root directory
+    write_dir_inode(2, BS, dir_blocks[""])
+    root_entries = [(".", 2, 2), ("..", 2, 2)]
+    for d in sorted(dirs):
+        root_entries.append((d, ino_of[d], 2))
+    img[dir_blocks[""] * BS:(dir_blocks[""] + 1) * BS] = pack_dir(root_entries)
+
+    # Subdirectories + files
+    for d in sorted(dirs):
+        write_dir_inode(ino_of[d], BS, dir_blocks[d])
+        entries = [(".", ino_of[d], 2), ("..", 2, 2)]
+        for n, _ in sorted(dirs[d]):
+            entries.append((n, file_ino[(d, n)], 1))
+        img[dir_blocks[d] * BS:(dir_blocks[d] + 1) * BS] = pack_dir(entries)
+        for n, data in sorted(dirs[d]):
+            write_file_inode(file_ino[(d, n)], data, (d, n))
+
     return bytes(img)
+
+
+def parse_extra(spec: str):
+    if "=" not in spec:
+        raise SystemExit("bad --extra (want ISO/PATH=HOST_FILE): " + spec)
+    iso, host = spec.split("=", 1)
+    parts = iso.lstrip("/").split("/")
+    if len(parts) != 2:
+        raise SystemExit("bad --extra path (one dir level only): " + iso)
+    with open(host, "rb") as f:
+        return (parts[0], parts[1], f.read())
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--flat", action="store_true", help="root without BOOT dir (negative test)")
+    ap.add_argument("--extra", action="append", default=[], help="ISO/PATH=HOST_FILE (repeatable)")
     a = ap.parse_args()
-    payload = open(a.kernel, "rb").read()
-    img = build(payload, flat=a.flat)
-    open(a.out, "wb").write(img)
+    with open(a.kernel, "rb") as f:
+        payload = f.read()
+    extras = [parse_extra(s) for s in a.extra]
+    img = build(payload, extras, flat=a.flat)
+    with open(a.out, "wb") as f:
+        f.write(img)
     s = sum(payload) & 0xFFFF
     print(f"ext_bytes={len(img)} file_len={len(payload)} file_sum16=0x{s:04x}")
+    for d, n, data in extras:
+        print(f"extra={d}/{n} len={len(data)} sum16=0x{sum(data) & 0xFFFF:04x}")
+
 
 if __name__ == "__main__":
     main()
