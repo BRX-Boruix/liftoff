@@ -107,6 +107,20 @@ if ($Variant -like "iso*" -or $Variant -like "elf-*" -or $Variant -eq "boot" -or
 
 # elf-iso: derive the assertion list from the oracle (single source of expectations).
 $autoExpect = $null
+# Small variants carry their own contract anchors, so "-Variant X" alone is a real
+# test (the harness hard-fails on an empty expectation list).
+switch ($Variant) {
+    "normal"     { $autoExpect = @("M2A: len=36", "M2A: sum=0x0834") }
+    "missing"    { $autoExpect = @("M2A: open failed status=0x800000000000000e") }
+    "empty"      { $autoExpect = @("M2A: len=0", "M2A: sum=0x0000") }
+    "iso"        { $autoExpect = @("M2B: mount ok", "M2B: len=36", "M2B: sum=0x089c") }
+    "iso-nosig"  { $autoExpect = @("M2B: mount failed status=0x11") }
+    "iso-nopath" { $autoExpect = @("M2B: open failed status=0x800000000000000e") }
+    "elf-bad"    { $autoExpect = @("M3: reject status=0x30") }
+    "ext"        { $autoExpect = @("M2C: mount ok", "M2C: len=38", "M2C: sum=0x08b7") }
+    "ext-nosig"  { $autoExpect = @("M2C: mount failed status=0x21") }
+    "ext-nopath" { $autoExpect = @("M2C: open failed status=0x800000000000000e") }
+}
 if ($Variant -eq "elf-iso") {
     $oracleOut = python (Join-Path $PSScriptRoot "elf_oracle.py") (Join-Path $liftoff "target\kernel.elf") 2>&1 | ForEach-Object { $_.ToString() }
     $autoExpect = @($oracleOut | Where-Object { $_ -match '^M3: ' })
