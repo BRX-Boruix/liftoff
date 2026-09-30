@@ -5,6 +5,7 @@
 //!
 //! 边界：只依赖 `arch`/`firmware` **抽象** 与 `fs`/`driver` 的**公开接口**，不触碰固件具体实现。
 
+use fs::iso9660::IsoError;
 use driver::volume::Volume;
 use firmware::block::BlockDeviceSource;
 use fs::ext2::Ext2Error;
@@ -217,5 +218,155 @@ mod chain_tests {
             names.iter().any(|name| *name == b"lost+found"),
             "经生产路径应列出 lost+found，实际: {names:?}"
         );
+    }
+}
+
+/// 读 ISO9660 的**逻辑块**到缓冲（逻辑块通常 2048 字节，而设备按扇区寻址）。
+///
+/// 换算：`logical_block × (block_size / sector_size)` = **分区内**扇区偏移。
+/// **先判后调**：块大小为 0、不是扇区整数倍、缓冲不足、或换算后越出分区，都不碰设备。
+///
+/// 固件错误映射为 `IsoError::ShortImage`（`fs` 层不认识固件错误类型，故在此适配处映射 ——
+/// 与 `read_ext2_block` 的约定一致，不另立一档）。
+pub fn read_iso_block<D: BlockDeviceSource>(
+    source: &mut D,
+    volume: &Volume,
+    block_size: u16,
+    logical_block: u32,
+    buffer: &mut [u8],
+) -> Result<(), IsoError> {
+    let size = block_size as u32;
+    if size == 0 {
+        return Err(IsoError::BadBlockSize);
+    }
+    let sector = volume.sector_size;
+    if sector == 0 || size % sector != 0 {
+        return Err(IsoError::BadBlockSize);
+    }
+    if buffer.len() < size as usize {
+        return Err(IsoError::BufferTooSmall);
+    }
+    let per_block = size / sector;
+    let offset = (logical_block as u64)
+        .checked_mul(per_block as u64)
+        .ok_or(IsoError::ShortImage)?;
+    volume
+        .read(source, offset, per_block, &mut buffer[..size as usize])
+        .map_err(|_| IsoError::ShortImage)
+}
+
+#[cfg(test)]
+mod iso_block_tests {
+    use super::read_iso_block;
+    use driver::volume::Volume;
+    use firmware::block::{BlockDeviceInfo, BlockDeviceSource, DeviceIndex};
+    use firmware::error::Error;
+    use fs::iso9660::{find_in_directory, parse_primary_descriptor};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::vec::Vec;
+
+    static READS: AtomicUsize = AtomicUsize::new(0);
+
+    /// 假块设备：整盘就是给定字节（扇区 512）。
+    struct FakeDisk {
+        bytes: Vec<u8>,
+    }
+
+    impl BlockDeviceSource for FakeDisk {
+        fn device_count(&self) -> usize {
+            1
+        }
+        fn device_info(&self, _index: DeviceIndex) -> Result<BlockDeviceInfo, Error> {
+            Ok(BlockDeviceInfo {
+                block_size: 512,
+                block_count: (self.bytes.len() / 512) as u64,
+                read_only: true,
+            })
+        }
+        fn read_blocks(
+            &mut self,
+            _index: DeviceIndex,
+            lba: u64,
+            count: u32,
+            buffer: &mut [u8],
+        ) -> Result<(), Error> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            let at = (lba as usize).checked_mul(512).ok_or(Error::InvalidArgument)?;
+            let len = (count as usize) * 512;
+            let src = self.bytes.get(at..at + len).ok_or(Error::InvalidArgument)?;
+            buffer
+                .get_mut(..len)
+                .ok_or(Error::InvalidArgument)?
+                .copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    fn whole_volume(disk: &FakeDisk) -> Volume {
+        Volume::new(DeviceIndex(0), 0, (disk.bytes.len() / 512) as u64, 512).expect("卷可建")
+    }
+
+    /// 用**真实 ISO** 验证：定位内核 extent 后，把它读出来应当是 ELF。
+    #[test]
+    fn the_kernel_extent_of_the_real_iso_reads_back_as_an_elf() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
+        let Ok(image) = std::fs::read(path) else {
+            std::eprintln!("跳过：真实 ISO 不存在（{path}）");
+            return;
+        };
+        let descriptor = parse_primary_descriptor(&image).expect("PVD 可解析");
+        let mut disk = FakeDisk { bytes: image };
+        let volume = whole_volume(&disk);
+        let mut block = std::vec![0u8; 2048];
+
+        // 先定位：根 -> BOOT -> KERNEL.;1（读块走 read_iso_block，与生产路径同一条）。
+        let boot = {
+            let mut read = |lba: u32, out: &mut [u8]| {
+                read_iso_block(&mut disk, &volume, 2048, lba, out)
+            };
+            find_in_directory(
+                descriptor.root.extent_lba,
+                descriptor.root.data_length,
+                descriptor.block_size,
+                b"boot",
+                &mut block,
+                &mut read,
+            )
+            .expect("根目录可查")
+            .expect("必须有 BOOT")
+        };
+        assert_eq!(boot.flags & 2, 2, "BOOT 是目录");
+
+        let kernel = {
+            let mut read = |lba: u32, out: &mut [u8]| read_iso_block(&mut disk, &volume, 2048, lba, out);
+            find_in_directory(
+                boot.extent_lba,
+                boot.data_length,
+                descriptor.block_size,
+                b"kernel",
+                &mut block,
+                &mut read,
+            )
+            .expect("BOOT 可查")
+            .expect("必须有内核")
+        };
+        assert_eq!(kernel.extent_lba, 33);
+
+        // 把内核的第一个逻辑块读出来，应当是 ELF 头。
+        let mut first = std::vec![0u8; 2048];
+        read_iso_block(&mut disk, &volume, 2048, kernel.extent_lba, &mut first).expect("可读");
+        assert_eq!(&first[..4], b"\x7fELF", "内核 extent 处必须是 ELF");
+    }
+
+    #[test]
+    fn a_block_size_that_is_not_a_sector_multiple_is_rejected_without_touching_the_device() {
+        let disk = FakeDisk { bytes: std::vec![0u8; 512 * 64] };
+        let volume = whole_volume(&disk);
+        let mut out = std::vec![0u8; 1000];
+        READS.store(0, Ordering::SeqCst);
+        let mut disk = disk;
+        let result = read_iso_block(&mut disk, &volume, 1000, 0, &mut out);
+        assert_eq!(result, Err(fs::iso9660::IsoError::BadBlockSize));
+        assert_eq!(READS.load(Ordering::SeqCst), 0, "块大小不合法时绝不能碰设备");
     }
 }
