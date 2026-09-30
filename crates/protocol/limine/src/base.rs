@@ -56,14 +56,14 @@ mod tests {
 
     #[test]
     fn base_revision_supported_matches_the_header_macro() {
-        // limine.h: LIMINE_BASE_REVISION_SUPPORTED(VAR) is ((VAR)[2] == 0).
+        // 依据 limine.h：LIMINE_BASE_REVISION_SUPPORTED(VAR) 即 ((VAR)[2] == 0)。
         assert!(base_revision_supported([1, 2, BASE_REVISION]));
         assert!(!base_revision_supported([1, 2, 1]));
     }
 
     #[test]
     fn request_layout_matches_the_header() {
-        // limine.h: struct limine_hhdm_request { uint64_t id[4]; uint64_t revision; ptr response; }
+        // 依据 limine.h：struct limine_hhdm_request { uint64_t id[4]; uint64_t revision; ptr response; }
         assert_eq!(size_of::<HhdmRequest>(), 48);
         assert_eq!(offset_of!(HhdmRequest, id), 0);
         assert_eq!(offset_of!(HhdmRequest, revision), 32);
