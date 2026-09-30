@@ -136,11 +136,6 @@ impl Responses {
         self.executable_address.virtual_base = virtual_base;
     }
 
-    /// 设置内核入口。
-    pub fn set_entry_point(&mut self, entry: Option<limine::entry_point::EntryPoint>) {
-        self.entry_point.revision = 0;
-        let _ = entry;
-    }
 
     /// 登记帧缓冲（超容量则只登记前 `MAX_FRAMEBUFFERS` 个，并把 `framebuffer_count`
     /// 设为**实际登记数**，不谎报数量）。
@@ -454,5 +449,35 @@ mod fill_framebuffer_tests {
         // SAFETY: 同上。
         let response: &FramebufferResponse = unsafe { &*(raw as *const FramebufferResponse) };
         assert_eq!(response.framebuffer_count, 0, "无效输入不得写入任何帧缓冲");
+    }
+}
+
+#[cfg(test)]
+mod executable_and_entry_tests {
+    use super::Responses;
+    use limine::entry_point::{ENTRY_POINT_REQUEST_ID, EntryPointResponse};
+    use limine::executable_address::{EXECUTABLE_ADDRESS_REQUEST_ID, ExecutableAddressResponse};
+
+    #[test]
+    fn the_executable_address_response_carries_both_bases() {
+        let mut responses = Responses::new();
+        responses.set_executable_address(0x10_0000, 0xffff_ffff_8000_0000);
+        let raw = responses
+            .pointer_for(&EXECUTABLE_ADDRESS_REQUEST_ID)
+            .expect("有响应");
+        // SAFETY: `raw` 指向容器内字段，类型为 `ExecutableAddressResponse`。
+        let response: &ExecutableAddressResponse =
+            unsafe { &*(raw as *const ExecutableAddressResponse) };
+        assert_eq!(response.physical_base, 0x10_0000);
+        assert_eq!(response.virtual_base, 0xffff_ffff_8000_0000);
+    }
+
+    #[test]
+    fn the_entry_point_response_is_a_zero_revision_marker() {
+        let mut responses = Responses::new();
+        let raw = responses.pointer_for(&ENTRY_POINT_REQUEST_ID).expect("有响应");
+        // SAFETY: 同上；该响应只有 `revision` 一个字段。
+        let response: &EntryPointResponse = unsafe { &*(raw as *const EntryPointResponse) };
+        assert_eq!(response.revision, 0, "入口点响应只是一个 revision 标记，无其他载荷");
     }
 }
