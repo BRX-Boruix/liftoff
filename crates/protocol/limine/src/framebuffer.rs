@@ -59,6 +59,29 @@ pub struct Framebuffer {
     pub modes: *mut *mut core::ffi::c_void,
 }
 
+impl Framebuffer {
+    /// 占位值（便于调用方初始化数组）。
+    pub const EMPTY: Self = Self {
+        address: core::ptr::null_mut(),
+        width: 0,
+        height: 0,
+        pitch: 0,
+        bpp: 0,
+        memory_model: 0,
+        red_mask_size: 0,
+        red_mask_shift: 0,
+        green_mask_size: 0,
+        green_mask_shift: 0,
+        blue_mask_size: 0,
+        blue_mask_shift: 0,
+        unused: [0; 7],
+        edid_size: 0,
+        edid: core::ptr::null_mut(),
+        mode_count: 0,
+        modes: core::ptr::null_mut(),
+    };
+}
+
 /// `struct limine_framebuffer_response`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

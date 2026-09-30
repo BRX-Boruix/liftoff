@@ -17,3 +17,4 @@ pub mod diag;
 pub mod entry;
 pub mod media;
 pub mod protocol;
+pub mod responses;
