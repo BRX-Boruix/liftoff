@@ -81,8 +81,14 @@ pub fn start_with<P: Platform>(
         let Some(head) = alloc_buffer((*boot_services).allocate_pages, HEAD_BUFFER) else {
             return Err(Error::Io);
         };
-        let Some(destination) = alloc_buffer((*boot_services).allocate_pages, DESTINATION_BUFFER)
-        else {
+        // 多要一个大页：`AllocatePages` 只保证 4 KiB 对齐，内核目标必须 2 MiB 对齐。
+        let Some(raw) = alloc_buffer(
+            (*boot_services).allocate_pages,
+            DESTINATION_BUFFER + LARGE_PAGE as usize,
+        ) else {
+            return Err(Error::Io);
+        };
+        let Some(destination) = aligned_within(raw, LARGE_PAGE) else {
             return Err(Error::Io);
         };
         (kernel_out, head, destination)
@@ -161,6 +167,18 @@ fn stage_text(stage: BringUpError) -> &'static [u8] {
         BringUpError::Load(_) => b"[liftoff] stage: load+activate\n",
         BringUpError::Handoff(_) => b"[liftoff] stage: handoff\n",
     }
+}
+
+/// 在一段缓冲里取一个**按 `align` 对齐**的子切片。
+///
+/// 内核段的物理目标必须按大页对齐（`build_plan` 会拒绝未对齐的基址），而 UEFI 的
+/// `AllocatePages` 只保证 4 KiB 对齐 —— 所以多要一页，在里面向上对齐。
+fn aligned_within(buffer: &mut [u8], align: u64) -> Option<&mut [u8]> {
+    let base = buffer.as_ptr() as u64;
+    let misalign = base % align;
+    let skip = if misalign == 0 { 0 } else { align - misalign };
+    let skip = usize::try_from(skip).ok()?;
+    buffer.get_mut(skip..)
 }
 
 /// 入口第一步的结果。
