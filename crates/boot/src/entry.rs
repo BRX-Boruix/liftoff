@@ -11,7 +11,8 @@ use firmware::boot_services::BootServicesControl;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
 use crate::responses::Responses;
 use limine::scan::RequestHit;
-use mm::plan::Mapping;
+use mm::plan::{Mapping, PlanError};
+use mm::usable::UsableRange;
 use mm::takeover::{MustStay, TakeoverError};
 use firmware::error::Error;
 use firmware_current::current::{
@@ -1057,6 +1058,132 @@ where
     }
     loaded.map_err(KernelPlanError::Elf)?;
     Ok(total)
+}
+
+/// HHDM 偏移（**引导器自己选定**）。
+///
+/// 取 Limine 惯用的 `0xffff_8000_0000_0000`：位于 48 位虚拟地址空间的高半区，与内核链接
+/// 基址 `0xffff_ffff_8000_0000` 不重叠。**报给内核的 `hhdm_response.offset` 必须与此常量
+/// 一致** —— 报错就是内核按错偏移解地址，必崩。
+pub const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
+
+/// 规划组装失败原因。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlanBuildError {
+    /// 内核物理基址未按大页对齐。
+    ///
+    /// 规划器只映射**整大页**，且会把基址**向上**对齐 —— 基址未对齐时，基址到首个对齐边界
+    /// 之间的部分会被**静默丢弃**，内核开头的映射凭空消失，而入口就在那一带。
+    /// 内核放在物理内存的哪里是**我们自己选的**，所以这里直接要求对齐，不放任静默丢失。
+    KernelBaseUnaligned,
+    /// 底层规划器报错。
+    Plan(PlanError),
+}
+
+/// 组装交接所需的页表规划：内核高区 + HHDM + 恒等。
+///
+/// 恒等映射**必须保留**：切换页表时当前正在执行的代码与栈必须仍然被映射
+/// （`PageTable::activate` 的 SAFETY 契约）。保留恒等映射后这条自动成立，
+/// 无需去读 RIP/RSP（那需要汇编）。`identity` 由调用方给出（取自固件内存映射的可用区间）。
+///
+/// 内核按**一段**给出（三段取并集）：段间空隙也会被映射，这是有意的简化。
+pub fn build_plan(
+    kernel_phys: u64,
+    kernel_virt: u64,
+    kernel_len: u64,
+    hhdm: &[UsableRange],
+    identity: &[UsableRange],
+    out: &mut [Mapping],
+    large: u64,
+) -> Result<usize, PlanBuildError> {
+    if large != 0 && kernel_phys % large != 0 {
+        return Err(PlanBuildError::KernelBaseUnaligned);
+    }
+    // 规划器只产出**整大页**：长度不是大页整数倍时，尾部会被丢掉（内核最后一段就没映射）。
+    // 向上取整 —— 多映射一点无害，少映射是致命的。
+    let kernel_len = if large == 0 {
+        kernel_len
+    } else {
+        kernel_len
+            .checked_add(large - 1)
+            .ok_or(PlanBuildError::Plan(PlanError::AddressOverflow))?
+            / large
+            * large
+    };
+    let mut total = 0usize;
+    total += mm::plan::plan_kernel_high(kernel_phys, kernel_virt, kernel_len, &mut out[total..], large)
+        .map_err(PlanBuildError::Plan)?;
+    total += mm::plan::plan_hhdm(hhdm, HHDM_OFFSET, &mut out[total..], large)
+        .map_err(PlanBuildError::Plan)?;
+    total += mm::plan::plan_identity(identity, &mut out[total..], large)
+        .map_err(PlanBuildError::Plan)?;
+    Ok(total)
+}
+
+#[cfg(test)]
+mod build_plan_tests {
+    use super::{HHDM_OFFSET, PlanBuildError, build_plan};
+    use arch::addr::PhysAddr;
+    use mm::plan::Mapping;
+    use mm::takeover::{MustStay, check_coverage};
+    use mm::usable::UsableRange;
+
+    const LARGE: u64 = 2 * 1024 * 1024;
+
+    fn range(base: u64, length: u64) -> UsableRange {
+        UsableRange { base: PhysAddr::new(base), length }
+    }
+
+    #[test]
+    fn the_plan_covers_the_kernel_hhdm_and_identity_and_passes_the_pre_jump_check() {
+        // 真实内核三段的并集：[0xffffffff80000000, 0xffffffff806fa000 + 0x2bea88) = 0x9b8a88。
+        let kernel_virt = 0xffff_ffff_8000_0000u64;
+        let kernel_len = 0x9b_8a88u64;
+        let kernel_phys = 0x20_0000u64;
+        let hhdm = [range(0, 0x80_0000)];
+        let identity = [range(0, 0x80_0000)];
+        let mut plan = [Mapping::EMPTY; 256];
+        let count = build_plan(kernel_phys, kernel_virt, kernel_len, &hhdm, &identity, &mut plan, LARGE)
+            .expect("规划应成功");
+        assert!(count >= 3, "至少要有内核/HHDM/恒等三类映射，实得 {count}");
+        let must_stay = [
+            MustStay { start: kernel_virt, len: kernel_len },
+            MustStay { start: 0, len: 0x80_0000 },
+        ];
+        check_coverage(&plan[..count], &must_stay).expect("覆盖检查必须通过");
+    }
+
+    #[test]
+    fn an_unaligned_kernel_base_is_rejected_instead_of_silently_under_mapping() {
+        let mut plan = [Mapping::EMPTY; 64];
+        let result = build_plan(
+            0x10_0000,
+            0xffff_ffff_8000_0000,
+            LARGE,
+            &[],
+            &[],
+            &mut plan,
+            LARGE,
+        );
+        assert_eq!(
+            result,
+            Err(PlanBuildError::KernelBaseUnaligned),
+            "未对齐必须拒绝：向上对齐会静默丢掉内核开头那一段"
+        );
+    }
+
+    #[test]
+    fn the_hhdm_mapping_lands_at_the_declared_offset() {
+        let hhdm = [range(0x1000_0000, LARGE)];
+        let mut plan = [Mapping::EMPTY; 64];
+        let count =
+            build_plan(0x20_0000, 0xffff_ffff_8000_0000, LARGE, &hhdm, &[], &mut plan, LARGE)
+                .expect("规划应成功");
+        let found = plan[..count]
+            .iter()
+            .any(|m| m.virt.as_u64() == HHDM_OFFSET + 0x1000_0000);
+        assert!(found, "HHDM 必须落在声明的偏移上 —— 报给内核的值与真实映射必须一致");
+    }
 }
 
 #[cfg(test)]
