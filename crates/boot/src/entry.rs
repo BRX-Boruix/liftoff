@@ -172,6 +172,28 @@ fn stage_text(stage: BringUpError) -> &'static [u8] {
     }
 }
 
+/// 把可用区间**向下对齐**到 `align`，并把长度补到整页（含尾部）。
+///
+/// 规划器要求基址已对齐（否则静默丢掉头部），所以对齐是调用方的责任。
+fn align_ranges_down(ranges: &mut [UsableRange], align: u64) -> Result<(), PlanBuildError> {
+    if align == 0 {
+        return Err(PlanBuildError::Plan(PlanError::InvalidPageSize));
+    }
+    for range in ranges.iter_mut() {
+        let end = range.end().ok_or(PlanBuildError::Plan(PlanError::AddressOverflow))?;
+        let base = range.base.as_u64();
+        let aligned_base = base / align * align;
+        let aligned_end = end
+            .checked_add(align - 1)
+            .ok_or(PlanBuildError::Plan(PlanError::AddressOverflow))?
+            / align
+            * align;
+        range.base = PhysAddr::new(aligned_base);
+        range.length = aligned_end - aligned_base;
+    }
+    Ok(())
+}
+
 /// 在一段缓冲里取一个**按 `align` 对齐**的子切片。
 ///
 /// 内核段的物理目标必须按大页对齐（`build_plan` 会拒绝未对齐的基址），而 UEFI 的
@@ -1379,6 +1401,11 @@ pub unsafe fn bring_up(
         .max()
         .ok_or(BringUpError::Kernel(KernelPlanError::Overflow))?;
     let kernel_len = kernel_end - kernel_virt;
+    // 可用区间必须**向下对齐到大页**再交给规划器：规划器只产出整大页、且会把基址向上
+    // 对齐，于是非对齐区间的**头部会被静默丢掉**。真实运行里这就是一次 #PF ——
+    // 栈所在的那一页正好落在被丢掉的头部。向下对齐多映射的是同一大页内的物理内存（安全），
+    // 少映射是致命的。
+    align_ranges_down(&mut c.usable[..usable_count], LARGE_PAGE).map_err(BringUpError::Plan)?;
     let plan_count = build_plan(
         c.destination,
         kernel_virt,
