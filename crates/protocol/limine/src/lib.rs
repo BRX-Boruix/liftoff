@@ -15,6 +15,7 @@ pub mod executable_address;
 pub mod executable_file;
 pub mod file;
 pub mod firmware_type;
+pub mod fill;
 pub mod framebuffer;
 pub mod memmap;
 pub mod module;
