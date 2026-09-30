@@ -142,7 +142,7 @@ pub fn scan(image: &[u8], hits: &mut [RequestHit]) -> Result<usize, ScanError> {
 #[cfg(test)]
 mod tests {
     use super::{KNOWN_REQUESTS, ScanError, scan};
-    use crate::base::{BASE_REVISION_MAGIC, COMMON_MAGIC, HHDM_REQUEST_ID};
+    use crate::base::{BASE_REVISION_MAGIC, HHDM_REQUEST_ID};
     use crate::memmap::MEMMAP_REQUEST_ID;
     use std::vec::Vec;
 

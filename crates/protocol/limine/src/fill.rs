@@ -39,7 +39,7 @@ mod tests {
     use super::{FillError, RESPONSE_OFFSET, fill_response};
     use crate::base::HHDM_REQUEST_ID;
     use crate::scan::RequestHit;
-    use std::vec::Vec;
+    
 
     fn hit_at(offset: usize) -> RequestHit {
         RequestHit { id: HHDM_REQUEST_ID, offset, size: 48 }
