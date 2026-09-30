@@ -120,3 +120,102 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod chain_tests {
+    use super::read_ext2_block;
+    use driver::volume::Volume;
+    use firmware::block::{BlockDeviceInfo, BlockDeviceSource, DeviceIndex};
+    use firmware::error::Error;
+    use fs::ext2::{
+        DirEntry, group_descriptor_block, parse_dir_entries, parse_group_descriptor, parse_inode,
+        parse_superblock,
+    };
+
+    const SECTOR: u32 = 512;
+    const BLOCK: usize = 1024;
+
+    struct Disk {
+        bytes: std::vec::Vec<u8>,
+    }
+
+    impl Disk {
+        fn info(&self) -> BlockDeviceInfo {
+            BlockDeviceInfo {
+                block_size: SECTOR,
+                block_count: (self.bytes.len() / SECTOR as usize) as u64,
+                read_only: true,
+            }
+        }
+    }
+
+    impl BlockDeviceSource for Disk {
+        fn device_count(&self) -> usize {
+            1
+        }
+
+        fn device_info(&self, index: DeviceIndex) -> Result<BlockDeviceInfo, Error> {
+            if index.0 != 0 {
+                return Err(Error::NotFound);
+            }
+            Ok(self.info())
+        }
+
+        fn read_blocks(
+            &mut self,
+            index: DeviceIndex,
+            lba: u64,
+            count: u32,
+            buffer: &mut [u8],
+        ) -> Result<(), Error> {
+            if index.0 != 0 {
+                return Err(Error::NotFound);
+            }
+            firmware::block::validate_read(self.info(), lba, count, buffer.len())?;
+            let start = (lba * SECTOR as u64) as usize;
+            let len = count as usize * SECTOR as usize;
+            buffer[..len].copy_from_slice(&self.bytes[start..start + len]);
+            Ok(())
+        }
+    }
+
+    /// 经**生产路径**（`boot::media::read_ext2_block`）走真实镜像直到根目录。
+    ///
+    /// 放在 lib 的测试模块里（而非 `tests/` 目录）：因为 `cargo test` 会构建 UEFI 的 bin，
+    /// 而它在宿主上无法链接；放在 lib 测试里也**不需要 dev-dependencies**。
+    #[test]
+    fn the_real_image_is_walked_through_the_production_glue() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fs/tests/fixtures/hello.ext2");
+        let bytes = std::fs::read(path).expect("夹具镜像应存在");
+        let sectors = (bytes.len() / SECTOR as usize) as u64;
+        let mut disk = Disk { bytes };
+        let volume = Volume::new(DeviceIndex(0), 0, sectors, SECTOR).expect("卷合法");
+
+        let mut head = std::vec![0u8; 2 * BLOCK];
+        read_ext2_block(&mut disk, &volume, 0, &mut head).expect("经生产胶水读头部");
+        let superblock = parse_superblock(&head).expect("超级块可解析");
+        assert_eq!(superblock.block_size, 1024);
+        assert_eq!(superblock.inode_size, 128);
+        assert_eq!(superblock.blocks_count, 256);
+
+        let gd_block = group_descriptor_block(superblock.block_size).expect("描述符表块号");
+        let mut gd = std::vec![0u8; BLOCK];
+        read_ext2_block(&mut disk, &volume, gd_block, &mut gd).expect("经生产胶水读描述符");
+        let group = parse_group_descriptor(&gd, 0).expect("解析描述符");
+
+        let mut table = std::vec![0u8; BLOCK];
+        read_ext2_block(&mut disk, &volume, group.inode_table as u64, &mut table)
+            .expect("经生产胶水读 inode 表");
+        let root = parse_inode(&table, 2, superblock.inode_size).expect("根目录 inode");
+        let mut dir = std::vec![0u8; BLOCK];
+        read_ext2_block(&mut disk, &volume, root.blocks[0] as u64, &mut dir)
+            .expect("经生产胶水读根目录块");
+        let mut entries = [DirEntry::EMPTY; 16];
+        let count = parse_dir_entries(&dir, &mut entries).expect("解析目录");
+        let names: std::vec::Vec<&[u8]> = entries[..count].iter().map(|entry| entry.name()).collect();
+        assert!(
+            names.iter().any(|name| *name == b"lost+found"),
+            "经生产路径应列出 lost+found，实际: {names:?}"
+        );
+    }
+}
