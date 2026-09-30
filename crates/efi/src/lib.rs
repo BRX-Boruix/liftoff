@@ -28,3 +28,5 @@ pub mod memory_map_source;
 pub mod uefi_memory_source;
 
 pub mod uefi_boot_services;
+
+pub mod handles;
