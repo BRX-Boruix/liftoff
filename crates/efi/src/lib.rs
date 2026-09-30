@@ -14,3 +14,5 @@ pub mod block_io;
 pub mod file;
 
 pub mod graphics;
+
+pub mod boot_services_table;
