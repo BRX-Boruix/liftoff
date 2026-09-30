@@ -8,7 +8,7 @@ use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
 use firmware::error::Error;
 use firmware_current::current::{
-    ExitBootServices, Handle, SystemTable, UefiBootServices, boot_services_of,
+    ExitBootServices, Handle, SystemTable, UefiBootServices, UefiMemoryMapSource, boot_services_of,
 };
 
 /// 入口第一步的结果。
@@ -28,6 +28,20 @@ pub fn start_with<P: Platform>(system_table: *mut SystemTable) -> Result<Outcome
 /// 生产入口：平台固定为门面选定的实现。
 pub fn start(system_table: *mut SystemTable) -> Result<Outcome, Error> {
     start_with::<crate::PlatformImpl>(system_table)
+}
+
+/// 交接前取键：把内存映射来源里记录的 `map_key` 写进槽。
+///
+/// 返回是否取到。**没有键时绝不编造**（`ExitBootServices` 只接受最近一次 `GetMemoryMap`
+/// 返回的键；编造一个只会让固件拒绝退出）。
+pub fn capture_map_key(source: &UefiMemoryMapSource<'_>, slot: &mut Option<usize>) -> bool {
+    match source.map_key() {
+        Some(key) => {
+            *slot = Some(key);
+            true
+        }
+        None => false,
+    }
 }
 
 /// 退出引导服务（入口编排）：复用 `UefiBootServices` 的语义。
@@ -174,5 +188,63 @@ mod exit_tests {
         let mut control = UefiBootServices::new(exit_fn(), core::ptr::null_mut(), &mut key);
         assert_eq!(unsafe { control.exit_boot_services() }, Err(Error::Io));
         assert_eq!(control.state(), BootServicesState::Active, "失败后固件仍在运行");
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::capture_map_key;
+    use core::ffi::c_void;
+    use firmware::memory::{MemoryEntry, MemoryMapSource};
+    use firmware_current::current::{BUFFER_TOO_SMALL, Status, SUCCESS, UefiMemoryMapSource};
+
+    /// 假 GetMemoryMap（沿用 `efi` crate 已验证的形态）：
+    /// 探测调用（map 为空）返回 BUFFER_TOO_SMALL 并给出所需大小；正式调用写入描述符并返回成功。
+    ///
+    /// SAFETY: 调用方按 UEFI 契约传入有效指针；本测试中始终如此。
+    unsafe extern "efiapi" fn fake(
+        map_size: *mut usize,
+        map: *mut c_void,
+        map_key: *mut usize,
+        descriptor_size: *mut usize,
+        _version: *mut u32,
+    ) -> Status {
+        unsafe {
+            *map_key = 0x1234;
+            *descriptor_size = 40;
+            *map_size = 40;
+            if map.is_null() {
+                BUFFER_TOO_SMALL
+            } else {
+                // 写一条全零的 40 字节描述符（UEFI 里类型 0 = 保留内存）。
+                core::ptr::write_bytes(map.cast::<u8>(), 0, 40);
+                SUCCESS
+            }
+        }
+    }
+
+    fn empty_entry() -> MemoryEntry {
+        MemoryEntry { base: arch::addr::PhysAddr::new(0), length: 0, kind: firmware::memory::MemoryKind::Reserved }
+    }
+
+    #[test]
+    fn the_key_is_captured_after_a_successful_map_load() {
+        let mut descriptors = [0u8; 128];
+        let mut source = UefiMemoryMapSource::new(fake, &mut descriptors);
+        assert_eq!(source.map_key(), None, "加载前没有键");
+        let mut buffer = [empty_entry(); 4];
+        source.memory_map(&mut buffer).expect("映射可取");
+        let mut slot = None;
+        assert!(capture_map_key(&source, &mut slot), "加载后应能取到键");
+        assert_eq!(slot, Some(0x1234));
+    }
+
+    #[test]
+    fn without_a_map_load_there_is_no_key_to_capture() {
+        let mut descriptors = [0u8; 128];
+        let source = UefiMemoryMapSource::new(fake, &mut descriptors);
+        let mut slot = None;
+        assert!(!capture_map_key(&source, &mut slot), "没加载就不该有键");
+        assert_eq!(slot, None, "不得凭空编造键");
     }
 }

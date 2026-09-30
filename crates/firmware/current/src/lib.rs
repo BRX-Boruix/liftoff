@@ -18,7 +18,7 @@ compile_error!("必须启用一个固件实现 feature：目前是 `impl-uefi`")
 #[cfg(feature = "impl-uefi")]
 pub mod current {
     pub use efi::boot_services_table::ExitBootServices;
-    pub use efi::types::{DEVICE_ERROR, Handle, SUCCESS, Status};
+    pub use efi::types::{BUFFER_TOO_SMALL, DEVICE_ERROR, Handle, SUCCESS, Status};
     pub use efi::uefi_boot_services::UefiBootServices;
     pub use efi::boot_services_table::BootServicesTable;
     pub use efi::system_table::boot_services_of;
