@@ -42,6 +42,8 @@ pub enum FatError {
     ArithmeticOverflow,
     /// 表项越出 FAT 表范围。
     TableOutOfBounds,
+    /// 调用方给的输出缓冲太小。
+    BufferTooSmall,
 }
 
 /// BPB 的关键字段。
@@ -186,6 +188,84 @@ pub fn fat_entry(fat: &[u8], index: u32, kind: FatKind) -> Result<u32, FatError>
     }
 }
 
+/// 链尾判断（各变体的结束标记区间不同）。
+pub fn is_end_of_chain(kind: FatKind, value: u32) -> bool {
+    match kind {
+        FatKind::Fat12 => (0x0FF8..=0x0FFF).contains(&value),
+        FatKind::Fat16 => (0xFFF8..=0xFFFF).contains(&value),
+        FatKind::Fat32 => (0x0FFF_FFF8..=0x0FFF_FFFF).contains(&value),
+    }
+}
+
+/// 坏簇判断。**与链尾互斥**：坏簇是错误，不是链的结束。
+pub fn is_bad_cluster(kind: FatKind, value: u32) -> bool {
+    match kind {
+        FatKind::Fat12 => value == 0x0FF7,
+        FatKind::Fat16 => value == 0xFFF7,
+        FatKind::Fat32 => value == 0x0FFF_FFF7,
+    }
+}
+
+/// 一个 8.3 目录项（名字 11 字节，空格填充）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Entry {
+    /// 8.3 名（11 字节）。
+    pub name: [u8; 11],
+    /// 属性字节。
+    pub attributes: u8,
+    /// 起始簇（含 FAT32 的高 16 位）。
+    pub first_cluster: u32,
+    /// 文件大小（字节）。
+    pub size: u32,
+}
+
+impl Entry {
+    /// 占位值。
+    pub const EMPTY: Self = Self { name: [0; 11], attributes: 0, first_cluster: 0, size: 0 };
+}
+
+/// 遍历一个目录扇区里的 32 字节目录项，返回条目数。
+///
+/// 首字节 `0x00` 表示**后续全空** → 终止遍历；`0xE5` 表示**已删除** → 跳过；
+/// 属性 `0x0F` 是**长文件名（LFN）项** → **明确跳过**（本实现不支持 LFN，不假装支持）。
+pub fn parse_directory(sector: &[u8], out: &mut [Entry]) -> Result<usize, FatError> {
+    if sector.len() < 32 {
+        return Err(FatError::ShortSector);
+    }
+    let mut count = 0;
+    let mut at = 0usize;
+    while at + 32 <= sector.len() {
+        let item = sector.get(at..at + 32).ok_or(FatError::ShortSector)?;
+        let first = item[0];
+        if first == 0x00 {
+            break;
+        }
+        if first == 0xE5 {
+            at += 32;
+            continue;
+        }
+        let attributes = item[11];
+        if attributes == 0x0F {
+            at += 32;
+            continue;
+        }
+        if count == out.len() {
+            return Err(FatError::BufferTooSmall);
+        }
+        let mut entry = Entry::EMPTY;
+        entry.name.copy_from_slice(&item[..11]);
+        entry.attributes = attributes;
+        let low = u16::from_le_bytes([item[26], item[27]]) as u32;
+        let high = u16::from_le_bytes([item[20], item[21]]) as u32;
+        entry.first_cluster = (high << 16) | low;
+        entry.size = u32::from_le_bytes([item[28], item[29], item[30], item[31]]);
+        out[count] = entry;
+        count += 1;
+        at += 32;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FAT_SIGNATURE_OFFSET, FatError, FatKind, parse_bpb};
@@ -317,5 +397,79 @@ mod chain_tests {
         let fat = std::vec![0u8; 4];
         assert_eq!(fat_entry(&fat, 100, FatKind::Fat16), Err(FatError::TableOutOfBounds));
         assert_eq!(fat_entry(&fat, u32::MAX, FatKind::Fat12), Err(FatError::TableOutOfBounds));
+    }
+}
+
+#[cfg(test)]
+mod dir_tests {
+    use super::{
+        Entry, FatError, FatKind, is_bad_cluster, is_end_of_chain, parse_directory,
+    };
+    
+
+    const SECTOR: usize = 512;
+
+    #[test]
+    fn end_of_chain_ranges_differ_per_variant() {
+        assert!(is_end_of_chain(FatKind::Fat12, 0x0FF8));
+        assert!(is_end_of_chain(FatKind::Fat12, 0x0FFF));
+        assert!(!is_end_of_chain(FatKind::Fat12, 0x0FF7), "0xFF7 是坏簇，不是链尾");
+        assert!(is_end_of_chain(FatKind::Fat16, 0xFFF8));
+        assert!(is_end_of_chain(FatKind::Fat16, 0xFFFF));
+        assert!(is_end_of_chain(FatKind::Fat32, 0x0FFF_FFF8));
+        assert!(is_end_of_chain(FatKind::Fat32, 0x0FFF_FFFF));
+        assert!(!is_end_of_chain(FatKind::Fat16, 5), "普通簇号不是链尾");
+    }
+
+    #[test]
+    fn bad_clusters_are_distinguished_from_chain_end() {
+        assert!(is_bad_cluster(FatKind::Fat12, 0x0FF7));
+        assert!(is_bad_cluster(FatKind::Fat16, 0xFFF7));
+        assert!(is_bad_cluster(FatKind::Fat32, 0x0FFF_FFF7));
+        assert!(!is_bad_cluster(FatKind::Fat12, 0x0FF8), "链尾不是坏簇");
+        assert!(!is_bad_cluster(FatKind::Fat32, 0), "空闲簇不是坏簇");
+    }
+
+    /// 往扇区里写一个 32 字节目录项。
+    fn put_entry(sector: &mut [u8], at: usize, name: &[u8; 11], attributes: u8, cluster: u32, size: u32) {
+        sector[at..at + 11].copy_from_slice(name);
+        sector[at + 11] = attributes;
+        sector[at + 26..at + 28].copy_from_slice(&(cluster as u16).to_le_bytes());
+        sector[at + 28..at + 32].copy_from_slice(&size.to_le_bytes());
+    }
+
+    #[test]
+    fn eight_three_names_are_read_and_the_zero_entry_terminates() {
+        let mut sector = std::vec![0u8; SECTOR];
+        put_entry(&mut sector, 0, b"HELLO   TXT", 0x20, 5, 1234);
+        // 偏移 32 处保持 0 → 表示后续全空。
+        let mut out = [Entry::EMPTY; 8];
+        let count = parse_directory(&sector, &mut out).expect("解析成功");
+        assert_eq!(count, 1);
+        assert_eq!(&out[0].name[..], b"HELLO   TXT", "8.3 名以空格填充");
+        assert_eq!(out[0].first_cluster, 5);
+        assert_eq!(out[0].size, 1234);
+    }
+
+    #[test]
+    fn deleted_entries_are_skipped_and_long_name_entries_are_skipped() {
+        let mut sector = std::vec![0u8; SECTOR];
+        // 已删除项：首字节 0xE5。
+        put_entry(&mut sector, 0, b"\xE5ONE    TXT", 0x20, 1, 1);
+        // 长文件名项：属性 0x0F —— 本实现**明确跳过**（不支持 LFN）。
+        put_entry(&mut sector, 32, b"LFN     X  ", 0x0F, 0, 0);
+        put_entry(&mut sector, 64, b"KEEP    TXT", 0x20, 7, 42);
+        let mut out = [Entry::EMPTY; 8];
+        let count = parse_directory(&sector, &mut out).expect("解析成功");
+        assert_eq!(count, 1, "已删除项与 LFN 项都不应出现在结果里");
+        assert_eq!(&out[0].name[..], b"KEEP    TXT");
+        assert_eq!(out[0].first_cluster, 7);
+    }
+
+    #[test]
+    fn a_short_sector_is_rejected() {
+        let sector = std::vec![0u8; 16];
+        let mut out = [Entry::EMPTY; 8];
+        assert_eq!(parse_directory(&sector, &mut out), Err(FatError::ShortSector));
     }
 }
