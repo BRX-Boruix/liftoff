@@ -1,0 +1,88 @@
+//! Protocol base types: magic, base revision, and the first request/response pair.
+//!
+//! Every constant and offset here is verified against
+//! brxLimine/limine-protocol/include/limine.h (checked 2026-09-30), not written from memory.
+
+/// `LIMINE_COMMON_MAGIC` (the first two words of every request id).
+pub const COMMON_MAGIC: [u64; 2] = [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b];
+
+/// `LIMINE_BASE_REVISION(N)` magic words.
+pub const BASE_REVISION_MAGIC: [u64; 2] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc];
+
+/// The base revision this bootloader implements.
+pub const BASE_REVISION: u64 = 0;
+
+/// `LIMINE_BASE_REVISION_SUPPORTED(VAR)`: the kernel's declared revision array is
+/// supported when its third element is zero.
+pub const fn base_revision_supported(declared: [u64; 3]) -> bool {
+    declared[2] == 0
+}
+
+/// `LIMINE_HHDM_REQUEST_ID`.
+pub const HHDM_REQUEST_ID: [u64; 4] = [
+    COMMON_MAGIC[0],
+    COMMON_MAGIC[1],
+    0x48dcf1cb8ad2b852,
+    0x63984e959a98244b,
+];
+
+/// `struct limine_hhdm_response`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct HhdmResponse {
+    /// Response revision.
+    pub revision: u64,
+    /// Higher-half direct map offset.
+    pub offset: u64,
+}
+
+/// `struct limine_hhdm_request`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct HhdmRequest {
+    /// Request identifier.
+    pub id: [u64; 4],
+    /// Request revision.
+    pub revision: u64,
+    /// Response pointer (filled by the bootloader).
+    pub response: *mut HhdmResponse,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BASE_REVISION, HHDM_REQUEST_ID, HhdmRequest, HhdmResponse, base_revision_supported,
+    };
+    use core::mem::{offset_of, size_of};
+
+    #[test]
+    fn base_revision_supported_matches_the_header_macro() {
+        // limine.h: LIMINE_BASE_REVISION_SUPPORTED(VAR) is ((VAR)[2] == 0).
+        assert!(base_revision_supported([1, 2, BASE_REVISION]));
+        assert!(!base_revision_supported([1, 2, 1]));
+    }
+
+    #[test]
+    fn request_layout_matches_the_header() {
+        // limine.h: struct limine_hhdm_request { uint64_t id[4]; uint64_t revision; ptr response; }
+        assert_eq!(size_of::<HhdmRequest>(), 48);
+        assert_eq!(offset_of!(HhdmRequest, id), 0);
+        assert_eq!(offset_of!(HhdmRequest, revision), 32);
+        assert_eq!(offset_of!(HhdmRequest, response), 40);
+    }
+
+    #[test]
+    fn response_layout_matches_the_header() {
+        assert_eq!(size_of::<HhdmResponse>(), 16);
+        assert_eq!(offset_of!(HhdmResponse, revision), 0);
+        assert_eq!(offset_of!(HhdmResponse, offset), 8);
+    }
+
+    #[test]
+    fn hhdm_request_id_matches_the_header() {
+        assert_eq!(HHDM_REQUEST_ID[0], 0xc7b1dd30df4c8b88);
+        assert_eq!(HHDM_REQUEST_ID[1], 0x0a82e883a194f07b);
+        assert_eq!(HHDM_REQUEST_ID[2], 0x48dcf1cb8ad2b852);
+        assert_eq!(HHDM_REQUEST_ID[3], 0x63984e959a98244b);
+    }
+}
