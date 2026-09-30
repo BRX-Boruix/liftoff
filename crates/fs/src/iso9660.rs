@@ -481,3 +481,63 @@ mod path_lookup_tests {
         assert!(found.is_none());
     }
 }
+
+#[cfg(test)]
+mod real_iso_tests {
+    use super::{IsoError, find_in_directory, parse_primary_descriptor};
+
+    struct Reader<'a>(&'a [u8]);
+
+    impl Reader<'_> {
+        fn read(&self, lba: u32, out: &mut [u8]) -> Result<(), IsoError> {
+            let at = lba as usize * 2048;
+            let src = self.0.get(at..at + out.len()).ok_or(IsoError::ShortImage)?;
+            out.copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    /// 用**真实 ISO** 验证查找：根 → `BOOT` → `KERNEL.;1`。
+    ///
+    /// ISO 不在时明确跳过（不让测试假装通过）。
+    #[test]
+    fn the_real_iso_yields_the_kernel_extent() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
+        let Ok(image) = std::fs::read(path) else {
+            std::eprintln!("跳过：真实 ISO 不存在（{path}）");
+            return;
+        };
+        let descriptor =
+            parse_primary_descriptor(&image).expect("主卷描述符可解析");
+        let reader = Reader(&image);
+        let mut block = std::vec![0u8; 2048];
+        let boot = find_in_directory(
+            descriptor.root.extent_lba,
+            descriptor.root.data_length,
+            descriptor.block_size,
+            b"boot",
+            &mut block,
+            |lba, out| reader.read(lba, out),
+        )
+        .expect("根目录可查")
+        .expect("根目录里必须有 BOOT");
+        assert_eq!(boot.flags & 2, 2, "BOOT 必须是目录");
+
+        let kernel = find_in_directory(
+            boot.extent_lba,
+            boot.data_length,
+            descriptor.block_size,
+            b"kernel",
+            &mut block,
+            |lba, out| reader.read(lba, out),
+        )
+        .expect("BOOT 可查")
+        .expect("BOOT 里必须有内核");
+        assert_eq!(kernel.extent_lba, 33, "实测内核 extent");
+        assert_eq!(kernel.data_length, 24619400, "实测内核大小");
+        assert_eq!(kernel.flags & 2, 0, "内核是文件");
+        // 真实产物：extent 处应当是 ELF 魔数。
+        let at = kernel.extent_lba as usize * 2048;
+        assert_eq!(&image[at..at + 4], b"\x7fELF", "内核位置应当是 ELF");
+    }
+}
