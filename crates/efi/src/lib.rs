@@ -62,3 +62,5 @@ pub mod file_info;
 pub mod file_get_info;
 
 pub mod file_open_info;
+
+pub mod uefi_files;
