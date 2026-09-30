@@ -254,27 +254,58 @@ where
         return Err(Ext2Error::BufferTooSmall);
     }
     let size = inode.size as usize;
+    let per_indirect = block / 4;
+    // 先判**布局可行性**（更根本的错误先报，且无需为三级间接准备巨大缓冲）。
+    let per_squared = per_indirect
+        .checked_mul(per_indirect)
+        .ok_or(Ext2Error::UnsupportedLayout)?;
+    let max_blocks = 12usize
+        .checked_add(per_indirect)
+        .and_then(|value| value.checked_add(per_squared))
+        .ok_or(Ext2Error::UnsupportedLayout)?;
+    let needed = if size == 0 { 0 } else { (size - 1) / block + 1 };
+    if needed > max_blocks {
+        return Err(Ext2Error::UnsupportedLayout);
+    }
     if out.len() < size {
         return Err(Ext2Error::BufferTooSmall);
     }
-    let per_indirect = block / 4;
     let mut written = 0usize;
     let mut index = 0usize;
     while written < size {
         // 定位数据块号：前 12 块直接，之后走一级间接。
+        // 三档定位：直接块 → 一级间接 → 二级间接；三级间接仍未支持（响亮报错）。
         let number = if index < 12 {
             inode.blocks[index]
-        } else {
+        } else if index < 12 + per_indirect {
             let slot = index - 12;
-            if slot >= per_indirect {
-                return Err(Ext2Error::UnsupportedLayout);
-            }
-            let indirect_number = inode.blocks[12];
-            if indirect_number == 0 {
+            let parent = inode.blocks[12];
+            if parent == 0 {
                 0
             } else {
-                read_block(indirect_number, scratch)?;
+                read_block(parent, scratch)?;
                 read_u32(scratch, slot * 4).ok_or(Ext2Error::ShortImage)?
+            }
+        } else {
+            let within = index - 12 - per_indirect;
+            if within >= per_squared {
+                return Err(Ext2Error::UnsupportedLayout);
+            }
+            let parent = inode.blocks[13];
+            if parent == 0 {
+                0
+            } else {
+                let first = within / per_indirect;
+                let second = within % per_indirect;
+                // 两级读取复用同一个 scratch：每次读完立刻取出块号。
+                read_block(parent, scratch)?;
+                let child = read_u32(scratch, first * 4).ok_or(Ext2Error::ShortImage)?;
+                if child == 0 {
+                    0
+                } else {
+                    read_block(child, scratch)?;
+                    read_u32(scratch, second * 4).ok_or(Ext2Error::ShortImage)?
+                }
             }
         };
         let remaining = size - written;
@@ -678,6 +709,105 @@ mod read_tests {
         assert_eq!(
             read_file(&inode, BLOCK, &mut std::vec![0u8; BLOCK as usize], &mut out, |number, buffer| device.read(number, buffer)),
             Err(Ext2Error::BufferTooSmall)
+        );
+    }
+}
+
+#[cfg(test)]
+mod double_indirect_tests {
+    use super::{Ext2Error, Inode, read_file};
+    use std::vec::Vec;
+
+    const BLOCK: u32 = 1024;
+    const PER: u32 = BLOCK / 4;
+
+    struct Fake {
+        blocks: Vec<Vec<u8>>,
+    }
+
+    impl Fake {
+        fn new(count: usize) -> Self {
+            Self { blocks: std::vec![std::vec![0u8; BLOCK as usize]; count] }
+        }
+
+        fn fill(&mut self, number: u32, byte: u8) {
+            self.blocks[number as usize] = std::vec![byte; BLOCK as usize];
+        }
+
+        fn put(&mut self, number: u32, slot: u32, value: u32) {
+            let at = slot as usize * 4;
+            self.blocks[number as usize][at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        fn read(&mut self, number: u32, out: &mut [u8]) -> Result<(), Ext2Error> {
+            let block = self.blocks.get(number as usize).ok_or(Ext2Error::ShortImage)?;
+            let take = out.len().min(block.len());
+            out[..take].copy_from_slice(&block[..take]);
+            Ok(())
+        }
+    }
+
+    /// 目标：索引 12 + PER（即二级间接的第一个数据块）。
+    fn target_index() -> usize {
+        (12 + PER) as usize
+    }
+
+    #[test]
+    fn a_block_beyond_the_single_indirect_range_comes_from_double_indirect() {
+        // 直接 12 块 + 一级 PER 块 = 12+256 = 268；索引 268 起走二级间接。
+        let index = target_index();
+        assert_eq!(index, 268, "1 KiB 块下二级间接从索引 268 开始");
+        let size = (index + 1) as u32 * BLOCK;
+        let mut fake = Fake::new(400);
+        // 二级间接块放在 300，其 [0] 指向一级间接块 301，301 的 [0] 指向数据块 302。
+        fake.put(300, 0, 301);
+        fake.put(301, 0, 302);
+        fake.fill(302, 0x77);
+        let mut blocks = [0u32; 15];
+        blocks[13] = 300;
+        let inode = Inode { mode: 0x81A4, size, blocks };
+        let mut out = std::vec![0u8; size as usize];
+        let mut scratch = std::vec![0u8; BLOCK as usize];
+        let mut device = fake;
+        let read = read_file(&inode, BLOCK, &mut scratch, &mut out, |number, buffer| device.read(number, buffer)).expect("读取成功");
+        assert_eq!(read, size as usize);
+        assert_eq!(out[index * BLOCK as usize], 0x77, "索引 268 应来自二级间接");
+    }
+
+    #[test]
+    fn a_zero_double_indirect_pointer_is_a_hole() {
+        let index = target_index();
+        let size = (index + 1) as u32 * BLOCK;
+        let fake = Fake::new(400);
+        // blocks[13] = 0 → 整个二级间接范围都是空洞。
+        let mut blocks = [0u32; 15];
+        blocks[13] = 0;
+        let inode = Inode { mode: 0x81A4, size, blocks };
+        let mut out = std::vec![0xFFu8; size as usize];
+        let mut scratch = std::vec![0u8; BLOCK as usize];
+        let mut device = fake;
+        read_file(&inode, BLOCK, &mut scratch, &mut out, |number, buffer| device.read(number, buffer)).expect("读取成功");
+        assert_eq!(out[index * BLOCK as usize], 0x00, "空洞必须零填充");
+    }
+
+    #[test]
+    fn an_index_beyond_the_double_indirect_range_is_rejected() {
+        // 12 + PER + PER*PER = 12 + 256 + 65536 = 65804；索引 65804 已属三级间接。
+        let index = 12 + PER as usize + (PER * PER) as usize;
+        assert_eq!(index, 65804);
+        let size = (index + 1) as u32 * BLOCK;
+        let fake = Fake::new(4);
+        let mut blocks = [0u32; 15];
+        blocks[13] = 1;
+        blocks[14] = 2;
+        let inode = Inode { mode: 0x81A4, size, blocks };
+        let mut out = std::vec![0u8; BLOCK as usize];
+        let mut scratch = std::vec![0u8; BLOCK as usize];
+        let mut device = fake;
+        assert_eq!(
+            read_file(&inode, BLOCK, &mut scratch, &mut out, |number, buffer| device.read(number, buffer)),
+            Err(Ext2Error::UnsupportedLayout)
+            , "三级间接仍未支持，必须响亮报错"
         );
     }
 }
