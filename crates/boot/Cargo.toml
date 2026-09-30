@@ -11,5 +11,6 @@ workspace = true
 [[bin]]
 name = "liftoff"
 path = "src/main.rs"
+test = false
 
 [dependencies]
