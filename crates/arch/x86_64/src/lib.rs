@@ -10,3 +10,4 @@
 extern crate std;
 
 pub mod platform;
+pub mod paging;

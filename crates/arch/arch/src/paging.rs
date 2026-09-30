@@ -78,6 +78,8 @@ pub enum MapError {
     Overflow,
     /// 页帧分配耗尽（实现方的帧来源无可用帧）。
     OutOfMemory,
+    /// 页表帧不在直接映射内，无法访问。
+    TableNotAccessible,
 }
 
 /// 覆盖 `len` 字节所需的页数（向上取整）。
