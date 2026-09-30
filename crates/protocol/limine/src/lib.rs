@@ -11,3 +11,4 @@
 extern crate std;
 
 pub mod base;
+pub mod memmap;
