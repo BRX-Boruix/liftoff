@@ -46,3 +46,5 @@ pub mod protocol_lookup;
 pub mod discover;
 
 pub mod uefi_block_devices;
+
+pub mod file_open;
