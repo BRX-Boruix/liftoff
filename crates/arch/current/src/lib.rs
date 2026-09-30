@@ -15,10 +15,10 @@ compile_error!("`impl-x86_64` 与 `impl-mock` 互斥，只能启用一个");
 compile_error!("必须启用一个实现 feature：`impl-x86_64` 或 `impl-mock`");
 
 #[cfg(feature = "impl-x86_64")]
-pub use x86_64 as current;
+pub use x86_64::platform::X86_64 as PlatformImpl;
 
 #[cfg(feature = "impl-mock")]
-pub mod current {
+pub mod mock {
     //! 宿主测试用实现：不触碰硬件，但状态机行为真实（不是"假数据"）。
 
     use arch::platform::{InterruptState, Platform};
@@ -85,9 +85,12 @@ pub mod current {
     }
 }
 
+#[cfg(feature = "impl-mock")]
+pub use mock::Mock as PlatformImpl;
+
 #[cfg(all(test, feature = "impl-mock"))]
 mod tests {
-    use crate::current::Mock;
+    use crate::mock::Mock;
     use arch::platform::Platform;
 
 
