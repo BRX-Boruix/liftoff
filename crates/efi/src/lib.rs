@@ -16,3 +16,5 @@ pub mod file;
 pub mod graphics;
 
 pub mod boot_services_table;
+
+pub mod memory;
