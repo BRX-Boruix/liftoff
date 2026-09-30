@@ -8,4 +8,5 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod error;
 pub mod memory;
