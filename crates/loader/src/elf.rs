@@ -254,6 +254,46 @@ where
 }
 
 #[cfg(test)]
+mod real_artifact_tests {
+    use super::{ET_DYN, EM_X86_64, ProgramHeader, parse_elf_header, parse_load_segments};
+
+    /// 用**真实内核产物**验证解析与段布局（不是自造夹具）。
+    ///
+    /// 产物不在时**明确跳过并说明**（不让测试假装通过）。
+    #[test]
+    fn the_real_kernel_artifact_matches_the_measured_layout() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../kernel/target/x86_64-unknown-none/release/kernel"
+        );
+        let Ok(image) = std::fs::read(path) else {
+            std::eprintln!("跳过：真实内核产物不存在（{path}）");
+            return;
+        };
+        let header = parse_elf_header(&image).expect("真实内核应可解析");
+        assert_eq!(header.e_machine, EM_X86_64);
+        assert_eq!(header.e_type, ET_DYN, "实测为 ET_DYN（PIE）");
+        assert_eq!(header.e_entry, 0xffff_ffff_8001_af20, "实测入口");
+        assert_eq!(header.e_phentsize as usize, 56);
+        assert_eq!(header.e_phnum, 4);
+
+        let mut out = [ProgramHeader::EMPTY; 8];
+        let count = parse_load_segments(&image, &header, &mut out).expect("段可解析");
+        assert_eq!(count, 3, "实测 3 个 PT_LOAD");
+        assert_eq!(out[0].p_vaddr, 0xffff_ffff_8000_0000);
+        assert_eq!(out[0].p_filesz, 0xba478);
+        assert_eq!(out[0].p_memsz, 0xba478, "实测 filesz == memsz（无 BSS）");
+        assert_eq!(out[1].p_vaddr, 0xffff_ffff_800b_b000);
+        assert_eq!(out[2].p_vaddr, 0xffff_ffff_804e_c000);
+        // 跳转前检查依赖这一点：入口必须落在某个已装载段内。
+        assert!(
+            header.e_entry >= out[0].p_vaddr && header.e_entry < out[0].p_vaddr + out[0].p_memsz,
+            "入口必须落在第 0 段内"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         ELF_MAGIC, EM_X86_64, ET_DYN, ET_EXEC, ElfError, parse_elf_header,
