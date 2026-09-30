@@ -10,3 +10,5 @@ pub mod types;
 pub mod boot_services;
 
 pub mod block_io;
+
+pub mod file;
