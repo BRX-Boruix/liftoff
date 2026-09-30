@@ -36,6 +36,16 @@ pub enum ElfError {
     WrongMachine,
     /// `e_type` 不是可执行文件或 PIE。
     UnsupportedType,
+    /// `e_phentsize` 不是 56。
+    BadProgramHeader,
+    /// `p_filesz > p_memsz`（BSS 只能补零，不能缩短）。
+    BadSegmentSize,
+    /// 程序头表或某个段越出映像范围。
+    SegmentOutOfBounds,
+    /// 没有任何 `PT_LOAD` 段（内核必须至少有一个）。
+    NoLoadSegments,
+    /// 调用方给的输出缓冲太小。
+    BufferTooSmall,
 }
 
 /// ELF64 头的关键字段。
@@ -60,6 +70,13 @@ fn read_u16(raw: &[u8], at: usize) -> Option<u16> {
     let mut buf = [0u8; 2];
     buf.copy_from_slice(bytes);
     Some(u16::from_le_bytes(buf))
+}
+
+fn read_u32(raw: &[u8], at: usize) -> Option<u32> {
+    let bytes = raw.get(at..at.checked_add(4)?)?;
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(bytes);
+    Some(u32::from_le_bytes(buf))
 }
 
 fn read_u64(raw: &[u8], at: usize) -> Option<u64> {
@@ -97,6 +114,95 @@ pub fn parse_elf_header(image: &[u8]) -> Result<ElfHeader, ElfError> {
         e_phentsize: read_u16(raw, 54).ok_or(ElfError::ShortImage)?,
         e_phnum: read_u16(raw, 56).ok_or(ElfError::ShortImage)?,
     })
+}
+
+/// `PT_LOAD`：可装载段。
+pub const PT_LOAD: u32 = 1;
+/// ELF64 程序头长度。
+pub const ELF64_PHDR_SIZE: usize = 56;
+
+/// ELF64 程序头的关键字段。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProgramHeader {
+    /// `p_type`。
+    pub p_type: u32,
+    /// `p_flags`。
+    pub p_flags: u32,
+    /// 在映像中的偏移。
+    pub p_offset: u64,
+    /// 目标虚拟地址。
+    pub p_vaddr: u64,
+    /// 文件中要拷贝的字节数。
+    pub p_filesz: u64,
+    /// 内存中占用的字节数（超出 `p_filesz` 的部分是 BSS，须清零）。
+    pub p_memsz: u64,
+}
+
+impl ProgramHeader {
+    /// 占位值。
+    pub const EMPTY: Self = Self {
+        p_type: 0,
+        p_flags: 0,
+        p_offset: 0,
+        p_vaddr: 0,
+        p_filesz: 0,
+        p_memsz: 0,
+    };
+}
+
+/// 解析所有 `PT_LOAD` 程序头，返回数量。
+///
+/// 数值边界：表范围 `e_phoff + e_phnum × 56` 与每个段的 `p_offset + p_filesz`
+/// 都用 checked 运算，越界一律报错（不越界读）；`p_filesz > p_memsz` 视为损坏。
+pub fn parse_load_segments(
+    image: &[u8],
+    header: &ElfHeader,
+    out: &mut [ProgramHeader],
+) -> Result<usize, ElfError> {
+    if header.e_phentsize as usize != ELF64_PHDR_SIZE {
+        return Err(ElfError::BadProgramHeader);
+    }
+    let start = usize::try_from(header.e_phoff).map_err(|_| ElfError::SegmentOutOfBounds)?;
+    let total = (header.e_phnum as usize)
+        .checked_mul(ELF64_PHDR_SIZE)
+        .ok_or(ElfError::SegmentOutOfBounds)?;
+    let end = start.checked_add(total).ok_or(ElfError::SegmentOutOfBounds)?;
+    let table = image.get(start..end).ok_or(ElfError::SegmentOutOfBounds)?;
+    let mut count = 0;
+    for index in 0..header.e_phnum as usize {
+        let at = index.checked_mul(ELF64_PHDR_SIZE).ok_or(ElfError::SegmentOutOfBounds)?;
+        let raw = table.get(at..at + ELF64_PHDR_SIZE).ok_or(ElfError::SegmentOutOfBounds)?;
+        let p_type = read_u32(raw, 0).ok_or(ElfError::SegmentOutOfBounds)?;
+        if p_type != PT_LOAD {
+            continue;
+        }
+        let p_offset = read_u64(raw, 8).ok_or(ElfError::SegmentOutOfBounds)?;
+        let p_filesz = read_u64(raw, 32).ok_or(ElfError::SegmentOutOfBounds)?;
+        let p_memsz = read_u64(raw, 40).ok_or(ElfError::SegmentOutOfBounds)?;
+        if p_filesz > p_memsz {
+            return Err(ElfError::BadSegmentSize);
+        }
+        let file_end = p_offset.checked_add(p_filesz).ok_or(ElfError::SegmentOutOfBounds)?;
+        if file_end > image.len() as u64 {
+            return Err(ElfError::SegmentOutOfBounds);
+        }
+        if count == out.len() {
+            return Err(ElfError::BufferTooSmall);
+        }
+        out[count] = ProgramHeader {
+            p_type,
+            p_flags: read_u32(raw, 4).ok_or(ElfError::SegmentOutOfBounds)?,
+            p_offset,
+            p_vaddr: read_u64(raw, 16).ok_or(ElfError::SegmentOutOfBounds)?,
+            p_filesz,
+            p_memsz,
+        };
+        count += 1;
+    }
+    if count == 0 {
+        return Err(ElfError::NoLoadSegments);
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -177,5 +283,127 @@ mod tests {
     fn a_short_image_is_rejected() {
         let raw = std::vec![0u8; 32];
         assert_eq!(parse_elf_header(&raw), Err(ElfError::ShortImage));
+    }
+}
+
+#[cfg(test)]
+mod phdr_tests {
+    use super::{
+        ELF_MAGIC, ELF64_PHDR_SIZE, EM_X86_64, ET_EXEC, ElfError, PT_LOAD, parse_elf_header,
+        parse_load_segments,
+    };
+    use std::vec::Vec;
+
+    /// 造一个程序头（56 字节）。
+    fn phdr(kind: u32, offset: u64, vaddr: u64, filesz: u64, memsz: u64) -> [u8; 56] {
+        let mut raw = [0u8; 56];
+        raw[0..4].copy_from_slice(&kind.to_le_bytes());
+        raw[4..8].copy_from_slice(&5u32.to_le_bytes());
+        raw[8..16].copy_from_slice(&offset.to_le_bytes());
+        raw[16..24].copy_from_slice(&vaddr.to_le_bytes());
+        raw[32..40].copy_from_slice(&filesz.to_le_bytes());
+        raw[40..48].copy_from_slice(&memsz.to_le_bytes());
+        raw
+    }
+
+    /// 造映像：64 字节头 + 紧随其后的程序头表。
+    fn image(headers: &[[u8; 56]]) -> Vec<u8> {
+        // 映像 = 64 字节头 + 程序头表 + 4096 字节余量：
+        // 余量取大一些，避免段偏移（0x100/0x200 等）算出越界。
+        let mut raw = std::vec![0u8; 64 + headers.len() * ELF64_PHDR_SIZE + 4096];
+        raw[0..4].copy_from_slice(&ELF_MAGIC);
+        raw[4] = 2;
+        raw[5] = 1;
+        raw[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        raw[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        raw[32..40].copy_from_slice(&64u64.to_le_bytes());
+        raw[54..56].copy_from_slice(&(ELF64_PHDR_SIZE as u16).to_le_bytes());
+        raw[56..58].copy_from_slice(&(headers.len() as u16).to_le_bytes());
+        for (index, header) in headers.iter().enumerate() {
+            let at = 64 + index * ELF64_PHDR_SIZE;
+            raw[at..at + ELF64_PHDR_SIZE].copy_from_slice(header);
+        }
+        raw
+    }
+
+    fn empty_out() -> [super::ProgramHeader; 4] {
+        [super::ProgramHeader::EMPTY; 4]
+    }
+
+    #[test]
+    fn only_load_segments_are_returned() {
+        let raw = image(&[
+            // 0x100 + 0x100 = 512，远小于映像长度；memsz 0x300 制造 BSS。
+            phdr(PT_LOAD, 0x100, 0xffff_ffff_8000_0000, 0x100, 0x300),
+            phdr(4, 0, 0, 0, 0),
+            phdr(PT_LOAD, 0x200, 0xffff_ffff_8000_1000, 0x100, 0x100),
+        ]);
+        let head = parse_elf_header(&raw).expect("头有效");
+        let mut out = empty_out();
+        let count = parse_load_segments(&raw, &head, &mut out).expect("解析成功");
+        assert_eq!(count, 2, "PT_NOTE 不应计入");
+        assert_eq!(out[0].p_offset, 0x100);
+        assert_eq!(out[0].p_vaddr, 0xffff_ffff_8000_0000);
+        assert_eq!(out[0].p_filesz, 0x100);
+        assert_eq!(out[0].p_memsz, 0x300, "memsz > filesz 表示 BSS");
+        assert_eq!(out[1].p_vaddr, 0xffff_ffff_8000_1000);
+    }
+
+    #[test]
+    fn filesz_greater_than_memsz_is_rejected() {
+        let raw = image(&[phdr(PT_LOAD, 0x1000, 0x1000, 0x400, 0x100)]);
+        let head = parse_elf_header(&raw).expect("头有效");
+        let mut out = empty_out();
+        assert_eq!(
+            parse_load_segments(&raw, &head, &mut out),
+            Err(ElfError::BadSegmentSize)
+        );
+    }
+
+    #[test]
+    fn a_segment_past_the_image_is_rejected() {
+        // offset + filesz 越出映像。
+        let raw = image(&[phdr(PT_LOAD, 0x9000, 0x1000, 0x100, 0x100)]);
+        let head = parse_elf_header(&raw).expect("头有效");
+        let mut out = empty_out();
+        assert_eq!(
+            parse_load_segments(&raw, &head, &mut out),
+            Err(ElfError::SegmentOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn a_program_header_table_past_the_image_is_rejected() {
+        let mut raw = image(&[phdr(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100)]);
+        raw[56..58].copy_from_slice(&100u16.to_le_bytes());
+        let head = parse_elf_header(&raw).expect("头有效");
+        let mut out = empty_out();
+        assert_eq!(
+            parse_load_segments(&raw, &head, &mut out),
+            Err(ElfError::SegmentOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn an_image_without_load_segments_is_rejected() {
+        let raw = image(&[phdr(4, 0, 0, 0, 0)]);
+        let head = parse_elf_header(&raw).expect("头有效");
+        let mut out = empty_out();
+        assert_eq!(
+            parse_load_segments(&raw, &head, &mut out),
+            Err(ElfError::NoLoadSegments)
+        );
+    }
+
+    #[test]
+    fn a_wrong_program_header_size_is_rejected() {
+        let mut raw = image(&[phdr(PT_LOAD, 0x1000, 0x1000, 0x100, 0x100)]);
+        raw[54..56].copy_from_slice(&48u16.to_le_bytes());
+        let head = parse_elf_header(&raw).expect("头有效");
+        let mut out = empty_out();
+        assert_eq!(
+            parse_load_segments(&raw, &head, &mut out),
+            Err(ElfError::BadProgramHeader)
+        );
     }
 }
