@@ -8,6 +8,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "boot"
+path = "src/lib.rs"
+
 [[bin]]
 name = "liftoff"
 path = "src/main.rs"
