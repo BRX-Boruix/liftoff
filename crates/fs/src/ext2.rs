@@ -28,6 +28,8 @@ pub enum Ext2Error {
     BadBlockSize,
     /// inode 号非法（EXT2 的 inode 号从 **1** 起算）。
     BadInodeNumber,
+    /// 文件用到了本实现尚未支持的布局（二级/三级间接块）。
+    UnsupportedLayout,
     /// 目录项的 `rec_len` 非法（为 0 会死循环，越出块尾会越界读）。
     BadRecLen,
     /// 目录项的 `name_len` 超出其记录范围。
@@ -225,6 +227,72 @@ pub fn parse_inode(table: &[u8], index: u32, inode_size: u16) -> Result<Inode, E
         size: read_u32(raw, 4).ok_or(Ext2Error::ShortImage)?,
         blocks,
     })
+}
+
+/// 按 inode 读取文件内容，返回实际读到的字节数。
+///
+/// 语义：`i_block[0..12]` 是直接块；`i_block[12]` 是一级间接（指向一个 u32 块号数组）。
+/// **块号 0 表示空洞，按规范零填充**（不是错误）。只读 `i_size` 个字节，最后一页只拷剩余部分。
+///
+/// `scratch` 用于读取间接块本体，**必须至少 `block_size` 字节** —— 间接块可达 64 KiB，
+/// 放在栈上会炸掉引导器，故由调用方提供。
+pub fn read_file<F>(
+    inode: &Inode,
+    block_size: u32,
+    scratch: &mut [u8],
+    out: &mut [u8],
+    mut read_block: F,
+) -> Result<usize, Ext2Error>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<(), Ext2Error>,
+{
+    if block_size == 0 {
+        return Err(Ext2Error::BadBlockSize);
+    }
+    let block = block_size as usize;
+    if scratch.len() < block {
+        return Err(Ext2Error::BufferTooSmall);
+    }
+    let size = inode.size as usize;
+    if out.len() < size {
+        return Err(Ext2Error::BufferTooSmall);
+    }
+    let per_indirect = block / 4;
+    let mut written = 0usize;
+    let mut index = 0usize;
+    while written < size {
+        // 定位数据块号：前 12 块直接，之后走一级间接。
+        let number = if index < 12 {
+            inode.blocks[index]
+        } else {
+            let slot = index - 12;
+            if slot >= per_indirect {
+                return Err(Ext2Error::UnsupportedLayout);
+            }
+            let indirect_number = inode.blocks[12];
+            if indirect_number == 0 {
+                0
+            } else {
+                read_block(indirect_number, scratch)?;
+                read_u32(scratch, slot * 4).ok_or(Ext2Error::ShortImage)?
+            }
+        };
+        let remaining = size - written;
+        let take = remaining.min(block);
+        let target = out.get_mut(written..written + take).ok_or(Ext2Error::BufferTooSmall)?;
+        if number == 0 {
+            for byte in target.iter_mut() {
+                *byte = 0;
+            }
+        } else {
+            read_block(number, scratch)?;
+            let source = scratch.get(..take).ok_or(Ext2Error::ShortImage)?;
+            target.copy_from_slice(source);
+        }
+        written += take;
+        index += 1;
+    }
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -494,5 +562,122 @@ mod lookup_tests {
         let mut block = dir_block(&[(2, ".", 2)]);
         block[4..6].copy_from_slice(&0u16.to_le_bytes());
         assert_eq!(find_in_dir(&block, b"."), Err(Ext2Error::BadRecLen));
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::{Ext2Error, Inode, read_file};
+    use std::vec::Vec;
+
+    const BLOCK: u32 = 1024;
+
+    /// 假块设备：块号 -> 数据。
+    struct Fake {
+        blocks: Vec<Vec<u8>>,
+    }
+
+    impl Fake {
+        fn new(count: usize) -> Self {
+            Self { blocks: std::vec![std::vec![0u8; BLOCK as usize]; count] }
+        }
+
+        fn fill(&mut self, number: u32, byte: u8) {
+            self.blocks[number as usize] = std::vec![byte; BLOCK as usize];
+        }
+
+        fn read(&mut self, number: u32, out: &mut [u8]) -> Result<(), Ext2Error> {
+            let block = self.blocks.get(number as usize).ok_or(Ext2Error::ShortImage)?;
+            let take = out.len().min(block.len());
+            out[..take].copy_from_slice(&block[..take]);
+            Ok(())
+        }
+    }
+
+    fn inode_with(size: u32, direct: &[u32], indirect: u32) -> Inode {
+        let mut blocks = [0u32; 15];
+        for (slot, number) in direct.iter().enumerate() {
+            blocks[slot] = *number;
+        }
+        blocks[12] = indirect;
+        Inode { mode: 0x81A4, size, blocks }
+    }
+
+    #[test]
+    fn two_direct_blocks_are_read_in_order() {
+        let mut fake = Fake::new(8);
+        fake.fill(5, 0xAA);
+        fake.fill(6, 0xBB);
+        let inode = inode_with(2 * BLOCK, &[5, 6], 0);
+        let mut out = std::vec![0u8; 2 * BLOCK as usize];
+        let mut device = fake;
+        let mut scratch = std::vec![0u8; BLOCK as usize];
+        let read = read_file(&inode, BLOCK, &mut scratch, &mut out, |number, buffer| device.read(number, buffer)).expect("读取成功");
+        assert_eq!(read, 2 * BLOCK as usize);
+        assert_eq!(out[0], 0xAA);
+        assert_eq!(out[BLOCK as usize], 0xBB);
+    }
+
+    #[test]
+    fn the_thirteenth_block_comes_from_the_indirect_block() {
+        // blocks[0..12] 是直接块；第 13 块（索引 12）由 blocks[12] 指向的 u32 数组给出。
+        let mut fake = Fake::new(32);
+        for slot in 0..12u32 {
+            fake.fill(slot + 1, 0x11);
+        }
+        // 间接块本体放在块号 20，其中第一项指向块号 21。
+        fake.blocks[20] = std::vec![0u8; BLOCK as usize];
+        fake.blocks[20][0..4].copy_from_slice(&21u32.to_le_bytes());
+        fake.fill(21, 0x22);
+        let direct: Vec<u32> = (1..=12).collect();
+        let inode = inode_with(13 * BLOCK, &direct, 20);
+        let mut out = std::vec![0u8; 13 * BLOCK as usize];
+        let mut device = fake;
+        let mut scratch = std::vec![0u8; BLOCK as usize];
+        let read = read_file(&inode, BLOCK, &mut scratch, &mut out, |number, buffer| device.read(number, buffer)).expect("读取成功");
+        assert_eq!(read, 13 * BLOCK as usize);
+        assert_eq!(out[0], 0x11);
+        assert_eq!(out[12 * BLOCK as usize], 0x22, "第 13 块应来自一级间接");
+    }
+
+    #[test]
+    fn the_last_partial_block_reads_only_the_remaining_bytes() {
+        let mut fake = Fake::new(8);
+        fake.fill(5, 0xAA);
+        fake.fill(6, 0xBB);
+        let inode = inode_with(BLOCK + 10, &[5, 6], 0);
+        let mut out = std::vec![0u8; BLOCK as usize + 10];
+        let mut device = fake;
+        let mut scratch = std::vec![0u8; BLOCK as usize];
+        let read = read_file(&inode, BLOCK, &mut scratch, &mut out, |number, buffer| device.read(number, buffer)).expect("读取成功");
+        assert_eq!(read, BLOCK as usize + 10, "只读 i_size 个字节，不读整块");
+        assert_eq!(out[BLOCK as usize + 9], 0xBB);
+    }
+
+    #[test]
+    fn a_zero_block_number_is_a_hole_and_reads_as_zeros() {
+        // 规范语义：块号 0 是空洞，按零填充（不是错误）。
+        let mut fake = Fake::new(8);
+        fake.fill(5, 0xAA);
+        let inode = inode_with(2 * BLOCK, &[5, 0], 0);
+        let mut out = std::vec![0xFFu8; 2 * BLOCK as usize];
+        let mut device = fake;
+        let mut scratch = std::vec![0u8; BLOCK as usize];
+        let read = read_file(&inode, BLOCK, &mut scratch, &mut out, |number, buffer| device.read(number, buffer)).expect("读取成功");
+        assert_eq!(read, 2 * BLOCK as usize);
+        assert_eq!(out[0], 0xAA);
+        assert_eq!(out[BLOCK as usize], 0x00, "空洞必须零填充");
+    }
+
+    #[test]
+    fn a_too_small_output_buffer_is_reported() {
+        let fake = Fake::new(8);
+        let inode = inode_with(2 * BLOCK, &[5, 6], 0);
+        let mut out = std::vec![0u8; 10];
+        let mut device = fake;
+        assert_eq!(
+            read_file(&inode, BLOCK, &mut std::vec![0u8; BLOCK as usize], &mut out, |number, buffer| device.read(number, buffer)),
+            Err(Ext2Error::BufferTooSmall)
+        );
     }
 }
