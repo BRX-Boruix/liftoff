@@ -9,4 +9,5 @@
 extern crate std;
 
 pub mod frame_allocator;
+pub mod plan;
 pub mod usable;
