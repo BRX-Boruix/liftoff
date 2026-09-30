@@ -7,6 +7,8 @@
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
+use mm::plan::Mapping;
+use mm::takeover::{MustStay, TakeoverError};
 use firmware::error::Error;
 use firmware_current::current::{
     ExitBootServices, Handle, SystemTable, UefiBootServices, UefiMemoryMapSource, boot_services_of,
@@ -385,6 +387,99 @@ unsafe extern "efiapi" fn counting_exit_fail(_image: Handle, _map_key: usize) ->
             EXIT_CALLS_FAIL.load(Ordering::SeqCst),
             0,
             "加载失败绝不能退出引导服务"
+        );
+    }
+}
+
+/// 进入内核前的检查失败原因。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntryError {
+    /// 入口地址为 0（不可跳转）。
+    NoEntry,
+    /// 某个必须保持映射的地址未被规划覆盖。
+    NotCovered {
+        /// 未被覆盖的地址。
+        address: u64,
+    },
+    /// 调用方给的「必须保持映射」区间长度为 0（调用方错误）。
+    EmptySpan,
+}
+
+/// 进入内核前的**前置检查**（纯，宿主可测）：入口非零，且必须保持映射的区间都被规划覆盖。
+///
+/// 返回入口地址；任一项不满足即报错 —— **绝不带着未覆盖的代码或栈跳转**。
+/// 错误**保留未被覆盖的具体地址**（不做有损扁平化），便于定位。
+pub fn check_before_entry(
+    entry: u64,
+    plan: &[Mapping],
+    must_stay: &[MustStay],
+) -> Result<u64, EntryError> {
+    if entry == 0 {
+        return Err(EntryError::NoEntry);
+    }
+    match mm::takeover::check_coverage(plan, must_stay) {
+        Ok(()) => Ok(entry),
+        Err(TakeoverError::Uncovered { address }) => Err(EntryError::NotCovered { address }),
+        Err(TakeoverError::EmptyRange) => Err(EntryError::EmptySpan),
+    }
+}
+
+#[cfg(test)]
+mod before_entry_tests {
+    use super::{EntryError, check_before_entry};
+    use mm::plan::Mapping;
+    use mm::takeover::MustStay;
+    use arch::addr::{PhysAddr, VirtAddr};
+    use arch::paging::PageFlags;
+
+    const LARGE: u64 = 2 * 1024 * 1024;
+
+    fn mapping(virt: u64, len: u64) -> Mapping {
+        Mapping {
+            virt: VirtAddr::new(virt),
+            phys: PhysAddr::new(virt),
+            len,
+            flags: PageFlags::present(),
+        }
+    }
+
+    fn stay(start: u64, len: u64) -> MustStay {
+        MustStay { start, len }
+    }
+
+    #[test]
+    fn a_covered_entry_is_returned() {
+        let plan = [mapping(0xffff_ffff_8000_0000, LARGE)];
+        let must = [stay(0xffff_ffff_8000_0000, LARGE)];
+        let entry = check_before_entry(0xffff_ffff_8000_0100, &plan, &must).expect("检查通过");
+        assert_eq!(entry, 0xffff_ffff_8000_0100);
+    }
+
+    #[test]
+    fn a_zero_entry_is_rejected() {
+        let plan = [mapping(0xffff_ffff_8000_0000, LARGE)];
+        let must = [stay(0xffff_ffff_8000_0000, LARGE)];
+        assert_eq!(check_before_entry(0, &plan, &must), Err(EntryError::NoEntry));
+    }
+
+    #[test]
+    fn an_uncovered_span_is_rejected_with_its_address() {
+        let plan = [mapping(0xffff_ffff_8000_0000, LARGE)];
+        // 第二段没有被任何映射覆盖。
+        let must = [stay(0xffff_ffff_8000_0000, LARGE), stay(0xffff_ffff_9000_0000, LARGE)];
+        assert_eq!(
+            check_before_entry(0xffff_ffff_8000_0100, &plan, &must),
+            Err(EntryError::NotCovered { address: 0xffff_ffff_9000_0000 })
+            , "必须报出未被覆盖的地址"
+        );
+    }
+
+    #[test]
+    fn an_empty_plan_cannot_cover_a_non_empty_span() {
+        let must = [stay(0xffff_ffff_8000_0000, LARGE)];
+        assert_eq!(
+            check_before_entry(0xffff_ffff_8000_0100, &[], &must),
+            Err(EntryError::NotCovered { address: 0xffff_ffff_8000_0000 })
         );
     }
 }
