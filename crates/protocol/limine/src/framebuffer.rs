@@ -1,8 +1,7 @@
 //! Limine 帧缓冲协议（请求/响应对）。
 //!
 //! 已对照 brxLimine/limine-protocol/include/limine.h 核实（2026-09-30）。
-//! 每个帧缓冲的结构体 limine_framebuffer 暂不声明：其头部字段尚未核实，
-//! 故 framebuffers 保持为不透明的双重指针。
+//! 帧缓冲结构体 limine_framebuffer 的头部字段已核实（2026-09-30），故已声明。
 
 use crate::base::COMMON_MAGIC;
 
@@ -17,6 +16,49 @@ pub const FRAMEBUFFER_REQUEST_ID: [u64; 4] = [
 /// `LIMINE_FRAMEBUFFER_RGB` (memory model).
 pub const FRAMEBUFFER_RGB: u64 = 1;
 
+/// `struct limine_framebuffer`.
+///
+/// 头部字段逐一对照 limine.h 核实（2026-09-30）：address/width/height/pitch/bpp/
+/// memory_model/各通道掩码尺寸与位移/unused[7]/edid_size/edid/mode_count/modes。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Framebuffer {
+    /// 线性帧缓冲的虚拟地址（引导器映射后可直接写）。
+    pub address: *mut core::ffi::c_void,
+    /// 宽度（像素）。
+    pub width: u64,
+    /// 高度（像素）。
+    pub height: u64,
+    /// 每行字节数。
+    pub pitch: u64,
+    /// 每像素位数。
+    pub bpp: u16,
+    /// 内存模型（1 = RGB）。
+    pub memory_model: u8,
+    /// 红色通道掩码位数。
+    pub red_mask_size: u8,
+    /// 红色通道位移。
+    pub red_mask_shift: u8,
+    /// 绿色通道掩码位数。
+    pub green_mask_size: u8,
+    /// 绿色通道位移。
+    pub green_mask_shift: u8,
+    /// 蓝色通道掩码位数。
+    pub blue_mask_size: u8,
+    /// 蓝色通道位移。
+    pub blue_mask_shift: u8,
+    /// 保留（对齐用）。
+    pub unused: [u8; 7],
+    /// EDID 大小。
+    pub edid_size: u64,
+    /// EDID 指针。
+    pub edid: *mut core::ffi::c_void,
+    /// 视频模式数量（响应修订 1 起）。
+    pub mode_count: u64,
+    /// 视频模式数组（双重指针）。
+    pub modes: *mut *mut core::ffi::c_void,
+}
+
 /// `struct limine_framebuffer_response`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -26,7 +68,7 @@ pub struct FramebufferResponse {
     /// Number of framebuffers.
     pub framebuffer_count: u64,
     /// Pointer to an array of framebuffer pointers.
-    pub framebuffers: *mut *mut core::ffi::c_void,
+    pub framebuffers: *mut *mut Framebuffer,
 }
 
 /// `struct limine_framebuffer_request`.
@@ -43,9 +85,7 @@ pub struct FramebufferRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FRAMEBUFFER_REQUEST_ID, FRAMEBUFFER_RGB, FramebufferRequest, FramebufferResponse,
-    };
+    use super::{FRAMEBUFFER_REQUEST_ID, FRAMEBUFFER_RGB, Framebuffer, FramebufferRequest, FramebufferResponse};
     use core::mem::{offset_of, size_of};
 
     #[test]
@@ -56,6 +96,27 @@ mod tests {
         assert_eq!(offset_of!(FramebufferResponse, framebuffers), 16);
     }
 
+    #[test]
+    fn framebuffer_layout_matches_the_header() {
+        assert_eq!(size_of::<Framebuffer>(), 80);
+        assert_eq!(offset_of!(Framebuffer, address), 0);
+        assert_eq!(offset_of!(Framebuffer, width), 8);
+        assert_eq!(offset_of!(Framebuffer, height), 16);
+        assert_eq!(offset_of!(Framebuffer, pitch), 24);
+        assert_eq!(offset_of!(Framebuffer, bpp), 32);
+        assert_eq!(offset_of!(Framebuffer, memory_model), 34);
+        assert_eq!(offset_of!(Framebuffer, red_mask_size), 35);
+        assert_eq!(offset_of!(Framebuffer, red_mask_shift), 36);
+        assert_eq!(offset_of!(Framebuffer, green_mask_size), 37);
+        assert_eq!(offset_of!(Framebuffer, green_mask_shift), 38);
+        assert_eq!(offset_of!(Framebuffer, blue_mask_size), 39);
+        assert_eq!(offset_of!(Framebuffer, blue_mask_shift), 40);
+        assert_eq!(offset_of!(Framebuffer, unused), 41);
+        assert_eq!(offset_of!(Framebuffer, edid_size), 48);
+        assert_eq!(offset_of!(Framebuffer, edid), 56);
+        assert_eq!(offset_of!(Framebuffer, mode_count), 64);
+        assert_eq!(offset_of!(Framebuffer, modes), 72);
+    }
     #[test]
     fn request_layout_matches_the_header() {
         assert_eq!(size_of::<FramebufferRequest>(), 48);
