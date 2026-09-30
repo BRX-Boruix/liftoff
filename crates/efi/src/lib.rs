@@ -50,3 +50,5 @@ pub mod uefi_block_devices;
 pub mod file_open;
 
 pub mod file_io;
+
+pub mod volume;
