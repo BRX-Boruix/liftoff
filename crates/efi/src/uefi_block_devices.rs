@@ -2,6 +2,7 @@
 //!
 //! 边界：设备表由调用方提供（发现阶段用 `discover_block_devices` 填充），**无隐式分配**。
 
+use crate::types::Handle;
 use crate::block_io::{BlockIo, BlockIoMedia, media_to_info};
 use crate::block_source::read_once;
 use firmware::block::{BlockDeviceInfo, BlockDeviceSource, DeviceIndex};
@@ -16,6 +17,24 @@ impl<'a> UefiBlockDevices<'a> {
     /// 以设备表构造。
     pub const fn new(devices: &'a [*mut BlockIo]) -> Self {
         Self { devices }
+    }
+
+    /// 从引导服务表**发现**块设备并构造（方案 B：能力挂在已转出的类型上）。
+    ///
+    /// `handles` 与 `devices` 由调用方提供 —— 引导阶段不该在内核态偷偷分配。
+    /// 发现逻辑复用 [`crate::discover::discover_block_devices`]（其两段式枚举已有独立测试）。
+    /// 收两个固件函数指针（而不是整张表）：调用方从引导服务表取 `locate_handle` 与
+    /// `handle_protocol` 传进来 —— 这样本函数可在宿主上测，无需构造整张表
+    /// （`BootServicesTable` 含函数指针字段，**不允许零初始化**，`zeroed()` 是 UB）。
+    pub fn discover(
+        locate_handle: crate::boot_services_table::LocateHandle,
+        handle_protocol: crate::boot_services_table::HandleProtocol,
+        handles: &'a mut [Handle],
+        devices: &'a mut [*mut BlockIo],
+    ) -> Result<Self, Error> {
+        let count =
+            crate::discover::discover_block_devices(locate_handle, handle_protocol, handles, devices)?;
+        Ok(Self { devices: &devices[..count] })
     }
 
     fn device(&self, index: DeviceIndex) -> Result<*mut BlockIo, Error> {
@@ -140,5 +159,98 @@ mod tests {
         assert_eq!(SEEN_BYTES.load(Ordering::SeqCst), 1024, "必须传字节数");
         assert_eq!(buffer[0], 0x5A);
         assert_eq!(source.read_blocks(DeviceIndex(9), 0, 1, &mut buffer), Err(Error::NotFound));
+    }
+}
+
+#[cfg(test)]
+mod discover_tests {
+    use super::UefiBlockDevices;
+    use crate::block_io::{BlockIo, BlockIoMedia};
+    use crate::discover::SEARCH_TYPE_BY_PROTOCOL;
+    use crate::types::{BUFFER_TOO_SMALL, Handle, Status, SUCCESS};
+    use firmware::block::BlockDeviceSource;
+    use core::ffi::c_void;
+    use core::mem::size_of;
+
+    static MEDIA: BlockIoMedia = BlockIoMedia {
+        media_id: 1,
+        removable_media: 0,
+        media_present: 1,
+        logical_partition: 0,
+        read_only: 0,
+        write_caching: 0,
+        block_size: 512,
+        io_align: 0,
+        last_block: 7,
+        lowest_aligned_lba: 0,
+        logical_blocks_per_physical_block: 1,
+        optimal_transfer_length_granularity: 0,
+    };
+
+    unsafe extern "efiapi" fn unused_read(
+        _this: *mut BlockIo,
+        _media_id: u32,
+        _lba: u64,
+        _size: usize,
+        _buffer: *mut c_void,
+    ) -> Status {
+        SUCCESS
+    }
+
+    static mut IO: BlockIo = BlockIo {
+        revision: 1,
+        media: core::ptr::null_mut(),
+        reset: core::ptr::null_mut(),
+        read_blocks: unused_read,
+        write_blocks: core::ptr::null_mut(),
+        flush_blocks: core::ptr::null_mut(),
+    };
+
+    unsafe extern "efiapi" fn fake_locate(
+        search_type: u32,
+        _protocol: *const c_void,
+        _key: *mut c_void,
+        size: *mut usize,
+        buffer: *mut Handle,
+    ) -> Status {
+        assert_eq!(search_type, SEARCH_TYPE_BY_PROTOCOL);
+        let unit = size_of::<Handle>();
+        // SAFETY: 调用方按 UEFI 契约传入有效指针；测试中始终如此。
+        unsafe {
+            if buffer.is_null() {
+                *size = unit;
+                BUFFER_TOO_SMALL
+            } else {
+                *size = unit;
+                *buffer = 0x10usize as Handle;
+                SUCCESS
+            }
+        }
+    }
+
+    unsafe extern "efiapi" fn fake_handle_protocol(
+        _handle: Handle,
+        _protocol: *const c_void,
+        interface: *mut *mut c_void,
+    ) -> Status {
+        // SAFETY: 同上；只写入调用方给的 `interface`。
+        unsafe {
+            let _ = MEDIA;
+            *interface = core::ptr::addr_of_mut!(IO) as *mut c_void;
+        }
+        SUCCESS
+    }
+
+    #[test]
+    fn discovery_through_the_firmware_pointers_finds_one_device() {
+        // 固件契约要求 `Media` 非空（`block_io_from_interface` 会校验），夹具必须满足。
+        // SAFETY: 测试内单线程初始化静态夹具。
+        unsafe { IO.media = core::ptr::addr_of!(MEDIA) as *mut BlockIoMedia };
+        let mut handles = [0usize as Handle; 4];
+        let mut devices = [core::ptr::null_mut::<BlockIo>(); 4];
+        let source =
+            UefiBlockDevices::discover(fake_locate, fake_handle_protocol, &mut handles, &mut devices)
+                .expect("发现应成功");
+        assert_eq!(source.device_count(), 1, "假固件只暴露一个 BlockIo");
     }
 }
