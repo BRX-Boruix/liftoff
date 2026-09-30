@@ -36,3 +36,5 @@ pub mod block_read;
 pub mod block_source;
 
 pub mod enumerate;
+
+pub mod guid;
