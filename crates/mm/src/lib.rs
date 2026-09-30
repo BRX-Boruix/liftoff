@@ -11,4 +11,5 @@ extern crate std;
 pub mod apply;
 pub mod frame_allocator;
 pub mod plan;
+pub mod takeover;
 pub mod usable;
