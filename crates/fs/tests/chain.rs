@@ -73,3 +73,58 @@ fn the_real_ext2_image_is_reachable_through_the_block_abstraction() {
     assert_eq!(superblock.inode_size, 128);
     assert_eq!(superblock.blocks_count, 256);
 }
+
+/// 把链路再推进一步：经真实镜像**列出根目录**。
+///
+/// **如实说明**：夹具镜像由 `mke2fs` 生成时**未能填充文件**（该环境的 `-d` 不可用），
+/// 故根目录里只应有 `mke2fs` 必然创建的 `lost+found`。本测试**只断言这一点**，
+/// **不声称**读到普通文件。
+#[test]
+fn the_root_directory_of_the_real_image_is_listed() {
+    use fs::ext2::{
+        DirEntry, group_descriptor_block, parse_dir_entries, parse_group_descriptor, parse_inode,
+    };
+
+    let bytes = std::fs::read("tests/fixtures/hello.ext2").expect("夹具镜像应存在");
+    let sectors = (bytes.len() / SECTOR as usize) as u64;
+    let mut disk = Disk { bytes };
+    let volume = Volume::new(DeviceIndex(0), 0, sectors, SECTOR).expect("卷合法");
+
+    // 1) 超级块：必须从块 0 读（切片起点即文件系统起点）。
+    let mut head = std::vec![0u8; 2048];
+    volume.read(&mut disk, 0, 4, &mut head).expect("读超级块");
+    let superblock = parse_superblock(&head).expect("超级块可解析");
+    let block_size = superblock.block_size;
+    assert_eq!(block_size, 1024);
+    let sectors_per_block = (block_size / SECTOR) as u64;
+    let block_bytes = block_size as usize;
+
+    // 2) 块组描述符表 → inode 表位置。
+    let gd_block = group_descriptor_block(block_size).expect("描述符表块号");
+    let mut gd = std::vec![0u8; block_bytes];
+    volume
+        .read(&mut disk, gd_block * sectors_per_block, sectors_per_block as u32, &mut gd)
+        .expect("读描述符表");
+    let group = parse_group_descriptor(&gd, 0).expect("解析描述符");
+
+    // 3) inode 表 → 根目录 inode（EXT2 里根目录固定是 inode 2）。
+    let mut table = std::vec![0u8; block_bytes];
+    volume
+        .read(&mut disk, group.inode_table as u64 * sectors_per_block, sectors_per_block as u32, &mut table)
+        .expect("读 inode 表");
+    let root = parse_inode(&table, 2, superblock.inode_size).expect("根目录 inode");
+
+    // 4) 根目录数据块 → 目录项。
+    let mut dir = std::vec![0u8; block_bytes];
+    volume
+        .read(&mut disk, root.blocks[0] as u64 * sectors_per_block, sectors_per_block as u32, &mut dir)
+        .expect("读根目录块");
+    let mut entries = [DirEntry::EMPTY; 16];
+    let count = parse_dir_entries(&dir, &mut entries).expect("解析目录");
+    assert!(count >= 2, "至少应有 . 与 ..，实际 {count}");
+    let names: std::vec::Vec<&[u8]> = entries[..count].iter().map(|entry| entry.name()).collect();
+    assert!(
+        names.iter().any(|name| *name == b"lost+found"),
+        "mke2fs 必然创建 lost+found，实际目录项: {names:?}"
+    );
+}
