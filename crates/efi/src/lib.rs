@@ -24,3 +24,5 @@ pub mod memory_map;
 pub mod status;
 
 pub mod memory_map_source;
+
+pub mod uefi_memory_source;
