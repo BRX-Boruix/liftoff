@@ -5,7 +5,7 @@
 
 use arch::addr::{Alignment, PhysAddr, PhysFrame, VirtAddr};
 use arch::hhdm::DirectMap;
-use arch::paging::{MapError, PageFlags, PageTable, pages_for, validate_range};
+use arch::paging::{FrameAllocator, MapError, PageFlags, PageTable, pages_for, validate_range};
 
 /// 2 MiB 大页大小（本实现唯一的页粒度）。
 pub const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
@@ -27,11 +27,6 @@ const LARGE_ADDR_MASK: u64 = 0x000F_FFFF_FFE0_0000;
 /// 每级页表项数。
 const ENTRIES_PER_TABLE: u64 = 512;
 
-/// 页帧来源。由调用方注入（引导阶段来自固件的页分配；宿主测试来自内存缓冲）。
-pub trait FrameAllocator {
-    /// 取一个已零化的物理页帧；耗尽返回 `None`。
-    fn allocate_zeroed(&mut self) -> Option<PhysFrame>;
-}
 
 /// x86_64 页表（4 级 + 2 MiB 大页）。
 pub struct X86PageTable<A> {

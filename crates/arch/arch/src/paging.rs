@@ -3,7 +3,7 @@
 //! 抽象边界（ADR-007）：调用方只声明区间与权限，页表层数与页大小由实现决定，
 //! 因此本模块不出现 PML4/PD 之类的架构名词。
 
-use crate::addr::{Alignment, PhysAddr, VirtAddr};
+use crate::addr::{Alignment, PhysAddr, PhysFrame, VirtAddr};
 
 /// 页表项权限（语义位，单点定义；实现负责映射到本架构的位布局）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,6 +145,15 @@ pub fn validate_range(
         return Err(MapError::Overflow);
     }
     Ok(())
+}
+
+/// 页帧来源：架构中立的抽象。
+///
+/// 任何架构都需要“取一帧已零化内存”，故它属于抽象层；
+/// 实现由调用方注入（引导阶段来自固件页分配，宿主测试来自内存缓冲）。
+pub trait FrameAllocator {
+    /// 取一个已零化的物理页帧；耗尽返回 `None`。
+    fn allocate_zeroed(&mut self) -> Option<PhysFrame>;
 }
 
 /// 页表：调用方按区间声明映射，页表层数与页大小由实现决定。
