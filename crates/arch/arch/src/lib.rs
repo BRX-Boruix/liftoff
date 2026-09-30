@@ -7,3 +7,4 @@ extern crate std;
 
 pub mod addr;
 pub mod paging;
+pub mod hhdm;
