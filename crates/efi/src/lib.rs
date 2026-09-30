@@ -34,3 +34,5 @@ pub mod handles;
 pub mod block_read;
 
 pub mod block_source;
+
+pub mod enumerate;
