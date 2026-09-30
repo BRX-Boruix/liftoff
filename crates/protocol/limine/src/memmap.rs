@@ -13,34 +13,34 @@ pub const MEMMAP_REQUEST_ID: [u64; 4] = [
     0xe304acdfc50c3c62,
 ];
 
-/// Usable memory.
+/// 可用内存。
 pub const USABLE: u64 = 0;
-/// Reserved memory.
+/// 保留内存。
 pub const RESERVED: u64 = 1;
-/// ACPI reclaimable memory.
+/// ACPI 可回收内存。
 pub const ACPI_RECLAIMABLE: u64 = 2;
-/// ACPI NVS memory.
+/// ACPI NVS 内存。
 pub const ACPI_NVS: u64 = 3;
-/// Bad memory.
+/// 坏内存。
 pub const BAD_MEMORY: u64 = 4;
-/// Memory reclaimable after boot services exit.
+/// 退出引导服务后可回收的内存。
 pub const BOOTLOADER_RECLAIMABLE: u64 = 5;
-/// Memory occupied by the executable and modules.
+/// 可执行文件与模块占用的内存。
 pub const EXECUTABLE_AND_MODULES: u64 = 6;
-/// Framebuffer memory.
+/// 帧缓冲内存。
 pub const FRAMEBUFFER: u64 = 7;
-/// Reserved memory that is mapped.
+/// 已建立映射的保留内存。
 pub const RESERVED_MAPPED: u64 = 8;
 
 /// `struct limine_memmap_entry`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MemmapEntry {
-    /// Base address.
+    /// 基地址。
     pub base: u64,
-    /// Length in bytes.
+    /// 长度（字节）。
     pub length: u64,
-    /// Type (one of the `LIMINE_MEMMAP_*` values).
+    /// 类型（取值之一见 `LIMINE_MEMMAP_*`）。
     pub kind: u64,
 }
 
@@ -48,11 +48,11 @@ pub struct MemmapEntry {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MemmapResponse {
-    /// Response revision.
+    /// 响应修订。
     pub revision: u64,
-    /// Number of entries.
+    /// 条目数量。
     pub entry_count: u64,
-    /// Pointer to an array of entry pointers.
+    /// 指向“条目指针数组”的指针。
     pub entries: *mut *mut MemmapEntry,
 }
 
@@ -60,11 +60,11 @@ pub struct MemmapResponse {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MemmapRequest {
-    /// Request identifier.
+    /// 请求标识。
     pub id: [u64; 4],
-    /// Request revision.
+    /// 请求修订。
     pub revision: u64,
-    /// Response pointer (filled by the bootloader).
+    /// 响应指针（由引导器填充）。
     pub response: *mut MemmapResponse,
 }
 

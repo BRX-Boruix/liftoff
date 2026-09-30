@@ -63,11 +63,11 @@ pub struct Framebuffer {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FramebufferResponse {
-    /// Response revision.
+    /// 响应修订。
     pub revision: u64,
-    /// Number of framebuffers.
+    /// 帧缓冲数量。
     pub framebuffer_count: u64,
-    /// Pointer to an array of framebuffer pointers.
+    /// 指向“帧缓冲指针数组”的指针。
     pub framebuffers: *mut *mut Framebuffer,
 }
 
@@ -75,11 +75,11 @@ pub struct FramebufferResponse {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FramebufferRequest {
-    /// Request identifier.
+    /// 请求标识。
     pub id: [u64; 4],
-    /// Request revision.
+    /// 请求修订。
     pub revision: u64,
-    /// Response pointer (filled by the bootloader).
+    /// 响应指针（由引导器填充）。
     pub response: *mut FramebufferResponse,
 }
 

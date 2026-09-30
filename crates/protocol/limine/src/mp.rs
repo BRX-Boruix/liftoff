@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn response_layout_matches_the_x86_64_variant() {
-        // flags and bsp_lapic_id are 32-bit here (unlike the loongarch64 variant).
+        // 这里 flags 与 bsp_lapic_id 是 32 位（与 loongarch64 变体不同）。
         assert_eq!(size_of::<MpResponse>(), 32);
         assert_eq!(offset_of!(MpResponse, revision), 0);
         assert_eq!(offset_of!(MpResponse, flags), 8);

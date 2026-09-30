@@ -5,14 +5,14 @@
 /// `LIMINE_COMMON_MAGIC` (the first two words of every request id).
 pub const COMMON_MAGIC: [u64; 2] = [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b];
 
-/// `LIMINE_BASE_REVISION(N)` magic words.
+/// `LIMINE_BASE_REVISION(N)` 的魔数。
 pub const BASE_REVISION_MAGIC: [u64; 2] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc];
 
-/// The base revision this bootloader implements.
+/// 本引导器实现的基础修订。
 pub const BASE_REVISION: u64 = 0;
 
-/// `LIMINE_BASE_REVISION_SUPPORTED(VAR)`: the kernel's declared revision array is
-/// supported when its third element is zero.
+/// `LIMINE_BASE_REVISION_SUPPORTED(VAR)`：内核声明的基础修订数组，
+/// 当第三个元素为零时视为受支持。
 pub const fn base_revision_supported(declared: [u64; 3]) -> bool {
     declared[2] == 0
 }
@@ -29,9 +29,9 @@ pub const HHDM_REQUEST_ID: [u64; 4] = [
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct HhdmResponse {
-    /// Response revision.
+    /// 响应修订。
     pub revision: u64,
-    /// Higher-half direct map offset.
+    /// 高半区直接映射（HHDM）偏移。
     pub offset: u64,
 }
 
@@ -39,11 +39,11 @@ pub struct HhdmResponse {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct HhdmRequest {
-    /// Request identifier.
+    /// 请求标识。
     pub id: [u64; 4],
-    /// Request revision.
+    /// 请求修订。
     pub revision: u64,
-    /// Response pointer (filled by the bootloader).
+    /// 响应指针（由引导器填充）。
     pub response: *mut HhdmResponse,
 }
 
