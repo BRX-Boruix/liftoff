@@ -769,10 +769,17 @@ fn m2c(bs: &efi::BootServices) {
             m4_fail("ext2 kernel pages", st);
         }
         let blob = unsafe { core::slice::from_raw_parts_mut(blob_base as *mut u8, size as usize) };
+        // 读取进度可观测：EXT2 按 1KiB 块逐块读（每块一次 BlockIo），release 内核
+        // 约 24MB → 数万次调用，TCG 下要数分钟。此前这一段一行不打印，看起来像卡死。
+        serial::write(format_args!(
+            "[m9] reading kernel path={} size={} (1KiB blocks, this takes a while under TCG)\n",
+            path, size
+        ));
         let n = match vol.read_file(&mut dev, &f, blob) {
             Ok(n) => n,
             Err(s) => fatal("ext read", s),
         };
+        serial::write(format_args!("[m9] read done n={}\n", n));
         let mut sum: u32 = 0;
         for &b in blob.iter() {
             sum = sum.wrapping_add(b as u32);
