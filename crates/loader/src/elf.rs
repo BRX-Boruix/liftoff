@@ -205,6 +205,54 @@ pub fn parse_load_segments(
     Ok(count)
 }
 
+/// 清零 BSS 时的分块大小（**固定小缓冲**，避免在栈上开 `p_memsz` 那么大的缓冲）。
+const ZERO_CHUNK: usize = 512;
+
+/// 把 `PT_LOAD` 段装载到目标地址：先写 `p_filesz` 字节，再把 BSS 尾部清零。
+///
+/// 返回装载总量（各段 `p_memsz` 之和）。写入器由调用方注入 —— `loader` 不依赖具体内存实现。
+/// 任一写入失败**立即上抛**（半装载的映像不可用）；零长度段不产生任何写入。
+pub fn load_segments<W>(
+    image: &[u8],
+    segments: &[ProgramHeader],
+    mut write: W,
+) -> Result<usize, ElfError>
+where
+    W: FnMut(u64, &[u8]) -> Result<(), ElfError>,
+{
+    let zeros = [0u8; ZERO_CHUNK];
+    let mut total = 0usize;
+    for segment in segments {
+        let file_end = segment
+            .p_offset
+            .checked_add(segment.p_filesz)
+            .ok_or(ElfError::SegmentOutOfBounds)?;
+        if file_end > image.len() as u64 {
+            return Err(ElfError::SegmentOutOfBounds);
+        }
+        let start = usize::try_from(segment.p_offset).map_err(|_| ElfError::SegmentOutOfBounds)?;
+        let len = usize::try_from(segment.p_filesz).map_err(|_| ElfError::SegmentOutOfBounds)?;
+        let bytes = image.get(start..start + len).ok_or(ElfError::SegmentOutOfBounds)?;
+        if !bytes.is_empty() {
+            write(segment.p_vaddr, bytes)?;
+        }
+        // `p_filesz <= p_memsz` 已由 `parse_load_segments` 保证，故这里不会下溢。
+        let mut remaining = segment.p_memsz - segment.p_filesz;
+        let mut at = segment
+            .p_vaddr
+            .checked_add(segment.p_filesz)
+            .ok_or(ElfError::SegmentOutOfBounds)?;
+        while remaining > 0 {
+            let take = remaining.min(ZERO_CHUNK as u64) as usize;
+            write(at, &zeros[..take])?;
+            at = at.checked_add(take as u64).ok_or(ElfError::SegmentOutOfBounds)?;
+            remaining -= take as u64;
+        }
+        total += usize::try_from(segment.p_memsz).map_err(|_| ElfError::SegmentOutOfBounds)?;
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -404,6 +452,106 @@ mod phdr_tests {
         assert_eq!(
             parse_load_segments(&raw, &head, &mut out),
             Err(ElfError::BadProgramHeader)
+        );
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::{ElfError, ProgramHeader, load_segments};
+    use std::vec::Vec;
+
+    /// 记录写入的写入器。
+    struct Recorder {
+        writes: Vec<(u64, usize, u8)>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self { writes: Vec::new() }
+        }
+
+        fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), ElfError> {
+            let value = bytes.first().copied().unwrap_or(0);
+            self.writes.push((address, bytes.len(), value));
+            Ok(())
+        }
+
+        fn total(&self) -> usize {
+            self.writes.iter().map(|(_, len, _)| *len).sum()
+        }
+    }
+
+    fn segment(offset: u64, vaddr: u64, filesz: u64, memsz: u64) -> ProgramHeader {
+        ProgramHeader {
+            p_type: 1,
+            p_flags: 5,
+            p_offset: offset,
+            p_vaddr: vaddr,
+            p_filesz: filesz,
+            p_memsz: memsz,
+        }
+    }
+
+    #[test]
+    fn file_bytes_are_written_at_the_target_address() {
+        // 映像留足余量：64 字节头之后放 0x200 字节的段内容。
+        let mut image = std::vec![0u8; 0x400];
+        for (index, byte) in image.iter_mut().enumerate().skip(0x100).take(0x100) {
+            *byte = (index & 0xFF) as u8;
+        }
+        let segments = [segment(0x100, 0xffff_ffff_8000_0000, 0x100, 0x100)];
+        let mut recorder = Recorder::new();
+        let written = load_segments(&image, &segments, |address, bytes| recorder.write(address, bytes)).expect("装载成功");
+        assert_eq!(written, 0x100);
+        assert_eq!(recorder.writes[0].0, 0xffff_ffff_8000_0000);
+        assert_eq!(recorder.total(), 0x100);
+    }
+
+    #[test]
+    fn the_bss_tail_is_zero_filled() {
+        let image = std::vec![0xAAu8; 0x400];
+        // filesz = 0x100，memsz = 0x300 → 额外 0x200 字节必须清零。
+        let segments = [segment(0x100, 0x1000, 0x100, 0x300)];
+        let mut recorder = Recorder::new();
+        let written = load_segments(&image, &segments, |address, bytes| recorder.write(address, bytes)).expect("装载成功");
+        assert_eq!(written, 0x300, "装载总量应等于 p_memsz");
+        assert_eq!(recorder.total(), 0x300);
+        let zeroed: usize = recorder.writes.iter().filter(|(_, _, value)| *value == 0).map(|(_, len, _)| *len).sum();
+        assert_eq!(zeroed, 0x200, "BSS 尾部必须清零");
+    }
+
+    #[test]
+    fn a_writer_failure_stops_the_load() {
+        let image = std::vec![0u8; 0x400];
+        let segments = [segment(0x100, 0x1000, 0x100, 0x100), segment(0x200, 0x2000, 0x100, 0x100)];
+        let mut calls = 0;
+        let result = load_segments(&image, &segments, |_address, _bytes| {
+            calls += 1;
+            Err(ElfError::SegmentOutOfBounds)
+        });
+        assert_eq!(result, Err(ElfError::SegmentOutOfBounds));
+        assert_eq!(calls, 1, "失败后不得继续装载后续段");
+    }
+
+    #[test]
+    fn an_empty_segment_writes_nothing() {
+        let image = std::vec![0u8; 0x400];
+        let segments = [segment(0, 0x1000, 0, 0)];
+        let mut recorder = Recorder::new();
+        let written = load_segments(&image, &segments, |address, bytes| recorder.write(address, bytes)).expect("装载成功");
+        assert_eq!(written, 0);
+        assert!(recorder.writes.is_empty());
+    }
+
+    #[test]
+    fn a_segment_past_the_image_is_rejected() {
+        let image = std::vec![0u8; 0x100];
+        let segments = [segment(0x100, 0x1000, 0x100, 0x100)];
+        let mut recorder = Recorder::new();
+        assert_eq!(
+            load_segments(&image, &segments, |address, bytes| recorder.write(address, bytes)),
+            Err(ElfError::SegmentOutOfBounds)
         );
     }
 }
