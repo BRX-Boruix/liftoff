@@ -22,3 +22,5 @@ pub mod memory;
 pub mod memory_map;
 
 pub mod status;
+
+pub mod memory_map_source;
