@@ -165,7 +165,8 @@ fn stage_text(stage: BringUpError) -> &'static [u8] {
         BringUpError::Plan(_) => b"[liftoff] stage: plan\n",
         BringUpError::MemoryMapLoad(_) => b"[liftoff] stage: memmap load\n",
         BringUpError::MemoryMapRanges(_) => b"[liftoff] stage: memmap ranges\n",
-        BringUpError::PageTable => b"[liftoff] stage: page table\n",
+        BringUpError::RootFrame => b"[liftoff] stage: root frame\n",
+        BringUpError::DirectMap => b"[liftoff] stage: direct map\n",
         BringUpError::Load(_) => b"[liftoff] stage: load+activate\n",
         BringUpError::Handoff(_) => b"[liftoff] stage: handoff\n",
     }
@@ -1319,8 +1320,10 @@ pub enum BringUpError {
     MemoryMapLoad(Error),
     /// 从内存映射里取可用区间失败。
     MemoryMapRanges(Error),
-    /// 建页表（根帧/HHDM 直接映射）失败。
-    PageTable,
+    /// 取根帧失败。
+    RootFrame,
+    /// 建 HHDM 直接映射失败。
+    DirectMap,
     /// 装载并激活失败。
     Load(KernelPlanError),
     /// 交接编排失败。
@@ -1388,8 +1391,14 @@ pub unsafe fn bring_up(
     .map_err(BringUpError::Plan)?;
     // 6) 页表：根帧 + HHDM 直接映射 + 固件帧来源。
     let mut frames = EfiFrameAllocator::new(table.allocate_pages);
-    let root = frames.allocate_zeroed().ok_or(BringUpError::PageTable)?;
-    let direct = DirectMap::new(HHDM_OFFSET, u64::MAX).ok_or(BringUpError::PageTable)?;
+    let root = frames.allocate_zeroed().ok_or(BringUpError::RootFrame)?;
+    // `top` 是**直接映射覆盖的最高物理地址**（不是 u64::MAX：那会溢出而被拒）。
+    let top = c.usable[..usable_count]
+        .iter()
+        .filter_map(|range| range.end())
+        .max()
+        .ok_or(BringUpError::DirectMap)?;
+    let direct = DirectMap::new(HHDM_OFFSET, top).ok_or(BringUpError::DirectMap)?;
     let mut page_table = X86PageTable::new(root, direct, frames);
     // 7) 拷段到物理目标（真机：直接写物理地址，UEFI 阶段恒等映射有效）。
     let mut write = |phys: u64, bytes: &[u8]| -> Result<(), ElfError> {
