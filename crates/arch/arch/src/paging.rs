@@ -177,9 +177,29 @@ pub trait PageTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{MapError, PageFlags, pages_for, validate_range};
-    use crate::addr::{Alignment, PhysAddr, VirtAddr};
+    use super::{FrameAllocator, MapError, PageFlags, pages_for, validate_range};
+    use crate::addr::{Alignment, PhysAddr, PhysFrame, VirtAddr};
 
+
+    #[test]
+    fn frame_allocator_is_implementable() {
+        struct Fake {
+            next: u64,
+        }
+        impl FrameAllocator for Fake {
+            fn allocate_zeroed(&mut self) -> Option<PhysFrame> {
+                if self.next == 0 {
+                    return None;
+                }
+                let frame = PhysFrame::containing(PhysAddr::new(self.next));
+                self.next = 0;
+                Some(frame)
+            }
+        }
+        let mut fake = Fake { next: 0x1000 };
+        assert!(fake.allocate_zeroed().is_some());
+        assert!(fake.allocate_zeroed().is_none(), "耗尽后必须返回 None");
+    }
 
     #[test]
     fn pages_for_rejects_zero_page_size_and_reports_overflow() {
