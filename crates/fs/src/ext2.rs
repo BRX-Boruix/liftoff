@@ -124,44 +124,71 @@ impl DirEntry {
     }
 }
 
-/// 解析一个目录块里的条目，返回条目数。
+/// 取 `at` 处的下一个目录项，返回条目与**下一个偏移**；`at` 越出块尾返回 `None`。
 ///
+/// 这是目录遍历的**单点定义**（`parse_dir_entries` 与 `find_in_dir` 都用它）。
 /// 数值边界：`rec_len == 0` 会让游标原地不动（**死循环**），故立即报错；
 /// `at + rec_len` 越出块尾同样报错（不越界读）；`name_len` 必须落在 `rec_len - 8` 之内。
-/// `inode == 0` 表示已删除：跳过该条目，但**仍按 `rec_len` 前进**。
+/// `inode == 0` 表示已删除：**返回该条目**，由调用方决定是否跳过（但游标一定前进）。
+pub fn next_dir_entry(block: &[u8], at: usize) -> Result<Option<(DirEntry, usize)>, Ext2Error> {
+    if at.checked_add(8).ok_or(Ext2Error::BadRecLen)? > block.len() {
+        return Ok(None);
+    }
+    let inode = read_u32(block, at).ok_or(Ext2Error::ShortImage)?;
+    let rec_len = read_u16(block, at + 4).ok_or(Ext2Error::ShortImage)? as usize;
+    let name_len = *block.get(at + 6).ok_or(Ext2Error::ShortImage)? as usize;
+    let file_type = *block.get(at + 7).ok_or(Ext2Error::ShortImage)?;
+    if rec_len == 0 {
+        return Err(Ext2Error::BadRecLen);
+    }
+    let end = at.checked_add(rec_len).ok_or(Ext2Error::BadRecLen)?;
+    if end > block.len() {
+        return Err(Ext2Error::BadRecLen);
+    }
+    if name_len > rec_len - 8 {
+        return Err(Ext2Error::BadNameLen);
+    }
+    let mut entry = DirEntry::EMPTY;
+    entry.inode = inode;
+    entry.name_len = name_len as u8;
+    entry.file_type = file_type;
+    entry.name[..name_len].copy_from_slice(&block[at + 8..at + 8 + name_len]);
+    Ok(Some((entry, end)))
+}
+
+/// 解析一个目录块里的条目，返回条目数（跳过已删除项）。
+///
+/// 调用方给的缓冲决定上限：超出即报 `BufferTooSmall`（**不静默截断**）。
 pub fn parse_dir_entries(block: &[u8], out: &mut [DirEntry]) -> Result<usize, Ext2Error> {
     let mut count = 0;
     let mut at = 0usize;
-    while at + 8 <= block.len() {
-        let inode = read_u32(block, at).ok_or(Ext2Error::ShortImage)?;
-        let rec_len = read_u16(block, at + 4).ok_or(Ext2Error::ShortImage)? as usize;
-        let name_len = *block.get(at + 6).ok_or(Ext2Error::ShortImage)? as usize;
-        let file_type = *block.get(at + 7).ok_or(Ext2Error::ShortImage)?;
-        if rec_len == 0 {
-            return Err(Ext2Error::BadRecLen);
-        }
-        let end = at.checked_add(rec_len).ok_or(Ext2Error::BadRecLen)?;
-        if end > block.len() {
-            return Err(Ext2Error::BadRecLen);
-        }
-        if name_len > rec_len - 8 {
-            return Err(Ext2Error::BadNameLen);
-        }
-        if inode != 0 {
+    while let Some((entry, next)) = next_dir_entry(block, at)? {
+        if entry.inode != 0 {
             if count == out.len() {
                 return Err(Ext2Error::BufferTooSmall);
             }
-            let mut entry = DirEntry::EMPTY;
-            entry.inode = inode;
-            entry.name_len = name_len as u8;
-            entry.file_type = file_type;
-            entry.name[..name_len].copy_from_slice(&block[at + 8..at + 8 + name_len]);
             out[count] = entry;
             count += 1;
         }
-        at = end;
+        at = next;
     }
     Ok(count)
+}
+
+/// 在目录块里按名字查找（**大小写敏感**、精确长度匹配）。
+///
+/// **流式**遍历（O(1) 额外内存），因为 `DirEntry` 带 255 字节定长名字，物化整块条目会
+/// 在引导器的栈上炸掉。目录本身损坏的错误照原样向上返回，**不吞成“找不到”**
+/// （否则会把坏盘误判成文件不存在）。已删除项（`inode == 0`）不参与匹配。
+pub fn find_in_dir(block: &[u8], name: &[u8]) -> Result<Option<DirEntry>, Ext2Error> {
+    let mut at = 0usize;
+    while let Some((entry, next)) = next_dir_entry(block, at)? {
+        if entry.inode != 0 && entry.name() == name {
+            return Ok(Some(entry));
+        }
+        at = next;
+    }
+    Ok(None)
 }
 
 /// EXT2 inode 的关键字段。
@@ -412,5 +439,60 @@ mod inode_tests {
         assert_eq!(inode.blocks[12], 111, "一级间接");
         assert_eq!(inode.blocks[13], 222, "二级间接");
         assert_eq!(inode.blocks[14], 333, "三级间接");
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::{Ext2Error, find_in_dir};
+    use std::vec::Vec;
+
+    fn dir_block(items: &[(u32, &str, u8)]) -> Vec<u8> {
+        let mut block = std::vec![0u8; 1024];
+        let mut at = 0usize;
+        for (index, (inode, name, kind)) in items.iter().enumerate() {
+            let need = 8 + name.len();
+            let rec_len = if index + 1 == items.len() { 1024 - at } else { (need + 3) & !3 };
+            block[at..at + 4].copy_from_slice(&inode.to_le_bytes());
+            block[at + 4..at + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+            block[at + 6] = name.len() as u8;
+            block[at + 7] = *kind;
+            block[at + 8..at + 8 + name.len()].copy_from_slice(name.as_bytes());
+            at += rec_len;
+        }
+        block
+    }
+
+    #[test]
+    fn an_exact_name_is_found() {
+        let block = dir_block(&[(2, ".", 2), (2, "..", 2), (11, "HELLO.TXT", 1)]);
+        let found = find_in_dir(&block, b"HELLO.TXT").expect("查找成功");
+        assert_eq!(found.map(|entry| entry.inode), Some(11));
+    }
+
+    #[test]
+    fn the_search_is_case_sensitive() {
+        let block = dir_block(&[(2, ".", 2), (11, "HELLO.TXT", 1)]);
+        assert_eq!(find_in_dir(&block, b"hello.txt").expect("查找成功").map(|e| e.inode), None);
+    }
+
+    #[test]
+    fn a_prefix_does_not_match_a_longer_name() {
+        // "HELLO" 不应匹配 "HELLO.TXT"。
+        let block = dir_block(&[(2, ".", 2), (11, "HELLO.TXT", 1)]);
+        assert_eq!(find_in_dir(&block, b"HELLO").expect("查找成功").map(|e| e.inode), None);
+    }
+
+    #[test]
+    fn a_missing_name_yields_none() {
+        let block = dir_block(&[(2, ".", 2), (2, "..", 2)]);
+        assert_eq!(find_in_dir(&block, b"NOPE").expect("查找成功").map(|e| e.inode), None);
+    }
+
+    #[test]
+    fn a_malformed_directory_is_reported() {
+        let mut block = dir_block(&[(2, ".", 2)]);
+        block[4..6].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(find_in_dir(&block, b"."), Err(Ext2Error::BadRecLen));
     }
 }
