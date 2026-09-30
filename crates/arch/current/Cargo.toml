@@ -11,7 +11,8 @@ workspace = true
 [features]
 default = ["impl-x86_64"]
 impl-x86_64 = ["dep:x86_64"]
-impl-mock = []
+impl-mock = ["dep:arch"]
 
 [dependencies]
 x86_64 = { path = "../x86_64", optional = true }
+arch = { path = "../arch", optional = true }

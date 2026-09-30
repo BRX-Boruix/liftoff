@@ -1,4 +1,7 @@
 //! 架构实现选择器：把具体实现接到抽象上（ADR-050）。
+//!
+//! 目标构建启用 `impl-x86_64`（默认），宿主测试启用 `impl-mock`；两者互斥，
+//! 都未启用时编译失败。
 
 #![no_std]
 
@@ -16,5 +19,76 @@ pub use x86_64 as current;
 
 #[cfg(feature = "impl-mock")]
 pub mod current {
-    //! 宿主测试用的最小实现（随抽象层逐步充实）。
+    //! 宿主测试用实现：不触碰硬件，但状态机行为真实（不是"假数据"）。
+
+    use arch::platform::{InterruptState, Platform};
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// 宿主测试用的中断开关状态。
+    ///
+    /// 并发说明：单测串行访问该原子量；不使用锁，避免测试间互相阻塞。
+    static INTERRUPTS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+    /// 宿主测试用平台。
+    pub struct Mock;
+
+    impl Mock {
+        /// 显式设置中断开关状态（仅宿主测试使用）。
+        pub fn set_interrupts_enabled(enabled: bool) {
+            INTERRUPTS_ENABLED.store(enabled, Ordering::SeqCst);
+        }
+
+        /// 当前中断开关状态（仅宿主测试使用）。
+        pub fn interrupts_enabled() -> bool {
+            INTERRUPTS_ENABLED.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Platform for Mock {
+        fn name() -> &'static str {
+            "mock"
+        }
+
+        fn halt() -> ! {
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+
+        fn write_byte(_byte: u8) {
+            // 宿主测试不产生输出；需要断言输出时再引入记录缓冲（届时另加测试）。
+        }
+
+        fn disable_interrupts() -> InterruptState {
+            InterruptState::from_enabled(INTERRUPTS_ENABLED.swap(false, Ordering::SeqCst))
+        }
+
+        fn restore_interrupts(state: InterruptState) {
+            INTERRUPTS_ENABLED.store(state.was_enabled(), Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "impl-mock"))]
+mod tests {
+    use crate::current::Mock;
+    use arch::platform::Platform;
+
+    #[test]
+    fn mock_reports_its_own_name() {
+        assert_eq!(<Mock as Platform>::name(), "mock");
+    }
+
+    #[test]
+    fn mock_tracks_the_interrupt_state_machine() {
+        Mock::set_interrupts_enabled(true);
+        let first = Mock::disable_interrupts();
+        assert!(first.was_enabled(), "首次关中断应报告此前为开");
+        let second = Mock::disable_interrupts();
+        assert!(!second.was_enabled(), "已关中断时应报告此前为关");
+        Mock::restore_interrupts(first);
+        assert!(Mock::interrupts_enabled(), "恢复后应回到开启");
+        Mock::restore_interrupts(second);
+        assert!(!Mock::interrupts_enabled(), "恢复为关状态应生效");
+    }
 }
