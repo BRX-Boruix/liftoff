@@ -16,6 +16,9 @@ pub const FRAMEBUFFER_REQUEST_ID: [u64; 4] = [
 /// `LIMINE_FRAMEBUFFER_RGB` (memory model).
 pub const FRAMEBUFFER_RGB: u64 = 1;
 
+/// 帧缓冲内存模型：RGB（limine.h 的 `LIMINE_FRAMEBUFFER_RGB`）。
+pub const MEMORY_MODEL_RGB: u8 = 1;
+
 /// `struct limine_framebuffer`.
 ///
 /// 头部字段逐一对照 limine.h 核实（2026-09-30）：address/width/height/pitch/bpp/

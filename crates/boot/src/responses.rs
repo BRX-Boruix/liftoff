@@ -9,6 +9,7 @@
 
 use core::ffi::c_void;
 use firmware::error::Error;
+use firmware::graphics::FramebufferInfo;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
 use limine::base::{HHDM_REQUEST_ID, HhdmResponse};
 use limine::bootloader_info::{BOOTLOADER_INFO_REQUEST_ID, BootloaderInfoResponse};
@@ -359,5 +360,99 @@ mod fill_from_firmware_tests {
         let memmap: &limine::memmap::MemmapResponse =
             unsafe { &*(raw as *const limine::memmap::MemmapResponse) };
         assert_eq!(memmap.entry_count, 0, "取映射失败时不得写入任何条目");
+    }
+}
+
+/// 用固件报告的帧缓冲填充 `Responses`。
+///
+/// 没有 EDID、没有模式列表时**如实置空**（不编造）；信息无效则返回 `InvalidArgument`
+/// 且**不写入任何条目**。
+pub fn fill_framebuffer(responses: &mut Responses, info: &FramebufferInfo) -> Result<(), Error> {
+    if !info.is_valid() {
+        return Err(Error::InvalidArgument);
+    }
+    let entry = limine::framebuffer::Framebuffer {
+        address: info.base.as_u64() as *mut core::ffi::c_void,
+        width: info.width as u64,
+        height: info.height as u64,
+        pitch: info.pitch as u64,
+        bpp: info.format.bits_per_pixel,
+        memory_model: limine::framebuffer::MEMORY_MODEL_RGB,
+        red_mask_size: info.format.red_mask_size,
+        red_mask_shift: info.format.red_shift,
+        green_mask_size: info.format.green_mask_size,
+        green_mask_shift: info.format.green_shift,
+        blue_mask_size: info.format.blue_mask_size,
+        blue_mask_shift: info.format.blue_shift,
+        unused: [0; 7],
+        edid_size: 0,
+        edid: core::ptr::null_mut(),
+        mode_count: 0,
+        modes: core::ptr::null_mut(),
+    };
+    responses.set_framebuffer(&[entry]);
+    Ok(())
+}
+
+#[cfg(test)]
+mod fill_framebuffer_tests {
+    use super::{Responses, fill_framebuffer};
+    use arch::addr::PhysAddr;
+    use firmware::error::Error;
+    use firmware::graphics::{FramebufferInfo, PixelFormat};
+    use limine::framebuffer::{FRAMEBUFFER_REQUEST_ID, FramebufferResponse, MEMORY_MODEL_RGB};
+
+    fn info(base: u64, width: u32, height: u32, pitch: u32, bpp: u16) -> FramebufferInfo {
+        FramebufferInfo {
+            base: PhysAddr::new(base),
+            width,
+            height,
+            pitch,
+            format: PixelFormat {
+                bits_per_pixel: bpp,
+                red_shift: 16,
+                green_shift: 8,
+                blue_shift: 0,
+                red_mask_size: 8,
+                green_mask_size: 8,
+                blue_mask_size: 8,
+            },
+        }
+    }
+
+    #[test]
+    fn the_response_carries_the_firmware_values_verbatim() {
+        let mut responses = Responses::new();
+        let fb = info(0xfd00_0000, 1024, 768, 4096, 32);
+        fill_framebuffer(&mut responses, &fb).expect("填充成功");
+        let raw = responses.pointer_for(&FRAMEBUFFER_REQUEST_ID).expect("有响应");
+        // SAFETY: `raw` 指向容器内字段，类型为 `FramebufferResponse`。
+        let response: &FramebufferResponse = unsafe { &*(raw as *const FramebufferResponse) };
+        assert_eq!(response.framebuffer_count, 1);
+        // SAFETY: `framebuffers` 指向容器内指针数组，长度为 1。
+        let entry = unsafe { **(response.framebuffers) };
+        assert_eq!(entry.address as u64, 0xfd00_0000);
+        assert_eq!(entry.width, 1024);
+        assert_eq!(entry.height, 768);
+        assert_eq!(entry.pitch, 4096);
+        assert_eq!(entry.bpp, 32);
+        assert_eq!(entry.memory_model, MEMORY_MODEL_RGB, "UEFI 像素格式映射到 RGB 模型");
+        assert_eq!(entry.red_mask_shift, 16);
+        assert_eq!(entry.red_mask_size, 8);
+        assert_eq!(entry.green_mask_size, 8);
+        assert_eq!(entry.blue_mask_size, 8);
+        assert_eq!(entry.edid_size, 0, "没有 EDID 就如实置空，不编造");
+        assert_eq!(entry.mode_count, 0, "没有模式列表就如实置空");
+    }
+
+    #[test]
+    fn an_invalid_framebuffer_is_rejected() {
+        let mut responses = Responses::new();
+        let bad = info(0xfd00_0000, 0, 768, 4096, 32);
+        assert_eq!(fill_framebuffer(&mut responses, &bad), Err(Error::InvalidArgument));
+        let raw = responses.pointer_for(&FRAMEBUFFER_REQUEST_ID).expect("有响应");
+        // SAFETY: 同上。
+        let response: &FramebufferResponse = unsafe { &*(raw as *const FramebufferResponse) };
+        assert_eq!(response.framebuffer_count, 0, "无效输入不得写入任何帧缓冲");
     }
 }
