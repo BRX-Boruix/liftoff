@@ -11,4 +11,5 @@ extern crate std;
 pub mod base;
 pub mod framebuffer;
 pub mod memmap;
+pub mod mp;
 pub mod rsdp;
