@@ -1,8 +1,8 @@
-//! Limine framebuffer protocol (request/response pair).
+//! Limine 帧缓冲协议（请求/响应对）。
 //!
-//! Verified against brxLimine/limine-protocol/include/limine.h (2026-09-30).
-//! The per-framebuffer structure (`limine_framebuffer`) is deliberately NOT declared yet:
-//! its head fields have not been verified, so `framebuffers` stays an opaque double pointer.
+//! 已对照 brxLimine/limine-protocol/include/limine.h 核实（2026-09-30）。
+//! 每个帧缓冲的结构体 limine_framebuffer 暂不声明：其头部字段尚未核实，
+//! 故 framebuffers 保持为不透明的双重指针。
 
 use crate::base::COMMON_MAGIC;
 

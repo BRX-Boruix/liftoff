@@ -1,8 +1,7 @@
-//! Limine memory map protocol.
+//! Limine 内存映射协议。
 //!
-//! Verified against brxLimine/limine-protocol/include/limine.h (2026-09-30): the entry's
-//! `type` field is 64-bit, and `response.entries` is a pointer to an array of pointers
-//! (not a contiguous array).
+//! 已对照 brxLimine/limine-protocol/include/limine.h 核实：条目的 type 是 64 位；
+//! 响应的 entries 是“指向指针数组的指针”，不是连续数组。
 
 use crate::base::COMMON_MAGIC;
 

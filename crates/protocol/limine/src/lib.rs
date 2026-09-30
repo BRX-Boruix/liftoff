@@ -1,9 +1,7 @@
-//! Limine protocol layer: request scanning and response filling.
+//! Limine 协议层：请求扫描与响应填充。
 //!
-//! Boundary: this crate owns the protocol itself (request/response structures and
-//! filling rules) only. It contains no boot flow, paging or firmware access.
-//! Every structure below is verified against
-//! brxLimine/limine-protocol/include/limine.h (not written from memory).
+//! 边界：本 crate 只负责协议本身（请求/响应结构与填充规则），不含引导流程、分页或固件访问。
+//! 下文每个结构与常量都对照 brxLimine/limine-protocol/include/limine.h 核实，不凭记忆书写。
 
 #![no_std]
 

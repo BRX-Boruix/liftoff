@@ -1,7 +1,6 @@
-//! Protocol base types: magic, base revision, and the first request/response pair.
+//! 协议基础类型：魔数、基础修订与第一对请求/响应。
 //!
-//! Every constant and offset here is verified against
-//! brxLimine/limine-protocol/include/limine.h (checked 2026-09-30), not written from memory.
+//! 每个常量与偏移都对照 brxLimine/limine-protocol/include/limine.h 核实（2026-09-30），不凭记忆书写。
 
 /// `LIMINE_COMMON_MAGIC` (the first two words of every request id).
 pub const COMMON_MAGIC: [u64; 2] = [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b];
