@@ -115,6 +115,18 @@ mod tests {
     }
 
     #[test]
+    fn the_real_image_parses_with_the_values_verified_by_hand() {
+        // 夹具由 mke2fs（Android 构建）生成，字段值已用十六进制手工核实：
+        // 魔数 0xEF53、块大小 1024、inode_size 128、blocks_count 256、rev_level 1。
+        let raw = std::fs::read("tests/fixtures/hello.ext2").expect("夹具镜像应存在");
+        assert_eq!(raw.len(), 262144, "夹具应为 256 KiB");
+        let sb = parse_superblock(&raw).expect("真实镜像应可解析");
+        assert_eq!(sb.block_size, 1024);
+        assert_eq!(sb.inode_size, 128);
+        assert_eq!(sb.blocks_count, 256);
+    }
+
+    #[test]
     fn a_minimal_image_yields_its_fields() {
         let raw = image(0, EXT2_MAGIC);
         let sb: Superblock = parse_superblock(&raw).expect("超级块有效");
