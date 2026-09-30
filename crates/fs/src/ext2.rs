@@ -26,6 +26,8 @@ pub enum Ext2Error {
     NotExt2,
     /// `s_log_block_size` 超出上限。
     BadBlockSize,
+    /// inode 号非法（EXT2 的 inode 号从 **1** 起算）。
+    BadInodeNumber,
     /// 目录项的 `rec_len` 非法（为 0 会死循环，越出块尾会越界读）。
     BadRecLen,
     /// 目录项的 `name_len` 超出其记录范围。
@@ -160,6 +162,42 @@ pub fn parse_dir_entries(block: &[u8], out: &mut [DirEntry]) -> Result<usize, Ex
         at = end;
     }
     Ok(count)
+}
+
+/// EXT2 inode 的关键字段。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Inode {
+    /// `i_mode`（@0）。
+    pub mode: u16,
+    /// `i_size` 的低 32 位（@4）。
+    pub size: u32,
+    /// `i_block[15]`（@40）：前 12 个直接块，[12] 一级间接、[13] 二级、[14] 三级。
+    pub blocks: [u32; 15],
+}
+
+/// 解析 inode 表里的第 `index` 个 inode（**1 起算**）。
+///
+/// 数值边界：先拒绝 0（否则 `index - 1` 会下溢），再用 checked 运算算偏移；
+/// 偏移与读取范围都必须落在表内。
+pub fn parse_inode(table: &[u8], index: u32, inode_size: u16) -> Result<Inode, Ext2Error> {
+    if index == 0 {
+        return Err(Ext2Error::BadInodeNumber);
+    }
+    let size = inode_size as usize;
+    let at = (index as usize - 1)
+        .checked_mul(size)
+        .ok_or(Ext2Error::ShortImage)?;
+    let end = at.checked_add(size).ok_or(Ext2Error::ShortImage)?;
+    let raw = table.get(at..end).ok_or(Ext2Error::ShortImage)?;
+    let mut blocks = [0u32; 15];
+    for (slot, value) in blocks.iter_mut().enumerate() {
+        *value = read_u32(raw, 40 + slot * 4).ok_or(Ext2Error::ShortImage)?;
+    }
+    Ok(Inode {
+        mode: read_u16(raw, 0).ok_or(Ext2Error::ShortImage)?,
+        size: read_u32(raw, 4).ok_or(Ext2Error::ShortImage)?,
+        blocks,
+    })
 }
 
 #[cfg(test)]
@@ -311,5 +349,68 @@ mod dir_tests {
         let count = parse_dir_entries(&block, &mut out).expect("解析成功");
         assert_eq!(count, 1, "inode 为 0 的条目表示已删除");
         assert_eq!(&out[0].name[..4], b"KEEP");
+    }
+}
+
+#[cfg(test)]
+mod inode_tests {
+    use super::{Ext2Error, Inode, parse_inode};
+    use std::vec::Vec;
+
+    /// 造一张 inode 表：第 n 个 inode（1 起算）的偏移是 size*(n-1)。
+    fn inode_table(inode_size: usize, count: usize, entries: &[(usize, u16, u32, u32)]) -> Vec<u8> {
+        let mut table = std::vec![0u8; inode_size * count];
+        for (index, mode, size, first_block) in entries {
+            let at = inode_size * (index - 1);
+            table[at..at + 2].copy_from_slice(&mode.to_le_bytes());
+            table[at + 4..at + 8].copy_from_slice(&size.to_le_bytes());
+            table[at + 40..at + 44].copy_from_slice(&first_block.to_le_bytes());
+        }
+        table
+    }
+
+    #[test]
+    fn inode_numbers_are_one_based() {
+        // inode 2 的偏移应是 inode_size * 1，而不是 0。
+        let table = inode_table(128, 4, &[(2, 0x81A4, 0x1234, 99)]);
+        let inode: Inode = parse_inode(&table, 2, 128).expect("解析成功");
+        assert_eq!(inode.mode, 0x81A4);
+        assert_eq!(inode.size, 0x1234);
+        assert_eq!(inode.blocks[0], 99);
+    }
+
+    #[test]
+    fn inode_zero_is_rejected() {
+        let table = inode_table(128, 4, &[]);
+        assert_eq!(parse_inode(&table, 0, 128), Err(Ext2Error::BadInodeNumber));
+    }
+
+    #[test]
+    fn an_inode_past_the_table_is_rejected() {
+        let table = inode_table(128, 4, &[]);
+        assert_eq!(parse_inode(&table, 5, 128), Err(Ext2Error::ShortImage));
+    }
+
+    #[test]
+    fn a_larger_inode_size_scales_the_offset() {
+        // inode_size = 256（revision 1 常见）：inode 2 的偏移是 256*1。
+        let table = inode_table(256, 4, &[(2, 0x41ED, 4096, 7)]);
+        let inode = parse_inode(&table, 2, 256).expect("解析成功");
+        assert_eq!(inode.mode, 0x41ED);
+        assert_eq!(inode.size, 4096);
+        assert_eq!(inode.blocks[0], 7);
+    }
+
+    #[test]
+    fn the_indirect_block_slots_are_readable() {
+        // i_block[12] 是一级间接、[13] 二级、[14] 三级。
+        let mut table = inode_table(128, 2, &[(1, 0x81A4, 0, 0)]);
+        table[40 + 12 * 4..40 + 13 * 4].copy_from_slice(&111u32.to_le_bytes());
+        table[40 + 13 * 4..40 + 14 * 4].copy_from_slice(&222u32.to_le_bytes());
+        table[40 + 14 * 4..40 + 15 * 4].copy_from_slice(&333u32.to_le_bytes());
+        let inode = parse_inode(&table, 1, 128).expect("解析成功");
+        assert_eq!(inode.blocks[12], 111, "一级间接");
+        assert_eq!(inode.blocks[13], 222, "二级间接");
+        assert_eq!(inode.blocks[14], 333, "三级间接");
     }
 }
