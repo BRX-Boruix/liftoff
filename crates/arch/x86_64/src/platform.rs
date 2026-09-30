@@ -31,6 +31,13 @@ impl Platform for X86_64 {
         outb(COM1 + 4, 0x03);
     }
 
+    unsafe fn jump_to(entry: u64) -> ! {
+        // SAFETY: 由调用方保证（见 trait 的 SAFETY 契约）。
+        unsafe {
+            core::arch::asm!("jmp {entry}", entry = in(reg) entry, options(noreturn));
+        }
+    }
+
     fn halt() -> ! {
         loop {
             // SAFETY: `hlt` 在 ring 0 合法；不访问内存、不改变通用寄存器。

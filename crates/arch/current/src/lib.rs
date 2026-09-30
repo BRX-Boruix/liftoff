@@ -65,7 +65,12 @@ pub mod mock {
             "mock"
         }
 
-        fn halt() -> ! {
+        unsafe fn jump_to(_entry: u64) -> ! {
+        // 测试替身不应被调用：万一有测试走到跳转，就响亮失败，而不是静默通过。
+        panic!("测试替身不应被调用")
+    }
+
+    fn halt() -> ! {
             loop {
                 core::hint::spin_loop();
             }
