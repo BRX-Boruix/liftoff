@@ -1,0 +1,19 @@
+[package]
+name = "liftoff"
+version = "0.1.0"
+edition = "2024"
+description = "BORUIX bootloader (gen2 rewrite): UEFI entry + Limine protocol semantics"
+license = "MIT"
+publish = false
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true

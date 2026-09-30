@@ -1,0 +1,9 @@
+gen2: scaffold the rewrite with cargo (no_std UEFI skeleton)
+
+- cargo init, then a minimal UEFI skeleton: efi_main entry, panic handler, halt
+- src/efi.rs: minimal EFI bindings (Handle, Status, SystemTable)
+- src/serial.rs: polled COM1 console, bounded transmitter wait (panic-safe)
+- rust-toolchain.toml: nightly + rust-src/llvm-tools + x86_64-unknown-uefi
+- profiles: panic=abort, lto, strip; README documents the layer plan
+
+Builds clean: cargo build --release --target x86_64-unknown-uefi
