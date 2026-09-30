@@ -19,6 +19,8 @@ compile_error!("必须启用一个固件实现 feature：目前是 `impl-uefi`")
 pub mod current {
     pub use efi::uefi_block_devices::UefiBlockDevices;
     pub use efi::uefi_boot_services::UefiBootServices;
+    pub use efi::uefi_files::UefiFiles;
+    pub use efi::uefi_graphics::UefiGraphics;
     pub use efi::uefi_memory_source::UefiMemoryMapSource;
 }
 
@@ -26,17 +28,23 @@ pub mod current {
 mod tests {
     use firmware::block::BlockDeviceSource;
     use firmware::boot_services::BootServicesControl;
+    use firmware::file::FileSource;
+    use firmware::graphics::GraphicsSink;
     use firmware::memory::MemoryMapSource;
 
     fn assert_memory_source<T: MemoryMapSource>() {}
     fn assert_block_source<T: BlockDeviceSource>() {}
     fn assert_boot_control<T: BootServicesControl>() {}
+    fn assert_file_source<T: FileSource>() {}
+    fn assert_graphics_sink<T: GraphicsSink>() {}
 
     #[test]
     fn the_selected_implementation_satisfies_the_abstract_traits() {
         assert_memory_source::<crate::current::UefiMemoryMapSource<'static>>();
         assert_block_source::<crate::current::UefiBlockDevices<'static>>();
         assert_boot_control::<crate::current::UefiBootServices<'static>>();
+        assert_file_source::<crate::current::UefiFiles<'static>>();
+        assert_graphics_sink::<crate::current::UefiGraphics<'static>>();
     }
 
     #[test]
