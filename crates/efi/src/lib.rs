@@ -32,3 +32,5 @@ pub mod uefi_boot_services;
 pub mod handles;
 
 pub mod block_read;
+
+pub mod block_source;
