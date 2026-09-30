@@ -58,6 +58,11 @@ dependencies = [
 [[package]]
 name = "fs"
 version = "0.1.0"
+dependencies = [
+ "driver",
+ "firmware",
+ "loader",
+]
 
 [[package]]
 name = "limine"

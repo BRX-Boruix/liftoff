@@ -8,3 +8,7 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[dev-dependencies]
+driver = { path = "../driver" }
+loader = { path = "../loader" }
+firmware = { path = "../firmware" }
