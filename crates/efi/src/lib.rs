@@ -8,3 +8,5 @@ extern crate std;
 pub mod types;
 
 pub mod boot_services;
+
+pub mod block_io;

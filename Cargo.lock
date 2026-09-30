@@ -29,6 +29,9 @@ version = "0.1.0"
 [[package]]
 name = "efi"
 version = "0.1.0"
+dependencies = [
+ "firmware",
+]
 
 [[package]]
 name = "firmware"
