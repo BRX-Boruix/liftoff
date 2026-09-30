@@ -23,3 +23,5 @@ limine = { path = "../protocol/limine" }
 firmware = { path = "../firmware" }
 firmware-current = { path = "../firmware/current" }
 current = { path = "../arch/current" }
+driver = { path = "../driver" }
+fs = { path = "../fs" }

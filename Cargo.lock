@@ -12,8 +12,10 @@ version = "0.1.0"
 dependencies = [
  "arch",
  "current",
+ "driver",
  "firmware",
  "firmware-current",
+ "fs",
  "limine",
 ]
 
