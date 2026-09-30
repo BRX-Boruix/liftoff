@@ -708,3 +708,135 @@ mod enter_kernel_tests {
         assert_eq!(ENTER_CALLS.load(Ordering::SeqCst), 0, "入口为 0 时绝不能跳转");
     }
 }
+
+#[cfg(test)]
+mod enter_kernel_success_tests {
+    use super::{Handoff, enter_kernel};
+    use crate::responses::Responses;
+    use core::ffi::c_void;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use firmware::memory::MemoryEntry;
+    use firmware_current::current::{
+        BUFFER_TOO_SMALL, Handle, Status, SUCCESS, UefiMemoryMapSource,
+    };
+    use limine::base::HHDM_REQUEST_ID;
+    use limine::scan::{RequestHit, END_MARKER, START_MARKER};
+    use mm::plan::Mapping;
+    use mm::takeover::MustStay;
+    use arch::addr::{PhysAddr, VirtAddr};
+    use arch::paging::PageFlags;
+
+    const LARGE: u64 = 2 * 1024 * 1024;
+
+    static ENTER_ENTRY: AtomicUsize = AtomicUsize::new(0);
+    static EXIT_OK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXIT_OK_KEY: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "efiapi" fn good_map(
+        map_size: *mut usize,
+        map: *mut c_void,
+        map_key: *mut usize,
+        descriptor_size: *mut usize,
+        _version: *mut u32,
+    ) -> Status {
+        unsafe {
+            *map_key = 0x1234;
+            *descriptor_size = 40;
+            *map_size = 40;
+            if map.is_null() {
+                BUFFER_TOO_SMALL
+            } else {
+                core::ptr::write_bytes(map.cast::<u8>(), 0, 40);
+                SUCCESS
+            }
+        }
+    }
+
+    unsafe extern "efiapi" fn exit_ok(_image: Handle, map_key: usize) -> Status {
+        EXIT_OK_CALLS.fetch_add(1, Ordering::SeqCst);
+        EXIT_OK_KEY.store(map_key, Ordering::SeqCst);
+        SUCCESS
+    }
+
+    /// 记录收到的入口地址，然后 panic 截住（绝不真的跳走）。
+    fn recording_enter(entry: u64) -> ! {
+        ENTER_ENTRY.store(entry as usize, Ordering::SeqCst);
+        panic!("测试中的跳转到此为止")
+    }
+
+    fn push_words(image: &mut std::vec::Vec<u8>, words: &[u64]) {
+        for word in words {
+            image.extend_from_slice(&word.to_ne_bytes());
+        }
+    }
+
+    fn image_with_hhdm() -> std::vec::Vec<u8> {
+        let mut image = std::vec![0u8; 64];
+        push_words(&mut image, &START_MARKER);
+        push_words(&mut image, &HHDM_REQUEST_ID);
+        push_words(&mut image, &[0, 0, 0]);
+        push_words(&mut image, &END_MARKER);
+        image
+    }
+
+    fn mapping(virt: u64, len: u64) -> Mapping {
+        Mapping {
+            virt: VirtAddr::new(virt),
+            phys: PhysAddr::new(virt),
+            len,
+            flags: PageFlags::present(),
+        }
+    }
+
+    fn stay(start: u64, len: u64) -> MustStay {
+        MustStay { start, len }
+    }
+
+    fn empty_entry() -> MemoryEntry {
+        MemoryEntry {
+            base: arch::addr::PhysAddr::new(0),
+            length: 0,
+            kind: firmware::memory::MemoryKind::Reserved,
+        }
+    }
+
+    #[test]
+    fn a_successful_path_fills_responses_exits_once_and_jumps_to_the_entry() {
+        let mut image = image_with_hhdm();
+        let mut hits = [RequestHit::EMPTY; 4];
+        let mut responses = Responses::new();
+        responses.set_hhdm_offset(0xffff_8000_0000_0000);
+        let plan = [mapping(0xffff_ffff_8000_0000, LARGE)];
+        let must = [stay(0xffff_ffff_8000_0000, LARGE)];
+        let mut descriptors = [0u8; 128];
+        let mut source = UefiMemoryMapSource::new(good_map, &mut descriptors);
+        let mut map_buffer = [empty_entry(); 4];
+        let mut slot = None;
+        let entry = 0xffff_ffff_8000_0100u64;
+        let h = Handoff {
+            image: &mut image,
+            hits: &mut hits,
+            responses: &mut responses,
+            plan: &plan,
+            must_stay: &must,
+            entry,
+            source: &mut source,
+            map_buffer: &mut map_buffer,
+            exit: exit_ok,
+            image_handle: core::ptr::null_mut(),
+            map_key: &mut slot,
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            enter_kernel(h, recording_enter)
+        }));
+        assert!(outcome.is_err(), "编排必然以跳转结束（测试替身用 panic 截住）");
+        assert_eq!(ENTER_ENTRY.load(Ordering::SeqCst), entry as usize, "必须跳到内核入口");
+        assert_eq!(EXIT_OK_CALLS.load(Ordering::SeqCst), 1, "必须退出一次");
+        assert_eq!(EXIT_OK_KEY.load(Ordering::SeqCst), 0x1234, "退出必须收到取到的键");
+        assert_eq!(slot, Some(0x1234), "键必须已写入槽");
+        let at = hits[0].offset + 40;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&image[at..at + 8]);
+        assert_ne!(usize::from_ne_bytes(buf), 0, "response 必须已被写入");
+    }
+}
