@@ -67,6 +67,10 @@ version = "0.1.0"
 [[package]]
 name = "mm"
 version = "0.1.0"
+dependencies = [
+ "arch",
+ "firmware",
+]
 
 [[package]]
 name = "utils"
