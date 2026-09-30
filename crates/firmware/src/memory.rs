@@ -81,7 +81,7 @@ impl MemoryEntry {
 }
 
 /// 内存映射：固件给出的条目序列。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct MemoryMap<'a> {
     entries: &'a [MemoryEntry],
 }
@@ -192,5 +192,44 @@ mod tests {
         let empty = MemoryMap::new(&[]);
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn entry_from_raw_rejects_unknown_firmware_kind() {
+        use crate::error::Error;
+        let entry = MemoryEntry::from_raw(PhysAddr::new(0x1000), 0x1000, 0).expect("可用内存");
+        assert_eq!(entry.kind, MemoryKind::Usable);
+        assert_eq!(MemoryEntry::from_raw(PhysAddr::new(0), 1, 7), Err(Error::Unsupported));
+    }
+
+    #[test]
+    fn copy_map_reports_buffer_too_small() {
+        use crate::error::Error;
+        let source = [
+            MemoryEntry { base: PhysAddr::new(0), length: 0x1000, kind: MemoryKind::Usable },
+            MemoryEntry { base: PhysAddr::new(0x1000), length: 0x1000, kind: MemoryKind::Reserved },
+        ];
+        let mut small = [MemoryEntry { base: PhysAddr::new(0), length: 0, kind: MemoryKind::Usable }; 1];
+        assert!(matches!(copy_map(&mut small, &source), Err(Error::BufferTooSmall)));
+        let mut big = [MemoryEntry { base: PhysAddr::new(0), length: 0, kind: MemoryKind::Usable }; 4];
+        let map = copy_map(&mut big, &source).expect("容量足够");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.entries()[1].kind, MemoryKind::Reserved);
+    }
+
+    #[test]
+    fn memory_map_source_is_implementable() {
+        struct Fake { entries: [MemoryEntry; 1] }
+        impl MemoryMapSource for Fake {
+            fn memory_map<'b>(&mut self, buffer: &'b mut [MemoryEntry]) -> Result<MemoryMap<'b>, crate::error::Error> {
+                copy_map(buffer, &self.entries)
+            }
+        }
+        let mut fake = Fake {
+            entries: [MemoryEntry { base: PhysAddr::new(0x2000), length: 0x1000, kind: MemoryKind::AcpiReclaimable }],
+        };
+        let mut buffer = [MemoryEntry { base: PhysAddr::new(0), length: 0, kind: MemoryKind::Usable }; 2];
+        let map = fake.memory_map(&mut buffer).expect("映射可取");
+        assert_eq!(map.entries()[0].kind, MemoryKind::AcpiReclaimable);
     }
 }
