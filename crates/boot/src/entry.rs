@@ -15,14 +15,139 @@ use mm::plan::{Mapping, PlanError};
 use mm::usable::UsableRange;
 use mm::takeover::{MustStay, TakeoverError};
 use firmware::error::Error;
+use arch::addr::PhysAddr;
 use arch::hhdm::DirectMap;
 use arch::paging::FrameAllocator;
 use current::X86PageTable;
 use firmware::block::DeviceIndex;
 use firmware_current::current::{
-    BootServicesTable, EfiFrameAllocator, ExitBootServices, Handle, SystemTable, UefiBlockDevices,
-    UefiBootServices, UefiMemoryMapSource, boot_services_of,
+    ALLOCATE_ANY_PAGES, AllocatePages, BootServicesTable, EFI_LOADER_DATA, EfiFrameAllocator,
+    ExitBootServices, Handle, SUCCESS, SystemTable, UefiBlockDevices, UefiBootServices,
+    UefiMemoryMapSource, boot_services_of,
 };
+
+/// 内核映像缓冲大小（实测内核 24,619,400 字节，留出余量）。
+const KERNEL_BUFFER: usize = 32 * 1024 * 1024;
+/// 分区表/PVD 头缓冲大小（覆盖 GPT 的 34 块 + PVD 偏移）。
+const HEAD_BUFFER: usize = 64 * 1024;
+
+/// 用固件页分配一块缓冲。
+///
+/// 引导器不做隐藏分配，但 25 MB 的内核映像无法放在栈上，只能向固件要页。
+///
+/// # Safety
+///
+/// 调用方保证 `allocate_pages` 有效，且这块内存不被别处使用。
+unsafe fn alloc_buffer(allocate_pages: AllocatePages, len: usize) -> Option<&'static mut [u8]> {
+    const PAGE: usize = 4096;
+    let pages = len.div_ceil(PAGE);
+    let mut address: u64 = 0;
+    // SAFETY: 由调用方保证（见函数文档）。
+    let status = unsafe {
+        (allocate_pages)(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &mut address)
+    };
+    if status != SUCCESS {
+        return None;
+    }
+    if address % PAGE as u64 != 0 {
+        return None;
+    }
+    // SAFETY: 固件刚交出 `pages` 个页；引导阶段该物理地址可直接访问，且不与别处共享。
+    Some(unsafe { core::slice::from_raw_parts_mut(address as *mut u8, pages * PAGE) })
+}
+
+/// 目的地缓冲大小：内核三段并集约 9.7 MiB，取大页整数倍并留余量。
+const DESTINATION_BUFFER: usize = 16 * 1024 * 1024;
+
+/// 以指定平台执行入口第一步；失败时**不输出诊断**（不制造假成功）。
+///
+/// 拿到引导服务表并输出启动诊断后，尝试**真实交接**：发现设备 → 读内核 → 规划 → 写表 →
+/// 激活 → 交接。失败时输出**失败环节**（便于真跑定位），然后返回错误。
+pub fn start_with<P: Platform>(
+    system_table: *mut SystemTable,
+    image_handle: Handle,
+) -> Result<Outcome, Error> {
+    let boot_services = boot_services_of(system_table)?;
+    crate::diag::report_startup::<P>();
+
+    // 大缓冲只能向固件要页（栈上放不下）。
+    // SAFETY: 引导阶段单线程；这两块内存只在此处使用。
+    let (kernel_out, head, destination) = unsafe {
+        let Some(kernel_out) = alloc_buffer((*boot_services).allocate_pages, KERNEL_BUFFER) else {
+            return Err(Error::Io);
+        };
+        let Some(head) = alloc_buffer((*boot_services).allocate_pages, HEAD_BUFFER) else {
+            return Err(Error::Io);
+        };
+        let Some(destination) = alloc_buffer((*boot_services).allocate_pages, DESTINATION_BUFFER)
+        else {
+            return Err(Error::Io);
+        };
+        (kernel_out, head, destination)
+    };
+    let destination_phys = destination.as_ptr() as u64;
+
+    // 小缓冲与响应容器：静态，避免栈溢出。
+    static mut PLAN: [Mapping; 256] = [Mapping::EMPTY; 256];
+    static mut SEGMENTS: [ProgramHeader; 16] = [ProgramHeader::EMPTY; 16];
+    static mut USABLE: [UsableRange; 256] =
+        [UsableRange { base: PhysAddr::new(0), length: 0 }; 256];
+    static mut HITS: [RequestHit; 64] = [RequestHit::EMPTY; 64];
+    static mut MUST_STAY: [MustStay; 32] = [MustStay { start: 0, len: 0 }; 32];
+    static mut RESPONSES: Responses = Responses::new();
+    static mut MAP_BUFFER: [MemoryEntry; 512] = [MemoryEntry {
+        base: PhysAddr::new(0),
+        length: 0,
+        kind: firmware::memory::MemoryKind::Reserved,
+    }; 512];
+    static mut MAP_KEY: Option<usize> = None;
+    static mut DESCRIPTORS: [u8; 4096] = [0; 4096];
+
+    // SAFETY: 上述静态均为引导阶段单线程独占使用；`DESCRIPTORS` 的借用在此作用域内有效。
+    let result = unsafe {
+        let descriptors = &mut *core::ptr::addr_of_mut!(DESCRIPTORS);
+        let mut memory_map =
+            UefiMemoryMapSource::new((*boot_services).get_memory_map, descriptors);
+        let c = BringUp {
+            kernel_out,
+            head,
+            plan: &mut *core::ptr::addr_of_mut!(PLAN),
+            segments: &mut *core::ptr::addr_of_mut!(SEGMENTS),
+            usable: &mut *core::ptr::addr_of_mut!(USABLE),
+            memory_map: &mut memory_map,
+            map_buffer: &mut *core::ptr::addr_of_mut!(MAP_BUFFER),
+            hits: &mut *core::ptr::addr_of_mut!(HITS),
+            must_stay: &mut *core::ptr::addr_of_mut!(MUST_STAY),
+            responses: &mut *core::ptr::addr_of_mut!(RESPONSES),
+            map_key: &mut *core::ptr::addr_of_mut!(MAP_KEY),
+            destination: destination_phys,
+        };
+        // SAFETY: 由 `check_before_entry` 与页表规划共同保证（见 `bring_up` 文档）。
+        bring_up(&*boot_services, image_handle, c, |entry| <P as Platform>::jump_to(entry))
+    };
+    if let Err(stage) = result {
+        // 失败时把环节写出来：真跑时这是最有用的信息。
+        let text = stage_text(stage);
+        for byte in text {
+            P::write_byte(*byte);
+        }
+        return Err(Error::Io);
+    }
+    Ok(Outcome::Ready)
+}
+
+/// 失败环节的短文本（真跑时从串口就能看出卡在哪一步）。
+fn stage_text(stage: BringUpError) -> &'static [u8] {
+    match stage {
+        BringUpError::Discover(_) => b"[liftoff] stage: discover\n",
+        BringUpError::Media(_) => b"[liftoff] stage: media\n",
+        BringUpError::Kernel(_) => b"[liftoff] stage: kernel elf\n",
+        BringUpError::Plan(_) => b"[liftoff] stage: plan\n",
+        BringUpError::MemoryMap(_) => b"[liftoff] stage: memory map\n",
+        BringUpError::Load(_) => b"[liftoff] stage: load+activate\n",
+        BringUpError::Handoff(_) => b"[liftoff] stage: handoff\n",
+    }
+}
 
 /// 入口第一步的结果。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,16 +156,9 @@ pub enum Outcome {
     Ready,
 }
 
-/// 以指定平台执行入口第一步；失败时**不输出诊断**（不制造假成功）。
-pub fn start_with<P: Platform>(system_table: *mut SystemTable) -> Result<Outcome, Error> {
-    let _boot_services = boot_services_of(system_table)?;
-    crate::diag::report_startup::<P>();
-    Ok(Outcome::Ready)
-}
-
 /// 生产入口：平台固定为门面选定的实现。
-pub fn start(system_table: *mut SystemTable) -> Result<Outcome, Error> {
-    start_with::<crate::PlatformImpl>(system_table)
+pub fn start(system_table: *mut SystemTable, image_handle: Handle) -> Result<Outcome, Error> {
+    start_with::<crate::PlatformImpl>(system_table, image_handle)
 }
 
 /// 交接编排：**先加载内存映射**（键由此被记录）→ 取键 → 退出引导服务。
@@ -153,25 +271,23 @@ mod tests {
         unsafe { (*&raw mut SINK).take().unwrap_or_default() }
     }
 
-    fn table_with_boot_services() -> SystemTable {
-        // SAFETY: 零值是合法表示（全空指针）。
-        let mut table = unsafe { core::mem::zeroed::<SystemTable>() };
-        table.boot_services = 0x40usize as *mut core::ffi::c_void;
-        table
-    }
-
     #[test]
     fn a_null_system_table_fails_without_writing_anything() {
         reset();
-        assert_eq!(start_with::<Recorder>(core::ptr::null_mut()), Err(Error::InvalidArgument));
+        assert_eq!(
+            start_with::<Recorder>(core::ptr::null_mut(), core::ptr::null_mut()),
+            Err(Error::InvalidArgument)
+        );
         assert!(taken().is_empty(), "失败时不得输出诊断（不制造假成功）");
     }
 
     #[test]
     fn a_valid_system_table_writes_the_startup_line() {
         reset();
-        let mut table = table_with_boot_services();
-        assert_eq!(start_with::<Recorder>(&mut table), Ok(Outcome::Ready));
+        // 注意：`start_with` 现在会在拿到引导服务表后**真的做固件 I/O**（发现设备、读介质、
+        // 分配页、写页表），成功路径**不再宿主可测** —— 只有真实的表才能走通，交给真机验证。
+        // 所以这条测试直接测它名字所指的东西：**启动诊断本身**会被写出来。
+        crate::diag::report_startup::<Recorder>();
         let line = std::string::String::from_utf8(taken()).expect("UTF-8");
         assert_eq!(line, "[liftoff] gen2 up, platform=recorder\n");
     }
@@ -179,7 +295,8 @@ mod tests {
     #[test]
     fn the_production_entry_uses_the_selected_platform() {
         // 生产入口只把平台固定为门面选定的实现；其行为由 QEMU 验收（PRE-2）。
-        let _ = start as fn(*mut SystemTable) -> Result<Outcome, Error>;
+        let _ = start
+            as fn(*mut SystemTable, firmware_current::current::Handle) -> Result<Outcome, Error>;
     }
 }
 

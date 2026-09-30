@@ -19,11 +19,12 @@ fn panic(_info: &PanicInfo) -> ! {
 /// UEFI 入口（`x86_64-unknown-uefi` 链接符号 `efi_main`）。
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(
-    _image_handle: *mut core::ffi::c_void,
+    image_handle: *mut core::ffi::c_void,
     system_table: *mut core::ffi::c_void,
 ) -> usize {
     PlatformImpl::init();
-    match boot::entry::start(system_table.cast::<SystemTable>()) {
+    // `image_handle` 必须传进去：退出引导服务时要用它（`ExitBootServices` 的第一个参数）。
+    match boot::entry::start(system_table.cast::<SystemTable>(), image_handle) {
         Ok(_) => 0,
         Err(_) => {
             // 失败：输出一行失败诊断后停机 —— 不静默返回“成功”。
