@@ -8,6 +8,8 @@
 //! 具体数值由上层用 `firmware` 抽象取来后经 setter 填入。
 
 use core::ffi::c_void;
+use firmware::error::Error;
+use firmware::memory::{MemoryEntry, MemoryMapSource};
 use limine::base::{HHDM_REQUEST_ID, HhdmResponse};
 use limine::bootloader_info::{BOOTLOADER_INFO_REQUEST_ID, BootloaderInfoResponse};
 use limine::entry_point::{ENTRY_POINT_REQUEST_ID, EntryPointResponse};
@@ -260,5 +262,102 @@ mod tests {
         let first = unsafe { **memmap.entries };
         assert_eq!(first.base, 0x1000);
         assert_eq!(first.kind, limine::memmap::USABLE);
+    }
+}
+
+/// 用固件抽象的内存映射填充 `Responses`：把抽象类型**翻译成协议取值**后交给容器。
+///
+/// 取映射失败时**不写入任何条目**（宁可容器保持空，也不写半份数据）。
+pub fn fill_memory_map<S: MemoryMapSource>(
+    responses: &mut Responses,
+    source: &mut S,
+    buffer: &mut [MemoryEntry],
+) -> Result<usize, Error> {
+    let map = source.memory_map(buffer)?;
+    let count = if map.len() > MAX_MEMMAP_ENTRIES { MAX_MEMMAP_ENTRIES } else { map.len() };
+    let mut converted = [limine::memmap::MemmapEntry { base: 0, length: 0, kind: 0 }; MAX_MEMMAP_ENTRIES];
+    for (index, entry) in map.iter().take(count).enumerate() {
+        converted[index] = limine::memmap::MemmapEntry {
+            base: entry.base.as_u64(),
+            length: entry.length,
+            kind: entry.kind.as_protocol() as u64,
+        };
+    }
+    responses.set_memmap(&converted[..count]);
+    Ok(count)
+}
+
+#[cfg(test)]
+mod fill_from_firmware_tests {
+    use super::{Responses, fill_memory_map};
+    use arch::addr::PhysAddr;
+    use firmware::error::Error;
+    use firmware::memory::{MemoryEntry, MemoryKind, MemoryMap, MemoryMapSource};
+    use limine::memmap::{RESERVED, USABLE};
+    use std::vec::Vec;
+
+    /// 假内存映射来源。
+    struct FakeMap {
+        entries: Vec<MemoryEntry>,
+        fail: bool,
+    }
+
+    impl MemoryMapSource for FakeMap {
+        fn memory_map<'b>(&mut self, buffer: &'b mut [MemoryEntry]) -> Result<MemoryMap<'b>, Error> {
+            if self.fail {
+                return Err(Error::Io);
+            }
+            if buffer.len() < self.entries.len() {
+                return Err(Error::BufferTooSmall);
+            }
+            let count = self.entries.len();
+            buffer[..count].copy_from_slice(&self.entries);
+            Ok(MemoryMap::new(&buffer[..count]))
+        }
+    }
+
+    fn entry(base: u64, length: u64, kind: MemoryKind) -> MemoryEntry {
+        MemoryEntry { base: PhysAddr::new(base), length, kind }
+    }
+
+    #[test]
+    fn the_firmware_map_is_translated_into_protocol_kinds() {
+        let mut source = FakeMap {
+            entries: std::vec![
+                entry(0x1000, 0x2000, MemoryKind::Usable),
+                entry(0x5000, 0x1000, MemoryKind::Reserved),
+            ],
+            fail: false,
+        };
+        let mut buffer = [entry(0, 0, MemoryKind::Reserved); 8];
+        let mut responses = Responses::new();
+        let count = fill_memory_map(&mut responses, &mut source, &mut buffer).expect("填充成功");
+        assert_eq!(count, 2);
+        let raw = responses.pointer_for(&limine::memmap::MEMMAP_REQUEST_ID).expect("有响应");
+        // SAFETY: `raw` 指向 `responses` 内字段，类型为 `MemmapResponse`。
+        let memmap: &limine::memmap::MemmapResponse =
+            unsafe { &*(raw as *const limine::memmap::MemmapResponse) };
+        assert_eq!(memmap.entry_count, 2);
+        // SAFETY: `entries` 指向容器内指针数组，长度为 2。
+        let first = unsafe { **memmap.entries };
+        assert_eq!(first.base, 0x1000);
+        assert_eq!(first.length, 0x2000);
+        assert_eq!(first.kind, USABLE, "抽象类型必须翻译成协议取值");
+        // SAFETY: 同上，第二项也在数组内。
+        let second = unsafe { **(memmap.entries.add(1)) };
+        assert_eq!(second.kind, RESERVED);
+    }
+
+    #[test]
+    fn a_failing_source_leaves_the_container_untouched() {
+        let mut source = FakeMap { entries: Vec::new(), fail: true };
+        let mut buffer = [entry(0, 0, MemoryKind::Reserved); 8];
+        let mut responses = Responses::new();
+        assert!(fill_memory_map(&mut responses, &mut source, &mut buffer).is_err());
+        let raw = responses.pointer_for(&limine::memmap::MEMMAP_REQUEST_ID).expect("有响应");
+        // SAFETY: 同上。
+        let memmap: &limine::memmap::MemmapResponse =
+            unsafe { &*(raw as *const limine::memmap::MemmapResponse) };
+        assert_eq!(memmap.entry_count, 0, "取映射失败时不得写入任何条目");
     }
 }
