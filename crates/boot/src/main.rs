@@ -13,6 +13,10 @@ use firmware_current::current::SystemTable;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+    // 停机前**必须留痕**：否则 panic 与“还在跑/已跳转”在串口上无法区分。
+    for byte in b"[liftoff] panic\n" {
+        PlatformImpl::write_byte(*byte);
+    }
     PlatformImpl::halt()
 }
 

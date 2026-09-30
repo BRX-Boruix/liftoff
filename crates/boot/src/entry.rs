@@ -69,6 +69,8 @@ pub fn start_with<P: Platform>(
 ) -> Result<Outcome, Error> {
     let boot_services = boot_services_of(system_table)?;
     crate::diag::report_startup::<P>();
+    // 每步都留痕：否则“成功跳转 / 还在跑 / panic”在串口上无法区分。
+    report::<P>(b"[liftoff] step: alloc\n");
 
     // 大缓冲只能向固件要页（栈上放不下）。
     // SAFETY: 引导阶段单线程；这两块内存只在此处使用。
@@ -86,6 +88,7 @@ pub fn start_with<P: Platform>(
         (kernel_out, head, destination)
     };
     let destination_phys = destination.as_ptr() as u64;
+    report::<P>(b"[liftoff] step: bring_up\n");
 
     // 小缓冲与响应容器：静态，避免栈溢出。
     static mut PLAN: [Mapping; 256] = [Mapping::EMPTY; 256];
@@ -134,6 +137,13 @@ pub fn start_with<P: Platform>(
         return Err(Error::Io);
     }
     Ok(Outcome::Ready)
+}
+
+/// 往串口写一行（用于真跑时定位）。
+fn report<P: Platform>(text: &[u8]) {
+    for byte in text {
+        P::write_byte(*byte);
+    }
 }
 
 /// 失败环节的短文本（真跑时从串口就能看出卡在哪一步）。
