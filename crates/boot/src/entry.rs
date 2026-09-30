@@ -4,7 +4,7 @@
 //! 平台与固件实现的**选择**来自门面（`crate::PlatformImpl`、`firmware_current::current`），
 //! 本模块不自己挑实现。
 
-use loader::elf::{ElfError, ProgramHeader, parse_elf_header, parse_load_segments};
+use loader::elf::{ElfError, ProgramHeader, load_segments, parse_elf_header, parse_load_segments};
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
@@ -866,6 +866,8 @@ pub enum KernelPlanError {
     Overflow,
     /// 调用方给的输出缓冲太小。
     BufferTooSmall,
+    /// 段的目标虚拟区间没有任何映射覆盖。
+    NotMapped,
 }
 
 /// 解析内核映像，得出入口与装载段。
@@ -991,6 +993,132 @@ mod kernel_plan_tests {
         assert_eq!(
             must_stay_from_segments(&segments, &mut stays),
             Err(KernelPlanError::BufferTooSmall)
+        );
+    }
+}
+
+/// 按页表规划把内核段拷进物理内存。
+///
+/// `load_segments` 的写入器收到的是 `p_vaddr`（虚拟地址），本函数用 `plan` 把它翻成物理地址：
+/// 找到**覆盖该虚拟区间的那一条**映射，目标为 `phys + (vaddr - mapping.virt)`。
+/// **覆盖不到就返回 `NotMapped`**，绝不静默丢弃字节 —— 半装载的映像跳过去就是执行垃圾。
+///
+/// `memory` 是目标物理内存视图（长度即可寻址的物理字节数），故宿主上可用假内存验证。
+///
+/// 边界：映射区间与物理地址都用 checked 运算；写入目标必须在 `memory` 内。
+pub fn copy_kernel_segments(
+    image: &[u8],
+    segments: &[ProgramHeader],
+    plan: &[Mapping],
+    memory: &mut [u8],
+) -> Result<usize, KernelPlanError> {
+    let mut total = 0usize;
+    let mut not_mapped = false;
+    let loaded = {
+        let mut write = |vaddr: u64, bytes: &[u8]| -> Result<(), ElfError> {
+            let len = bytes.len() as u64;
+            let end = vaddr.checked_add(len).ok_or(ElfError::SegmentOutOfBounds)?;
+            // 必须落在**同一条**映射内（不允许跨映射拼接）。
+            let mut found = None;
+            for candidate in plan {
+                let Some(mapping_end) = candidate.virt.as_u64().checked_add(candidate.len) else {
+                    continue;
+                };
+                if vaddr >= candidate.virt.as_u64() && end <= mapping_end {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            let Some(mapping) = found else {
+                not_mapped = true;
+                return Err(ElfError::SegmentOutOfBounds);
+            };
+            let offset = vaddr - mapping.virt.as_u64();
+            let phys = mapping
+                .phys
+                .as_u64()
+                .checked_add(offset)
+                .ok_or(ElfError::SegmentOutOfBounds)?;
+            let start = usize::try_from(phys).map_err(|_| ElfError::SegmentOutOfBounds)?;
+            let slot = memory
+                .get_mut(start..start + bytes.len())
+                .ok_or(ElfError::SegmentOutOfBounds)?;
+            slot.copy_from_slice(bytes);
+            total += bytes.len();
+            Ok(())
+        };
+        load_segments(image, segments, &mut write)
+    };
+    if not_mapped {
+        return Err(KernelPlanError::NotMapped);
+    }
+    loaded.map_err(KernelPlanError::Elf)?;
+    Ok(total)
+}
+
+#[cfg(test)]
+mod copy_segments_tests {
+    use super::{KernelPlanError, copy_kernel_segments, plan_kernel};
+    use arch::addr::{PhysAddr, VirtAddr};
+    use arch::paging::PageFlags;
+    use loader::elf::ProgramHeader;
+    use mm::plan::Mapping;
+
+    fn real_kernel() -> Option<std::vec::Vec<u8>> {
+        let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
+        let bytes = std::fs::read(iso).ok()?;
+        bytes.get(33 * 2048..33 * 2048 + 24_619_400).map(|s| s.to_vec())
+    }
+
+    fn mapping(virt: u64, phys: u64, len: u64) -> Mapping {
+        Mapping {
+            virt: VirtAddr::new(virt),
+            phys: PhysAddr::new(phys),
+            len,
+            flags: PageFlags::present(),
+        }
+    }
+
+    #[test]
+    fn the_real_kernel_segment_lands_at_the_planned_physical_address() {
+        let Some(image) = real_kernel() else {
+            std::eprintln!("跳过：真实 ISO 不存在");
+            return;
+        };
+        let mut segments = [ProgramHeader::EMPTY; 8];
+        let plan_ = plan_kernel(&image, &mut segments).expect("可规划");
+        // 三段各放到不同的物理位置，互不重叠。
+        let plan = [
+            mapping(0xffff_ffff_8000_0000, 0x10_0000, 0x22_3cb0),
+            mapping(0xffff_ffff_8022_4000, 0x40_0000, 0x4d_5780),
+            mapping(0xffff_ffff_806f_a000, 0x90_0000, 0x2b_ea88),
+        ];
+        let mut memory = std::vec![0u8; 0x100_0000];
+        let total = copy_kernel_segments(&image, &segments[..plan_.segment_count], &plan, &mut memory)
+            .expect("拷贝成功");
+        assert!(total > 0);
+        // 第 0 段的 p_offset 是 0x1000（实测），故其头 16 字节应出现在物理 0x100000。
+        assert_eq!(
+            &memory[0x10_0000..0x10_0010],
+            &image[0x1000..0x1010],
+            "第 0 段字节必须落到 plan 给的物理地址"
+        );
+    }
+
+    #[test]
+    fn a_virtual_address_the_plan_does_not_cover_is_rejected() {
+        let mut segments = [ProgramHeader::EMPTY; 2];
+        segments[0].p_offset = 0;
+        segments[0].p_vaddr = 0xffff_ffff_8000_0000;
+        segments[0].p_filesz = 16;
+        segments[0].p_memsz = 16;
+        let image = std::vec![7u8; 64];
+        let plan: [Mapping; 0] = [];
+        let mut memory = std::vec![0u8; 4096];
+        assert_eq!(
+            copy_kernel_segments(&image, &segments[..1], &plan, &mut memory),
+            Err(KernelPlanError::NotMapped)
+            , "没有映射就必须拒绝，不能静默丢弃"
         );
     }
 }
