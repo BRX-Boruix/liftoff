@@ -10,4 +10,5 @@ extern crate std;
 
 pub mod block;
 pub mod error;
+pub mod file;
 pub mod memory;
