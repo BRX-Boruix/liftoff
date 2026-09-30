@@ -1009,14 +1009,18 @@ mod kernel_plan_tests {
 /// `memory` 是目标物理内存视图（长度即可寻址的物理字节数），故宿主上可用假内存验证。
 ///
 /// 边界：映射区间与物理地址都用 checked 运算；写入目标必须在 `memory` 内。
-pub fn copy_kernel_segments(
+pub fn copy_kernel_segments<W>(
     image: &[u8],
     segments: &[ProgramHeader],
     plan: &[Mapping],
-    memory: &mut [u8],
-) -> Result<usize, KernelPlanError> {
+    write_phys: W,
+) -> Result<usize, KernelPlanError>
+where
+    W: FnMut(u64, &[u8]) -> Result<(), ElfError>,
+{
     let mut total = 0usize;
     let mut not_mapped = false;
+    let mut write_phys = write_phys;
     let loaded = {
         let mut write = |vaddr: u64, bytes: &[u8]| -> Result<(), ElfError> {
             let len = bytes.len() as u64;
@@ -1042,11 +1046,7 @@ pub fn copy_kernel_segments(
                 .as_u64()
                 .checked_add(offset)
                 .ok_or(ElfError::SegmentOutOfBounds)?;
-            let start = usize::try_from(phys).map_err(|_| ElfError::SegmentOutOfBounds)?;
-            let slot = memory
-                .get_mut(start..start + bytes.len())
-                .ok_or(ElfError::SegmentOutOfBounds)?;
-            slot.copy_from_slice(bytes);
+            write_phys(phys, bytes)?;
             total += bytes.len();
             Ok(())
         };
@@ -1064,7 +1064,7 @@ mod copy_segments_tests {
     use super::{KernelPlanError, copy_kernel_segments, plan_kernel};
     use arch::addr::{PhysAddr, VirtAddr};
     use arch::paging::PageFlags;
-    use loader::elf::ProgramHeader;
+    use loader::elf::{ElfError, ProgramHeader};
     use mm::plan::Mapping;
 
     fn real_kernel() -> Option<std::vec::Vec<u8>> {
@@ -1097,8 +1097,18 @@ mod copy_segments_tests {
             mapping(0xffff_ffff_806f_a000, 0x90_0000, 0x2b_ea88),
         ];
         let mut memory = std::vec![0u8; 0x100_0000];
-        let total = copy_kernel_segments(&image, &segments[..plan_.segment_count], &plan, &mut memory)
-            .expect("拷贝成功");
+        let total = {
+            let mut write = |phys: u64, bytes: &[u8]| {
+                let at = usize::try_from(phys).map_err(|_| ElfError::SegmentOutOfBounds)?;
+                let slot = memory
+                    .get_mut(at..at + bytes.len())
+                    .ok_or(ElfError::SegmentOutOfBounds)?;
+                slot.copy_from_slice(bytes);
+                Ok(())
+            };
+            copy_kernel_segments(&image, &segments[..plan_.segment_count], &plan, &mut write)
+                .expect("拷贝成功")
+        };
         assert!(total > 0);
         // 第 0 段的 p_offset 是 0x1000（实测），故其头 16 字节应出现在物理 0x100000。
         assert_eq!(
@@ -1118,8 +1128,16 @@ mod copy_segments_tests {
         let image = std::vec![7u8; 64];
         let plan: [Mapping; 0] = [];
         let mut memory = std::vec![0u8; 4096];
+        let mut write = |phys: u64, bytes: &[u8]| {
+            let at = usize::try_from(phys).map_err(|_| ElfError::SegmentOutOfBounds)?;
+            let slot = memory
+                .get_mut(at..at + bytes.len())
+                .ok_or(ElfError::SegmentOutOfBounds)?;
+            slot.copy_from_slice(bytes);
+            Ok(())
+        };
         assert_eq!(
-            copy_kernel_segments(&image, &segments[..1], &plan, &mut memory),
+            copy_kernel_segments(&image, &segments[..1], &plan, &mut write),
             Err(KernelPlanError::NotMapped)
             , "没有映射就必须拒绝，不能静默丢弃"
         );
@@ -1136,14 +1154,17 @@ mod copy_segments_tests {
 /// # Safety
 ///
 /// 与 [`PageTable::activate`] 相同：调用方必须保证新页表仍映射当前正在执行的代码与栈。
-pub unsafe fn load_and_activate<P: PageTable>(
+pub unsafe fn load_and_activate<P: PageTable, W>(
     table: &mut P,
     plan: &[Mapping],
     image: &[u8],
     segments: &[ProgramHeader],
     entry: u64,
-    memory: &mut [u8],
-) -> Result<(), KernelPlanError> {
+    write_phys: W,
+) -> Result<(), KernelPlanError>
+where
+    W: FnMut(u64, &[u8]) -> Result<(), ElfError>,
+{
     // 入口必须落在某个装载段内 —— 否则跳过去就是执行未装载的内存。
     let mut inside = false;
     for segment in segments {
@@ -1160,7 +1181,7 @@ pub unsafe fn load_and_activate<P: PageTable>(
         return Err(KernelPlanError::EntryOutsideSegments);
     }
     mm::apply::apply(table, plan).map_err(|_| KernelPlanError::MapFailed)?;
-    copy_kernel_segments(image, segments, plan, memory)?;
+    copy_kernel_segments(image, segments, plan, write_phys)?;
     // SAFETY: 由调用方保证（见函数文档与 `PageTable::activate` 的 SAFETY 契约）。
     unsafe { table.activate() };
     Ok(())
@@ -1171,7 +1192,7 @@ mod load_and_activate_tests {
     use super::{KernelPlanError, load_and_activate, plan_kernel};
     use arch::addr::{PhysAddr, VirtAddr};
     use arch::paging::{MapError, PageFlags, PageTable};
-    use loader::elf::ProgramHeader;
+    use loader::elf::{ElfError, ProgramHeader};
     use mm::plan::Mapping;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1244,6 +1265,14 @@ mod load_and_activate_tests {
         ];
         let mut memory = std::vec![0u8; 0x100_0000];
         let mut table = RecordingTable;
+        let mut write = |phys: u64, bytes: &[u8]| {
+            let at = usize::try_from(phys).map_err(|_| ElfError::SegmentOutOfBounds)?;
+            let slot = memory
+                .get_mut(at..at + bytes.len())
+                .ok_or(ElfError::SegmentOutOfBounds)?;
+            slot.copy_from_slice(bytes);
+            Ok(())
+        };
         MAP_CALLS.store(0, Ordering::SeqCst);
         ACTIVATE_CALLS.store(0, Ordering::SeqCst);
         let result = unsafe {
@@ -1253,7 +1282,7 @@ mod load_and_activate_tests {
                 &image,
                 &segments[..plan_info.segment_count],
                 plan_info.entry,
-                &mut memory,
+                &mut write,
             )
         };
         assert!(result.is_ok(), "装载并激活应成功");
@@ -1276,11 +1305,11 @@ mod load_and_activate_tests {
         segments[0].p_memsz = 16;
         let image = std::vec![7u8; 64];
         let plan: [Mapping; 0] = [];
-        let mut memory = std::vec![0u8; 4096];
         let mut table = FailTable;
+        let mut write = |_phys: u64, _bytes: &[u8]| Ok(());
         ACTIVATE_FAIL.store(0, Ordering::SeqCst);
         let result = unsafe {
-            load_and_activate(&mut table, &plan, &image, &segments[..1], 0xffff_ffff_8000_0000, &mut memory)
+            load_and_activate(&mut table, &plan, &image, &segments[..1], 0xffff_ffff_8000_0000, &mut write)
         };
         assert_eq!(result, Err(KernelPlanError::NotMapped));
         assert_eq!(
