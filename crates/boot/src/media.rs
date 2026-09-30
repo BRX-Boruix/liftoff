@@ -5,6 +5,10 @@
 //!
 //! 边界：只依赖 `arch`/`firmware` **抽象** 与 `fs`/`driver` 的**公开接口**，不触碰固件具体实现。
 
+use driver::partition::Partition;
+use firmware::error::Error;
+use driver::table::{TableError, parse_partition_table};
+use firmware::block::DeviceIndex;
 use fs::iso9660::{ISO9660_DESCRIPTOR_OFFSET, ISO9660_DESCRIPTOR_SIZE, IsoError, find_in_directory, parse_primary_descriptor};
 use driver::volume::Volume;
 use firmware::block::BlockDeviceSource;
@@ -507,5 +511,139 @@ mod read_kernel_image_tests {
         let mut out = std::vec![0u8; 16];
         let result = read_kernel_image(&mut disk, &volume, 2048, &mut head, &mut out);
         assert!(result.is_err(), "缓冲装不下内核必须报错，不能截断交付");
+    }
+}
+
+/// 介质访问失败原因（**保留失败环节**，不做有损扁平化）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaError {
+    /// 固件访问失败。
+    Device(Error),
+    /// 分区表解析失败。
+    Table(TableError),
+    /// ISO9660 解析或读取失败。
+    Iso(IsoError),
+}
+
+/// 从块设备上取出内核映像：判定分区表 → 选卷 → 读内核。
+///
+/// 没有分区表时（`Ok(None)`）卷就是**整盘**（`start_lba = 0`）—— ISO 直接挂载正是这种情况。
+///
+/// 分区表判定需要不止第 0 块（GPT 的头在第 1 块、项表在第 2..34 块），故按 34 块读入；
+/// 读不满则按实际能读到的部分判定（不假装读到了）。
+pub fn load_kernel_from_device<D: BlockDeviceSource>(
+    source: &mut D,
+    device: DeviceIndex,
+    head: &mut [u8],
+    out: &mut [u8],
+) -> Result<usize, MediaError> {
+    let info = source.device_info(device).map_err(MediaError::Device)?;
+    let unit = info.block_size as usize;
+    if unit == 0 || head.len() < unit {
+        return Err(MediaError::Device(Error::BufferTooSmall));
+    }
+    // 读入覆盖分区表所需的前若干块（GPT 需要 34 块）。
+    let want = core::cmp::min(info.block_count, 34) as u32;
+    let mut got = 0u32;
+    while got < want {
+        let at = got as usize * unit;
+        if at + unit > head.len() {
+            break;
+        }
+        source
+            .read_blocks(device, got as u64, 1, &mut head[at..at + unit])
+            .map_err(MediaError::Device)?;
+        got += 1;
+    }
+    if got == 0 {
+        return Err(MediaError::Device(Error::BufferTooSmall));
+    }
+    let image_end = got as usize * unit;
+    let mut partitions = [Partition { start_lba: 0, sector_count: 0 }; 8];
+    let table = parse_partition_table(
+        &head[..core::cmp::min(512, image_end)],
+        &head[..image_end],
+        unit as u64,
+        &mut partitions,
+    )
+    .map_err(MediaError::Table)?;
+    let (start_lba, sector_count) = match table {
+        Some((_, count)) if count > 0 => (partitions[0].start_lba, partitions[0].sector_count),
+        _ => (0, info.block_count),
+    };
+    let volume =
+        Volume::new(device, start_lba, sector_count, info.block_size).map_err(MediaError::Device)?;
+    read_kernel_image(source, &volume, 2048, head, out).map_err(MediaError::Iso)
+}
+
+#[cfg(test)]
+mod load_kernel_from_device_tests {
+    use super::{MediaError, load_kernel_from_device};
+    use firmware::block::{BlockDeviceInfo, BlockDeviceSource, DeviceIndex};
+    use firmware::error::Error;
+    use std::vec::Vec;
+
+    struct FakeDisk {
+        bytes: Vec<u8>,
+        block_size: u32,
+    }
+
+    impl BlockDeviceSource for FakeDisk {
+        fn device_count(&self) -> usize {
+            1
+        }
+        fn device_info(&self, _index: DeviceIndex) -> Result<BlockDeviceInfo, Error> {
+            Ok(BlockDeviceInfo {
+                block_size: self.block_size,
+                block_count: (self.bytes.len() as u32 / self.block_size) as u64,
+                read_only: true,
+            })
+        }
+        fn read_blocks(
+            &mut self,
+            _index: DeviceIndex,
+            lba: u64,
+            count: u32,
+            buffer: &mut [u8],
+        ) -> Result<(), Error> {
+            let unit = self.block_size as usize;
+            let at = (lba as usize).checked_mul(unit).ok_or(Error::InvalidArgument)?;
+            let len = (count as usize) * unit;
+            let src = self.bytes.get(at..at + len).ok_or(Error::InvalidArgument)?;
+            buffer
+                .get_mut(..len)
+                .ok_or(Error::InvalidArgument)?
+                .copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_real_iso_yields_the_kernel_through_the_whole_media_path() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
+        let Ok(bytes) = std::fs::read(path) else {
+            std::eprintln!("跳过：真实 ISO 不存在");
+            return;
+        };
+        let mut disk = FakeDisk { bytes, block_size: 512 };
+        // PVD 在偏移 32768，头缓冲要覆盖它（17 个 2048 逻辑块）。
+        let mut head = std::vec![0u8; 17 * 2048];
+        let mut out = std::vec![0u8; 24_619_400];
+        let len = load_kernel_from_device(&mut disk, DeviceIndex(0), &mut head, &mut out)
+            .expect("整条介质路径应成功");
+        assert_eq!(len, 24_619_400);
+        assert_eq!(&out[..4], b"\x7fELF");
+        // 与直接按 extent 33 取到的字节交叉核对。
+        let at = 33 * 2048;
+        assert_eq!(&out[..64], &disk.bytes[at..at + 64]);
+    }
+
+    #[test]
+    fn a_device_that_is_not_iso_is_reported_as_such() {
+        let mut disk = FakeDisk { bytes: std::vec![0u8; 512 * 4096], block_size: 512 };
+        let mut head = std::vec![0u8; 17 * 2048];
+        let mut out = std::vec![0u8; 4096];
+        let result = load_kernel_from_device(&mut disk, DeviceIndex(0), &mut head, &mut out);
+        assert!(matches!(result, Err(MediaError::Iso(_))), "非 ISO 必须如实报错");
     }
 }
