@@ -54,3 +54,5 @@ pub mod file_io;
 pub mod volume;
 
 pub mod handle_table;
+
+pub mod pixel_format;
