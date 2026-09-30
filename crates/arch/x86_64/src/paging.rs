@@ -95,7 +95,12 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
         len: u64,
         flags: PageFlags,
     ) -> Result<(), MapError> {
-        validate_range(virt, phys, len, LARGE_ALIGN)?;
+        // 两步校验：先用最小粒度（4 KiB）判“参数是否合法”，
+        // 再判“本实现能不能做”（2 MiB），两者错误语义不同。
+        validate_range(virt, phys, len, Alignment::PAGE)?;
+        if !virt.is_aligned_to(LARGE_ALIGN) || !phys.is_aligned_to(LARGE_ALIGN) || len % LARGE_PAGE_SIZE != 0 {
+            return Err(MapError::UnsupportedGranularity);
+        }
         let pages = pages_for(len, LARGE_PAGE_SIZE).ok_or(MapError::Overflow)?;
         let mut pte_flags = PTE_PRESENT;
         if flags.is_writable() {
@@ -213,10 +218,28 @@ mod tests {
         let mut pt = X86PageTable::new(root, dm, alloc);
         let a = LARGE_PAGE_SIZE;
         assert_eq!(pt.map_range(VirtAddr::new(0), PhysAddr::new(0), 0, PageFlags::present()), Err(MapError::Empty));
-        assert_eq!(pt.map_range(VirtAddr::new(0x1000), PhysAddr::new(0), a, PageFlags::present()), Err(MapError::MisalignedVirt));
-        assert_eq!(pt.map_range(VirtAddr::new(0), PhysAddr::new(0x1000), a, PageFlags::present()), Err(MapError::MisalignedPhys));
-        assert_eq!(pt.map_range(VirtAddr::new(0), PhysAddr::new(0), a - 0x1000, PageFlags::present()), Err(MapError::MisalignedLength));
+        assert_eq!(pt.map_range(VirtAddr::new(0x1001), PhysAddr::new(0), a, PageFlags::present()), Err(MapError::MisalignedVirt));
+        assert_eq!(pt.map_range(VirtAddr::new(0), PhysAddr::new(0x1001), a, PageFlags::present()), Err(MapError::MisalignedPhys));
+        assert_eq!(pt.map_range(VirtAddr::new(0), PhysAddr::new(0), a - 0x1000, PageFlags::present()), Err(MapError::UnsupportedGranularity));
         assert_eq!(pt.allocator.allocated(), 1, "参数非法时只应有根表帧");
+    }
+
+
+    #[test]
+    fn reports_unsupported_granularity_separately_from_bad_arguments() {
+        let (mut alloc, dm) = harness(16);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        // 4 KiB 对齐但不是 2 MiB 对齐：参数合法，实现不支持该粒度。
+        assert_eq!(
+            pt.map_range(VirtAddr::new(0x1000), PhysAddr::new(0x2000_0000), 0x1000, PageFlags::present()),
+            Err(MapError::UnsupportedGranularity)
+        );
+        // 真正未对齐：仍应报参数错误。
+        assert_eq!(
+            pt.map_range(VirtAddr::new(0x1001), PhysAddr::new(0x2000_0000), 0x1000, PageFlags::present()),
+            Err(MapError::MisalignedVirt)
+        );
     }
 
     #[test]

@@ -80,6 +80,24 @@ pub enum MapError {
     OutOfMemory,
     /// 页表帧不在直接映射内，无法访问。
     TableNotAccessible,
+    /// 参数合法，但实现不支持该页粒度。
+    UnsupportedGranularity,
+}
+
+impl core::fmt::Display for MapError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let text = match self {
+            Self::Empty => "区间长度为零",
+            Self::MisalignedVirt => "虚拟地址未对齐",
+            Self::MisalignedPhys => "物理地址未对齐",
+            Self::MisalignedLength => "长度不是对齐量的整数倍",
+            Self::Overflow => "区间端点计算溢出",
+            Self::OutOfMemory => "页帧分配耗尽",
+            Self::TableNotAccessible => "页表帧不在直接映射内",
+            Self::UnsupportedGranularity => "实现不支持该页粒度",
+        };
+        f.write_str(text)
+    }
 }
 
 /// 覆盖 `len` 字节所需的页数（向上取整）。
@@ -162,6 +180,24 @@ mod tests {
         assert_eq!(pages_for(0x2000, 0x1000), Some(2));
         assert_eq!(pages_for(0x1001, 0x1000), Some(2), "非整倍数向上取整");
         assert_eq!(pages_for(u64::MAX, 0x1000), None, "页数计算溢出应报错");
+    }
+
+
+    #[test]
+    fn map_error_has_human_readable_display() {
+        let cases = [
+            (MapError::Empty, "区间长度为零"),
+            (MapError::MisalignedVirt, "虚拟地址未对齐"),
+            (MapError::MisalignedPhys, "物理地址未对齐"),
+            (MapError::MisalignedLength, "长度不是对齐量的整数倍"),
+            (MapError::Overflow, "区间端点计算溢出"),
+            (MapError::OutOfMemory, "页帧分配耗尽"),
+            (MapError::TableNotAccessible, "页表帧不在直接映射内"),
+            (MapError::UnsupportedGranularity, "实现不支持该页粒度"),
+        ];
+        for (err, want) in cases {
+            assert_eq!(std::format!("{err}"), want);
+        }
     }
 
     #[test]
