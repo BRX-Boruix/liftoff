@@ -4,6 +4,7 @@
 //! 平台与固件实现的**选择**来自门面（`crate::PlatformImpl`、`firmware_current::current`），
 //! 本模块不自己挑实现。
 
+use arch::paging::PageTable;
 use loader::elf::{ElfError, ProgramHeader, load_segments, parse_elf_header, parse_load_segments};
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
@@ -868,6 +869,8 @@ pub enum KernelPlanError {
     BufferTooSmall,
     /// 段的目标虚拟区间没有任何映射覆盖。
     NotMapped,
+    /// 把规划写入页表失败。
+    MapFailed,
 }
 
 /// 解析内核映像，得出入口与装载段。
@@ -1119,6 +1122,171 @@ mod copy_segments_tests {
             copy_kernel_segments(&image, &segments[..1], &plan, &mut memory),
             Err(KernelPlanError::NotMapped)
             , "没有映射就必须拒绝，不能静默丢弃"
+        );
+    }
+}
+
+/// 装载内核并激活页表（**不跳转**）：写规划 → 拷段 → 激活。
+///
+/// 顺序是硬要求：**先写表、再拷段、最后才激活**；任一步失败都**不激活** ——
+/// 带着残缺的地址空间激活，等于跳过去就故障。
+///
+/// 入口由调用方从 `plan_kernel` 取（`e_entry` 无法从段反推），本函数只负责装载与激活。
+///
+/// # Safety
+///
+/// 与 [`PageTable::activate`] 相同：调用方必须保证新页表仍映射当前正在执行的代码与栈。
+pub unsafe fn load_and_activate<P: PageTable>(
+    table: &mut P,
+    plan: &[Mapping],
+    image: &[u8],
+    segments: &[ProgramHeader],
+    entry: u64,
+    memory: &mut [u8],
+) -> Result<(), KernelPlanError> {
+    // 入口必须落在某个装载段内 —— 否则跳过去就是执行未装载的内存。
+    let mut inside = false;
+    for segment in segments {
+        let end = segment
+            .p_vaddr
+            .checked_add(segment.p_memsz)
+            .ok_or(KernelPlanError::Overflow)?;
+        if entry >= segment.p_vaddr && entry < end {
+            inside = true;
+            break;
+        }
+    }
+    if !inside {
+        return Err(KernelPlanError::EntryOutsideSegments);
+    }
+    mm::apply::apply(table, plan).map_err(|_| KernelPlanError::MapFailed)?;
+    copy_kernel_segments(image, segments, plan, memory)?;
+    // SAFETY: 由调用方保证（见函数文档与 `PageTable::activate` 的 SAFETY 契约）。
+    unsafe { table.activate() };
+    Ok(())
+}
+
+#[cfg(test)]
+mod load_and_activate_tests {
+    use super::{KernelPlanError, load_and_activate, plan_kernel};
+    use arch::addr::{PhysAddr, VirtAddr};
+    use arch::paging::{MapError, PageFlags, PageTable};
+    use loader::elf::ProgramHeader;
+    use mm::plan::Mapping;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static ACTIVATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static ACTIVATE_FAIL: AtomicUsize = AtomicUsize::new(0);
+
+    /// 记录型假页表（成功路径）。
+    struct RecordingTable;
+    impl PageTable for RecordingTable {
+        fn map_range(
+            &mut self,
+            _virt: VirtAddr,
+            _phys: PhysAddr,
+            _len: u64,
+            _flags: PageFlags,
+        ) -> Result<(), MapError> {
+            MAP_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        unsafe fn activate(&self) {
+            ACTIVATE_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 记录型假页表（失败路径专用，计数分开以免两个测试互相干扰）。
+    struct FailTable;
+    impl PageTable for FailTable {
+        fn map_range(
+            &mut self,
+            _virt: VirtAddr,
+            _phys: PhysAddr,
+            _len: u64,
+            _flags: PageFlags,
+        ) -> Result<(), MapError> {
+            Ok(())
+        }
+        unsafe fn activate(&self) {
+            ACTIVATE_FAIL.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn real_kernel() -> Option<std::vec::Vec<u8>> {
+        let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
+        let bytes = std::fs::read(iso).ok()?;
+        bytes.get(33 * 2048..33 * 2048 + 24_619_400).map(|s| s.to_vec())
+    }
+
+    fn mapping(virt: u64, phys: u64, len: u64) -> Mapping {
+        Mapping {
+            virt: VirtAddr::new(virt),
+            phys: PhysAddr::new(phys),
+            len,
+            flags: PageFlags::present(),
+        }
+    }
+
+    #[test]
+    fn a_complete_load_maps_every_mapping_copies_the_segment_and_activates_once() {
+        let Some(image) = real_kernel() else {
+            std::eprintln!("跳过：真实 ISO 不存在");
+            return;
+        };
+        let mut segments = [ProgramHeader::EMPTY; 8];
+        let plan_info = plan_kernel(&image, &mut segments).expect("可规划");
+        let plan = [
+            mapping(0xffff_ffff_8000_0000, 0x10_0000, 0x22_3cb0),
+            mapping(0xffff_ffff_8022_4000, 0x40_0000, 0x4d_5780),
+            mapping(0xffff_ffff_806f_a000, 0x90_0000, 0x2b_ea88),
+        ];
+        let mut memory = std::vec![0u8; 0x100_0000];
+        let mut table = RecordingTable;
+        MAP_CALLS.store(0, Ordering::SeqCst);
+        ACTIVATE_CALLS.store(0, Ordering::SeqCst);
+        let result = unsafe {
+            load_and_activate(
+                &mut table,
+                &plan,
+                &image,
+                &segments[..plan_info.segment_count],
+                plan_info.entry,
+                &mut memory,
+            )
+        };
+        assert!(result.is_ok(), "装载并激活应成功");
+        assert_eq!(plan_info.entry, 0xffff_ffff_8003_78d0, "入口来自 e_entry（实测值）");
+        assert_eq!(MAP_CALLS.load(Ordering::SeqCst), 3, "规划应逐条写入页表");
+        assert_eq!(ACTIVATE_CALLS.load(Ordering::SeqCst), 1, "成功后激活一次");
+        assert_eq!(
+            &memory[0x10_0000..0x10_0010],
+            &image[0x1000..0x1010],
+            "段字节必须落到规划给的物理位置"
+        );
+    }
+
+    #[test]
+    fn a_copy_failure_never_activates_the_table() {
+        let mut segments = [ProgramHeader::EMPTY; 2];
+        segments[0].p_offset = 0;
+        segments[0].p_vaddr = 0xffff_ffff_8000_0000;
+        segments[0].p_filesz = 16;
+        segments[0].p_memsz = 16;
+        let image = std::vec![7u8; 64];
+        let plan: [Mapping; 0] = [];
+        let mut memory = std::vec![0u8; 4096];
+        let mut table = FailTable;
+        ACTIVATE_FAIL.store(0, Ordering::SeqCst);
+        let result = unsafe {
+            load_and_activate(&mut table, &plan, &image, &segments[..1], 0xffff_ffff_8000_0000, &mut memory)
+        };
+        assert_eq!(result, Err(KernelPlanError::NotMapped));
+        assert_eq!(
+            ACTIVATE_FAIL.load(Ordering::SeqCst),
+            0,
+            "装载失败绝不能激活：带着残缺地址空间跳过去就是故障"
         );
     }
 }
