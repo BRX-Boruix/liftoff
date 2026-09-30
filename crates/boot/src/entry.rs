@@ -167,9 +167,20 @@ fn stage_text(stage: BringUpError) -> &'static [u8] {
         BringUpError::MemoryMapRanges(_) => b"[liftoff] stage: memmap ranges\n",
         BringUpError::RootFrame => b"[liftoff] stage: root frame\n",
         BringUpError::DirectMap => b"[liftoff] stage: direct map\n",
-        BringUpError::Load(_) => b"[liftoff] stage: load+activate\n",
+        BringUpError::Apply(_) => b"[liftoff] stage: apply plan\n",
+        BringUpError::Copy(_) => b"[liftoff] stage: copy segments\n",
         BringUpError::Handoff(_) => b"[liftoff] stage: handoff\n",
     }
+}
+
+/// 只激活页表（不返回）。
+///
+/// # Safety
+///
+/// 调用方必须保证新页表仍映射当前正在执行的代码与栈。
+unsafe fn activate_only<P: PageTable>(table: &mut P) {
+    // SAFETY: 由调用方保证（见函数文档）。
+    unsafe { table.activate() };
 }
 
 /// 把可用区间**向下对齐**到 `align`，并把长度补到整页（含尾部）。
@@ -1346,8 +1357,10 @@ pub enum BringUpError {
     RootFrame,
     /// 建 HHDM 直接映射失败。
     DirectMap,
-    /// 装载并激活失败。
-    Load(KernelPlanError),
+    /// 把规划写入页表失败。
+    Apply(arch::paging::MapError),
+    /// 拷贝段失败。
+    Copy(KernelPlanError),
     /// 交接编排失败。
     Handoff(HandoffError),
 }
@@ -1425,7 +1438,11 @@ pub unsafe fn bring_up(
         .filter_map(|range| range.end())
         .max()
         .ok_or(BringUpError::DirectMap)?;
-    let direct = DirectMap::new(HHDM_OFFSET, top).ok_or(BringUpError::DirectMap)?;
+    // `DirectMap` 是 `X86PageTable` **写页表项**时用来够表帧的映射，而写表发生在
+    // **激活之前** —— 那时固件页表里只有恒等映射，没有 HHDM。真实运行中这里正是
+    // 一次 #PF：CR2 落在 HHDM、P:0。所以这里用 **offset 0（恒等）**：它在激活前后都成立
+    // （我们的规划本身也保留恒等映射）。
+    let direct = DirectMap::new(0, top).ok_or(BringUpError::DirectMap)?;
     let mut page_table = X86PageTable::new(root, direct, frames);
     // 7) 拷段到物理目标（真机：直接写物理地址，UEFI 阶段恒等映射有效）。
     let mut write = |phys: u64, bytes: &[u8]| -> Result<(), ElfError> {
@@ -1433,18 +1450,16 @@ pub unsafe fn bring_up(
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys as *mut u8, bytes.len()) };
         Ok(())
     };
+    mm::apply::apply(&mut page_table, &c.plan[..plan_count]).map_err(BringUpError::Apply)?;
+    copy_kernel_segments(
+        &c.kernel_out[..len],
+        &c.segments[..info.segment_count],
+        &c.plan[..plan_count],
+        &mut write,
+    )
+    .map_err(BringUpError::Copy)?;
     // SAFETY: 由调用方保证（见函数文档）。
-    unsafe {
-        load_and_activate(
-            &mut page_table,
-            &c.plan[..plan_count],
-            &c.kernel_out[..len],
-            &c.segments[..info.segment_count],
-            info.entry,
-            &mut write,
-        )
-    }
-    .map_err(BringUpError::Load)?;
+    unsafe { activate_only(&mut page_table) };
     let _ = stays;
     // 8) 交接：填响应 → 检查 → 取键退出 → 跳转。
     let h = Handoff {
