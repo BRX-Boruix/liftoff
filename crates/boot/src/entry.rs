@@ -15,8 +15,13 @@ use mm::plan::{Mapping, PlanError};
 use mm::usable::UsableRange;
 use mm::takeover::{MustStay, TakeoverError};
 use firmware::error::Error;
+use arch::hhdm::DirectMap;
+use arch::paging::FrameAllocator;
+use current::X86PageTable;
+use firmware::block::DeviceIndex;
 use firmware_current::current::{
-    ExitBootServices, Handle, SystemTable, UefiBootServices, UefiMemoryMapSource, boot_services_of,
+    BootServicesTable, EfiFrameAllocator, ExitBootServices, Handle, SystemTable, UefiBlockDevices,
+    UefiBootServices, UefiMemoryMapSource, boot_services_of,
 };
 
 /// 入口第一步的结果。
@@ -1119,6 +1124,154 @@ pub fn build_plan(
         .map_err(PlanBuildError::Plan)?;
     Ok(total)
 }
+
+/// 交接所需的**全部调用方缓冲**（引导器不做隐藏分配：每个缓冲都由调用方给）。
+pub struct BringUp<'a, 'b> {
+    /// 内核映像读出目标（约 25 MB，来自固件页）。
+    pub kernel_out: &'a mut [u8],
+    /// 分区表/PVD 头缓冲（≥ 34 KiB）。
+    pub head: &'a mut [u8],
+    /// 页表规划输出。
+    pub plan: &'a mut [Mapping],
+    /// 装载段输出。
+    pub segments: &'a mut [ProgramHeader],
+    /// 可用物理区间输出（HHDM 与恒等映射的来源）。
+    pub usable: &'a mut [UsableRange],
+    /// 内存映射来源（退出前要用它记录的键）。
+    pub memory_map: &'a mut UefiMemoryMapSource<'b>,
+    /// 内存映射缓冲。
+    pub map_buffer: &'a mut [MemoryEntry],
+    /// 扫描命中缓冲。
+    pub hits: &'a mut [RequestHit],
+    /// 必须保持映射的区间输出。
+    pub must_stay: &'a mut [MustStay],
+    /// 我们准备的响应结构。
+    pub responses: &'a mut Responses,
+    /// 键的存放槽。
+    pub map_key: &'a mut Option<usize>,
+    /// 内核段拷入的**物理目标基址**（须按大页对齐，由调用方选定）。
+    pub destination: u64,
+}
+
+/// 交接失败原因（保留环节）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BringUpError {
+    /// 发现块设备失败。
+    Discover(Error),
+    /// 介质路径失败。
+    Media(crate::media::MediaError),
+    /// 内核 ELF 规划失败。
+    Kernel(KernelPlanError),
+    /// 页表规划失败。
+    Plan(PlanBuildError),
+    /// 内存映射不可用。
+    MemoryMap(Error),
+    /// 装载并激活失败。
+    Load(KernelPlanError),
+    /// 交接编排失败。
+    Handoff(HandoffError),
+}
+
+/// 真实入口的交接（**固件侧**）：发现设备 → 读内核 → 规划 → 拷段 → 写表 → 激活 → 交接。
+///
+/// 本函数只做编排：所有判断都在已测过的纯函数里。它是**唯一只能在真机上验**的部分。
+///
+/// # Safety
+///
+/// 引导阶段单线程调用一次；激活页表后不再返回。
+pub unsafe fn bring_up(
+    table: &BootServicesTable,
+    image_handle: Handle,
+    c: BringUp<'_, '_>,
+    enter: impl FnOnce(u64) -> !,
+) -> Result<(), BringUpError> {
+    // 1) 发现块设备（存储由类型自己持有，入口不需要认识 BlockIo）。
+    // SAFETY: 由调用方保证引导阶段单线程、只调一次。
+    let mut devices =
+        unsafe { UefiBlockDevices::from_boot_services(table.locate_handle, table.handle_protocol) }
+            .map_err(BringUpError::Discover)?;
+    // 2) 从介质读出内核映像。
+    let len = crate::media::load_kernel_from_device(
+        &mut devices,
+        DeviceIndex(0),
+        c.head,
+        c.kernel_out,
+    )
+    .map_err(BringUpError::Media)?;
+    // 3) 规划内核装载（入口、段、必须保持映射的区间）。
+    let info = plan_kernel(&c.kernel_out[..len], c.segments).map_err(BringUpError::Kernel)?;
+    let stays = must_stay_from_segments(&c.segments[..info.segment_count], c.must_stay)
+        .map_err(BringUpError::Kernel)?;
+    // 4) 可用物理区间（HHDM 与恒等映射都从这里来）。
+    let map = c.memory_map.memory_map(c.map_buffer).map_err(BringUpError::MemoryMap)?;
+    let usable_count = mm::usable::usable_ranges(map, c.usable).map_err(BringUpError::MemoryMap)?;
+    // 5) 页表规划：内核高区 + HHDM + 恒等。
+    let kernel_virt = c.segments[..info.segment_count]
+        .iter()
+        .map(|s| s.p_vaddr)
+        .min()
+        .ok_or(BringUpError::Kernel(KernelPlanError::EntryOutsideSegments))?;
+    let kernel_end = c.segments[..info.segment_count]
+        .iter()
+        .map(|s| s.p_vaddr + s.p_memsz)
+        .max()
+        .ok_or(BringUpError::Kernel(KernelPlanError::Overflow))?;
+    let kernel_len = kernel_end - kernel_virt;
+    let plan_count = build_plan(
+        c.destination,
+        kernel_virt,
+        kernel_len,
+        &c.usable[..usable_count],
+        &c.usable[..usable_count],
+        c.plan,
+        LARGE_PAGE,
+    )
+    .map_err(BringUpError::Plan)?;
+    // 6) 页表：根帧 + HHDM 直接映射 + 固件帧来源。
+    let mut frames = EfiFrameAllocator::new(table.allocate_pages);
+    let root = frames.allocate_zeroed().ok_or(BringUpError::MemoryMap(Error::Io))?;
+    let direct = DirectMap::new(HHDM_OFFSET, u64::MAX).ok_or(BringUpError::MemoryMap(Error::Io))?;
+    let mut page_table = X86PageTable::new(root, direct, frames);
+    // 7) 拷段到物理目标（真机：直接写物理地址，UEFI 阶段恒等映射有效）。
+    let mut write = |phys: u64, bytes: &[u8]| -> Result<(), ElfError> {
+        // SAFETY: 目标是我们自己选定的物理内存；引导阶段该地址可直接访问。
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys as *mut u8, bytes.len()) };
+        Ok(())
+    };
+    // SAFETY: 由调用方保证（见函数文档）。
+    unsafe {
+        load_and_activate(
+            &mut page_table,
+            &c.plan[..plan_count],
+            &c.kernel_out[..len],
+            &c.segments[..info.segment_count],
+            info.entry,
+            &mut write,
+        )
+    }
+    .map_err(BringUpError::Load)?;
+    let _ = stays;
+    // 8) 交接：填响应 → 检查 → 取键退出 → 跳转。
+    let h = Handoff {
+        image: &mut c.kernel_out[..len],
+        hits: c.hits,
+        responses: c.responses,
+        plan: &c.plan[..plan_count],
+        must_stay: &c.must_stay[..stays],
+        entry: info.entry,
+        source: c.memory_map,
+        map_buffer: c.map_buffer,
+        exit: table.exit_boot_services,
+        image_handle,
+        map_key: c.map_key,
+    };
+    // SAFETY: 由调用方保证（见函数文档）。
+    unsafe { enter_kernel(h, enter) }.map_err(BringUpError::Handoff)?;
+    Ok(())
+}
+
+/// 页表大页粒度（与 `X86PageTable` 的实现一致）。
+pub const LARGE_PAGE: u64 = 2 * 1024 * 1024;
 
 #[cfg(test)]
 mod build_plan_tests {
