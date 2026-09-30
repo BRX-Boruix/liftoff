@@ -1,6 +1,6 @@
 //! Limine 协议层：请求扫描与响应填充。
 //!
-//! 边界：本 crate 只负责协议本身（请求/响应结构与填充规则），不含引导流程、分页或固件访问。
+//! 边界：本 crate 只负责协议本身（请求/响应结构、扫描与填充规则），不含引导流程、分页或固件访问。
 //! 下文每个结构与常量都对照 brxLimine/limine-protocol/include/limine.h 核实，不凭记忆书写。
 
 #![no_std]
@@ -13,10 +13,11 @@ pub mod bootloader_info;
 pub mod entry_point;
 pub mod executable_address;
 pub mod executable_file;
-pub mod module;
 pub mod file;
 pub mod firmware_type;
 pub mod framebuffer;
 pub mod memmap;
+pub mod module;
 pub mod mp;
 pub mod rsdp;
+pub mod scan;
