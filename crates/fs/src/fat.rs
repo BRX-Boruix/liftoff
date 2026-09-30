@@ -336,6 +336,152 @@ pub const fn lfn_checksum(short_name: &[u8; 11]) -> u8 {
     sum
 }
 
+/// 带长名的目录项。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EntryWithName {
+    /// 8.3 项本体。
+    pub entry: Entry,
+    /// 长名（定长存放；有效范围是前 `long_name_len` 字节）。
+    pub long_name: [u8; 255],
+    /// 长名长度；0 表示没有可用长名。
+    pub long_name_len: u8,
+}
+
+impl EntryWithName {
+    /// 占位值。
+    pub const EMPTY: Self = Self {
+        entry: Entry::EMPTY,
+        long_name: [0; 255],
+        long_name_len: 0,
+    };
+
+    /// 长名切片。
+    pub fn long_name(&self) -> &[u8] {
+        &self.long_name[..self.long_name_len as usize]
+    }
+}
+
+/// 收集中的 LFN 状态。
+#[derive(Clone, Copy)]
+struct LfnState {
+    text: [u8; 255],
+    len: usize,
+    expected: u8,
+    checksum: u8,
+    active: bool,
+}
+
+impl LfnState {
+    const EMPTY: Self = Self { text: [0; 255], len: 0, expected: 0, checksum: 0, active: false };
+}
+
+/// 把一个 LFN 片段前插到收集缓冲（片段在盘上**逆序**存放，故前插即得正序）。
+fn lfn_prepend(state: &mut LfnState, item: &[u8]) {
+    // 每个片段有 13 个 UTF-16 码元，分别在 @1、@14、@28；取**低字节**。
+    // 如实标注：只支持 Latin-1 范围，非 ASCII 字符会失真（不假装支持完整 Unicode）。
+    let mut piece = [0u8; 13];
+    let mut piece_len = 0usize;
+    for slot in 0..13 {
+        let at = match slot {
+            0..=4 => 1 + slot * 2,
+            5..=10 => 14 + (slot - 5) * 2,
+            _ => 28 + (slot - 11) * 2,
+        };
+        let low = item.get(at).copied().unwrap_or(0);
+        let high = item.get(at + 1).copied().unwrap_or(0);
+        if low == 0 && high == 0 {
+            break;
+        }
+        if piece_len == piece.len() {
+            break;
+        }
+        piece[piece_len] = low;
+        piece_len += 1;
+    }
+    let total = state.len.checked_add(piece_len).unwrap_or(usize::MAX);
+    if total > state.text.len() {
+        state.active = false;
+        return;
+    }
+    // 先把已有内容整体右移，再把本片段放到最前面。
+    let mut index = state.len;
+    while index > 0 {
+        state.text[index - 1 + piece_len] = state.text[index - 1];
+        index -= 1;
+    }
+    state.text[..piece_len].copy_from_slice(&piece[..piece_len]);
+    state.len = total;
+}
+
+/// 遍历目录并拼装长名：**校验和必须匹配**，片段**必须连续**，否则丢弃长名。
+pub fn parse_directory_with_lfn(
+    sector: &[u8],
+    out: &mut [EntryWithName],
+) -> Result<usize, FatError> {
+    if sector.len() < 32 {
+        return Err(FatError::ShortSector);
+    }
+    let mut count = 0;
+    let mut at = 0usize;
+    let mut state = LfnState::EMPTY;
+    while at + 32 <= sector.len() {
+        let item = sector.get(at..at + 32).ok_or(FatError::ShortSector)?;
+        let first = item[0];
+        if first == 0x00 {
+            break;
+        }
+        if first == 0xE5 {
+            state = LfnState::EMPTY;
+            at += 32;
+            continue;
+        }
+        let attributes = item[11];
+        if attributes == 0x0F {
+            let sequence = item[0];
+            let checksum = item[13];
+            if !state.active {
+                // 首个片段：必须带 bit 6（表示“最后一项”），低 5 位是总段数。
+                if sequence & 0x40 == 0 || sequence & 0x3F == 0 {
+                    state = LfnState::EMPTY;
+                    at += 32;
+                    continue;
+                }
+                state = LfnState { expected: sequence & 0x3F, checksum, active: true, ..LfnState::EMPTY };
+            }
+            if checksum != state.checksum || sequence & 0x3F != state.expected {
+                state.active = false;
+                at += 32;
+                continue;
+            }
+            lfn_prepend(&mut state, item);
+            state.expected = state.expected.saturating_sub(1);
+            at += 32;
+            continue;
+        }
+        if count == out.len() {
+            return Err(FatError::BufferTooSmall);
+        }
+        let mut entry = Entry::EMPTY;
+        entry.name.copy_from_slice(&item[..11]);
+        entry.attributes = attributes;
+        let low = u16::from_le_bytes([item[26], item[27]]) as u32;
+        let high = u16::from_le_bytes([item[20], item[21]]) as u32;
+        entry.first_cluster = (high << 16) | low;
+        entry.size = u32::from_le_bytes([item[28], item[29], item[30], item[31]]);
+        let mut result = EntryWithName { entry, long_name: [0; 255], long_name_len: 0 };
+        // 只有“片段连续（expected 归零）”且“校验和与短名一致”才采用长名。
+        if state.active && state.expected == 0 && state.checksum == lfn_checksum(&entry.name) {
+            result.long_name[..state.len].copy_from_slice(&state.text[..state.len]);
+            result.long_name_len = state.len as u8;
+        }
+        state = LfnState::EMPTY;
+        out[count] = result;
+        count += 1;
+        at += 32;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FAT_SIGNATURE_OFFSET, FatError, FatKind, parse_bpb};
@@ -673,5 +819,102 @@ mod lfn_checksum_tests {
     fn the_checksum_is_deterministic() {
         let name = *b"HELLO   TXT";
         assert_eq!(lfn_checksum(&name), lfn_checksum(&name));
+    }
+}
+
+#[cfg(test)]
+mod lfn_tests {
+    use super::{FatError, lfn_checksum, parse_directory_with_lfn};
+    
+
+    const SECTOR: usize = 512;
+
+    /// 写一个 LFN 片段项。
+    fn put_lfn(sector: &mut [u8], at: usize, sequence: u8, checksum: u8, text: &[u8]) {
+        sector[at] = sequence;
+        sector[at + 11] = 0x0F;
+        sector[at + 13] = checksum;
+        for (index, byte) in text.iter().enumerate() {
+            let offset = match index {
+                0..=4 => at + 1 + index * 2,
+                5..=10 => at + 14 + (index - 5) * 2,
+                _ => at + 28 + (index - 11) * 2,
+            };
+            sector[offset] = *byte;
+        }
+    }
+
+    /// 写一个 8.3 项。
+    fn put_short(sector: &mut [u8], at: usize, name: &[u8; 11], cluster: u32) {
+        sector[at..at + 11].copy_from_slice(name);
+        sector[at + 11] = 0x20;
+        sector[at + 26..at + 28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    }
+
+    fn empty_out() -> [super::EntryWithName; 8] {
+        [super::EntryWithName::EMPTY; 8]
+    }
+
+    #[test]
+    fn two_fragments_are_assembled_into_the_long_name() {
+        let short = *b"LONGFI~1TXT";
+        let checksum = lfn_checksum(&short);
+        let mut sector = std::vec![0u8; SECTOR];
+        // 片段 2（最后一项，bit 6 置位）在前，片段 1 在后 —— 盘上逆序存放。
+        // 片段 1 "LongFil" + 片段 2 "eName.TXT" = "LongFileName.TXT"（7+9=16 字符）。
+        put_lfn(&mut sector, 0, 0x42, checksum, b"eName.TXT");
+        put_lfn(&mut sector, 32, 0x01, checksum, b"LongFil");
+        put_short(&mut sector, 64, &short, 9);
+        let mut out = empty_out();
+        let count = parse_directory_with_lfn(&sector, &mut out).expect("解析成功");
+        assert_eq!(count, 1, "LFN 片段本身不是条目");
+        assert_eq!(out[0].entry.first_cluster, 9);
+        assert_eq!(&out[0].long_name[..out[0].long_name_len as usize], b"LongFileName.TXT");
+    }
+
+    #[test]
+    fn a_checksum_mismatch_discards_the_long_name() {
+        let short = *b"LONGFI~1TXT";
+        let wrong = lfn_checksum(&short) ^ 0xFF;
+        let mut sector = std::vec![0u8; SECTOR];
+        put_lfn(&mut sector, 0, 0x41, wrong, b"BogusName");
+        put_short(&mut sector, 32, &short, 9);
+        let mut out = empty_out();
+        let count = parse_directory_with_lfn(&sector, &mut out).expect("解析成功");
+        assert_eq!(count, 1);
+        assert_eq!(out[0].long_name_len, 0, "校验和不符必须丢弃长名");
+        assert_eq!(&out[0].entry.name[..], b"LONGFI~1TXT");
+    }
+
+    #[test]
+    fn a_missing_sequence_discards_the_long_name() {
+        let short = *b"LONGFI~1TXT";
+        let checksum = lfn_checksum(&short);
+        let mut sector = std::vec![0u8; SECTOR];
+        // 只有序号 2（应含 bit6）而缺序号 1：不连续 → 丢弃。
+        put_lfn(&mut sector, 0, 0x42, checksum, b"ME.TXT");
+        put_short(&mut sector, 32, &short, 9);
+        let mut out = empty_out();
+        let count = parse_directory_with_lfn(&sector, &mut out).expect("解析成功");
+        assert_eq!(count, 1);
+        assert_eq!(out[0].long_name_len, 0, "片段不连续必须丢弃");
+    }
+
+    #[test]
+    fn an_entry_without_lfn_has_an_empty_long_name() {
+        let mut sector = std::vec![0u8; SECTOR];
+        put_short(&mut sector, 0, b"PLAIN   TXT", 3);
+        let mut out = empty_out();
+        let count = parse_directory_with_lfn(&sector, &mut out).expect("解析成功");
+        assert_eq!(count, 1);
+        assert_eq!(out[0].long_name_len, 0);
+        assert_eq!(&out[0].entry.name[..], b"PLAIN   TXT");
+    }
+
+    #[test]
+    fn a_short_sector_is_rejected() {
+        let sector = std::vec![0u8; 16];
+        let mut out = empty_out();
+        assert_eq!(parse_directory_with_lfn(&sector, &mut out), Err(FatError::ShortSector));
     }
 }
