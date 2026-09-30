@@ -9,6 +9,34 @@
 /// 为单位，引导器内部按页管理内存时以 4 KiB 为最小单位。
 pub const PAGE_SIZE: u64 = 4096;
 
+/// 对齐量（字节）。
+///
+/// 不变量：取值恒为 2 的幂且非零——只能经 [`Alignment::new_power_of_two`] 构造，
+/// 因此对齐运算不会收到非法对齐量（严格模式：宁可报错，不靠文档前置条件）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Alignment(u64);
+
+impl Alignment {
+    /// 基础页对齐量（4 KiB），供页级操作使用。
+    pub const PAGE: Alignment = Alignment(PAGE_SIZE);
+
+    /// 由 2 的幂构造；`0` 与非 2 的幂返回 `None`。
+    #[inline]
+    pub const fn new_power_of_two(bytes: u64) -> Option<Self> {
+        if bytes != 0 && bytes.is_power_of_two() {
+            Some(Self(bytes))
+        } else {
+            None
+        }
+    }
+
+    /// 对齐量（字节）。
+    #[inline]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 macro_rules! byte_address {
     ($name:ident, $doc:expr) => {
         #[doc = $doc]
@@ -47,21 +75,21 @@ macro_rules! byte_address {
 
             /// 是否按 `align` 对齐。`align` 必须为 2 的幂（调用方保证）。
             #[inline]
-            pub const fn is_aligned_to(self, align: u64) -> bool {
-                self.0 % align == 0
+            pub const fn is_aligned_to(self, align: Alignment) -> bool {
+                self.0 % align.0 == 0
             }
 
             /// 向下对齐。`align` 必须为 2 的幂（调用方保证）。
             #[inline]
-            pub const fn align_down(self, align: u64) -> Self {
-                Self(self.0 & !(align - 1))
+            pub const fn align_down(self, align: Alignment) -> Self {
+                Self(self.0 & !(align.0 - 1))
             }
 
             /// 向上对齐；溢出时返回 `None`。`align` 必须为 2 的幂（调用方保证）。
             #[inline]
-            pub const fn align_up(self, align: u64) -> Option<Self> {
-                match self.0.checked_add(align - 1) {
-                    Some(sum) => Some(Self(sum & !(align - 1))),
+            pub const fn align_up(self, align: Alignment) -> Option<Self> {
+                match self.0.checked_add(align.0 - 1) {
+                    Some(sum) => Some(Self(sum & !(align.0 - 1))),
                     None => None,
                 }
             }
@@ -125,18 +153,18 @@ impl PhysFrame {
 
 #[cfg(test)]
 mod tests {
-    use super::{PhysAddr, PhysFrame, VirtAddr, PAGE_SIZE};
+    use super::{Alignment, PhysAddr, PhysFrame, VirtAddr, PAGE_SIZE};
 
     #[test]
     fn align_down_rounds_towards_zero() {
-        assert_eq!(PhysAddr::new(0x1234).align_down(PAGE_SIZE).as_u64(), 0x1000);
+        assert_eq!(PhysAddr::new(0x1234).align_down(Alignment::PAGE).as_u64(), 0x1000);
         assert_eq!(PhysAddr::new(0x1000).align_down(PAGE_SIZE).as_u64(), 0x1000);
         assert_eq!(PhysAddr::new(0).align_down(PAGE_SIZE).as_u64(), 0);
     }
 
     #[test]
     fn align_up_keeps_aligned_values_unchanged() {
-        assert_eq!(PhysAddr::new(0x1000).align_up(PAGE_SIZE).map(|a| a.as_u64()), Some(0x1000));
+        assert_eq!(PhysAddr::new(0x1000).align_up(Alignment::PAGE).map(|a| a.as_u64()), Some(0x1000));
         assert_eq!(PhysAddr::new(0x1001).align_up(PAGE_SIZE).map(|a| a.as_u64()), Some(0x2000));
         assert_eq!(PhysAddr::new(0).align_up(PAGE_SIZE).map(|a| a.as_u64()), Some(0));
     }
@@ -177,3 +205,17 @@ mod tests {
         }
     }
 }
+    #[test]
+    fn alignment_rejects_non_power_of_two_and_zero() {
+        assert_eq!(Alignment::new_power_of_two(0), None);
+        assert_eq!(Alignment::new_power_of_two(3), None);
+        assert_eq!(Alignment::new_power_of_two(4096).map(|a| a.as_u64()), Some(4096));
+        assert_eq!(Alignment::PAGE.as_u64(), PAGE_SIZE);
+    }
+
+    #[test]
+    fn align_ops_use_the_alignment_invariant() {
+        assert!(PhysAddr::new(0x2000).is_aligned_to(Alignment::PAGE));
+        assert!(!PhysAddr::new(0x2001).is_aligned_to(Alignment::PAGE));
+        assert_eq!(PhysAddr::new(0x2001).align_up(Alignment::PAGE).map(|a| a.as_u64()), Some(0x3000));
+    }}
