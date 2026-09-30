@@ -25,6 +25,10 @@ pub enum MemoryKind {
     BootloaderReclaimable = 5,
     /// 内核与模块占用。
     KernelAndModules = 6,
+    /// 帧缓冲区。
+    Framebuffer = 7,
+    /// 保留（已建映射）。
+    ReservedMapped = 8,
 }
 
 impl MemoryKind {
@@ -39,6 +43,8 @@ impl MemoryKind {
             4 => Some(Self::BadMemory),
             5 => Some(Self::BootloaderReclaimable),
             6 => Some(Self::KernelAndModules),
+            7 => Some(Self::Framebuffer),
+            8 => Some(Self::ReservedMapped),
             _ => None,
         }
     }
@@ -151,6 +157,8 @@ mod tests {
             (MemoryKind::BadMemory, 4),
             (MemoryKind::BootloaderReclaimable, 5),
             (MemoryKind::KernelAndModules, 6),
+            (MemoryKind::Framebuffer, 7),
+            (MemoryKind::ReservedMapped, 8),
         ];
         for (kind, value) in all {
             assert_eq!(kind.as_protocol(), value);
@@ -160,7 +168,7 @@ mod tests {
 
     #[test]
     fn memory_kind_rejects_unknown_protocol_values() {
-        assert_eq!(MemoryKind::from_protocol(7), None);
+        assert_eq!(MemoryKind::from_protocol(9), None);
         assert_eq!(MemoryKind::from_protocol(u32::MAX), None);
     }
 
@@ -199,7 +207,7 @@ mod tests {
         use crate::error::Error;
         let entry = MemoryEntry::from_raw(PhysAddr::new(0x1000), 0x1000, 0).expect("可用内存");
         assert_eq!(entry.kind, MemoryKind::Usable);
-        assert_eq!(MemoryEntry::from_raw(PhysAddr::new(0), 1, 7), Err(Error::Unsupported));
+        assert_eq!(MemoryEntry::from_raw(PhysAddr::new(0), 1, 9), Err(Error::Unsupported));
     }
 
     #[test]
