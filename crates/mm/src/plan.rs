@@ -40,13 +40,19 @@ pub enum PlanError {
     InvalidPageSize,
     /// 调用方给的输出缓冲太小。
     BufferTooSmall,
+    /// 虚拟地址计算溢出（绝不回绕）。
+    AddressOverflow,
 }
 
 /// 规划**恒等映射**（`virt == phys`），返回产出的映射条数。
-pub fn plan_identity(
+/// 共用规划核心：按 `large` 对齐遍历区间，虚拟地址由 `virt_of` 给出。
+///
+/// `virt_of` 返回 `None` 表示该页的虚拟地址无法表示（溢出）→ 整段报错，**不静默丢弃**。
+fn plan_with(
     ranges: &[UsableRange],
     out: &mut [Mapping],
     large: u64,
+    virt_of: impl Fn(u64) -> Option<u64>,
 ) -> Result<usize, PlanError> {
     if large == 0 {
         return Err(PlanError::InvalidPageSize);
@@ -58,7 +64,6 @@ pub fn plan_identity(
             Some(end) => end,
             None => continue,
         };
-        // 起点向上对齐；溢出则跳过该区间。
         let aligned = match base.checked_add(large - 1) {
             Some(value) => value & !(large - 1),
             None => continue,
@@ -68,8 +73,9 @@ pub fn plan_identity(
             if count == out.len() {
                 return Err(PlanError::BufferTooSmall);
             }
+            let virt = virt_of(at).ok_or(PlanError::AddressOverflow)?;
             out[count] = Mapping {
-                virt: VirtAddr::new(at),
+                virt: VirtAddr::new(virt),
                 phys: PhysAddr::new(at),
                 len: large,
                 flags: PageFlags::present(),
@@ -79,6 +85,25 @@ pub fn plan_identity(
         }
     }
     Ok(count)
+}
+
+/// 规划**恒等映射**（`virt == phys`），返回产出的映射条数。
+pub fn plan_identity(
+    ranges: &[UsableRange],
+    out: &mut [Mapping],
+    large: u64,
+) -> Result<usize, PlanError> {
+    plan_with(ranges, out, large, Some)
+}
+
+/// 规划 **HHDM** 映射（`virt == offset + phys`）。
+pub fn plan_hhdm(
+    ranges: &[UsableRange],
+    offset: u64,
+    out: &mut [Mapping],
+    large: u64,
+) -> Result<usize, PlanError> {
+    plan_with(ranges, out, large, |phys| offset.checked_add(phys))
 }
 
 #[cfg(test)]
@@ -152,5 +177,58 @@ mod tests {
         let ranges = [range(0x10_0000, u64::MAX - 0x10_0000)];
         let mut out = [Mapping::EMPTY; 2];
         assert_eq!(plan_identity(&ranges, &mut out, LARGE), Err(PlanError::BufferTooSmall));
+    }
+}
+
+#[cfg(test)]
+mod hhdm_tests {
+    use super::{Mapping, PlanError, plan_hhdm};
+    use crate::usable::UsableRange;
+    use arch::addr::PhysAddr;
+
+    const LARGE: u64 = 2 * 1024 * 1024;
+    const OFFSET: u64 = 0xffff_8000_0000_0000;
+
+    fn range(base: u64, length: u64) -> UsableRange {
+        UsableRange { base: PhysAddr::new(base), length }
+    }
+
+    #[test]
+    fn virtual_is_offset_plus_physical() {
+        // 基址 0x20_0000 = 2 MiB，本身即 LARGE 的整数倍。
+        // 长度 2 * LARGE：产出 2 页（0x20_0000 与 0x40_0000）。
+        let ranges = [range(0x20_0000, 2 * LARGE)];
+        let mut out = [Mapping::EMPTY; 4];
+        let count = plan_hhdm(&ranges, OFFSET, &mut out, LARGE).expect("规划成功");
+        assert_eq!(count, 2);
+        assert_eq!(out[0].phys.as_u64(), 0x20_0000);
+        assert_eq!(out[0].virt.as_u64(), OFFSET + 0x20_0000);
+        assert_eq!(out[1].phys.as_u64(), 0x20_0000 + LARGE);
+        assert_eq!(out[1].virt.as_u64(), OFFSET + 0x20_0000 + LARGE);
+    }
+
+    #[test]
+    fn an_offset_addition_that_overflows_is_rejected() {
+        // 物理基址极大 + 偏移极大：virt 计算必然溢出，必须报错而不是回绕。
+        let ranges = [range(0xffff_ffff_0000_0000, LARGE)];
+        let mut out = [Mapping::EMPTY; 4];
+        assert_eq!(
+            plan_hhdm(&ranges, OFFSET, &mut out, LARGE),
+            Err(PlanError::AddressOverflow)
+        );
+    }
+
+    #[test]
+    fn a_too_small_output_buffer_is_reported() {
+        let ranges = [range(0x20_0000, 3 * LARGE)];
+        let mut out = [Mapping::EMPTY; 2];
+        assert_eq!(plan_hhdm(&ranges, OFFSET, &mut out, LARGE), Err(PlanError::BufferTooSmall));
+    }
+
+    #[test]
+    fn a_zero_page_size_is_rejected() {
+        let ranges = [range(0x20_0000, LARGE)];
+        let mut out = [Mapping::EMPTY; 4];
+        assert_eq!(plan_hhdm(&ranges, OFFSET, &mut out, 0), Err(PlanError::InvalidPageSize));
     }
 }
