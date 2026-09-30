@@ -24,6 +24,12 @@ use limine::module::{MODULE_REQUEST_ID, ModuleResponse};
 use limine::mp::{MP_REQUEST_ID, MpResponse};
 use limine::rsdp::{RSDP_REQUEST_ID, RsdpResponse};
 
+/// 零值 UUID（表示「未知」）。
+const ZERO_UUID: limine::file::Uuid = limine::file::Uuid { a: 0, b: 0, c: 0, d: [0; 8] };
+
+/// 内核在介质上的路径（NUL 结尾，供 `File::path` 使用）。
+static KERNEL_PATH: &[u8] = b"/boot/kernel\0";
+
 /// 内存映射最多登记的条目数（写入前检查容量）。
 pub const MAX_MEMMAP_ENTRIES: usize = 32;
 /// 最多登记的帧缓冲数。
@@ -44,6 +50,8 @@ pub struct Responses {
     bootloader_info: BootloaderInfoResponse,
     firmware_type: FirmwareTypeResponse,
     executable_file: ExecutableFileResponse,
+    /// 可执行文件的描述本体（`executable_file` 指向它，故必须留在容器内）。
+    executable_file_data: File,
     executable_address: ExecutableAddressResponse,
     entry_point: EntryPointResponse,
     module: ModuleResponse,
@@ -76,6 +84,22 @@ impl Responses {
             executable_file: ExecutableFileResponse {
                 revision: 0,
                 executable_file: core::ptr::null_mut(),
+            },
+            executable_file_data: File {
+                revision: 0,
+                address: core::ptr::null_mut(),
+                size: 0,
+                path: core::ptr::null_mut(),
+                string: core::ptr::null_mut(),
+                media_type: 0,
+                unused: 0,
+                tftp_ipv4: [0; 4],
+                tftp_port: 0,
+                partition_index: 0,
+                mbr_disk_id: 0,
+                gpt_disk_uuid: ZERO_UUID,
+                gpt_part_uuid: ZERO_UUID,
+                part_uuid: ZERO_UUID,
             },
             executable_address: ExecutableAddressResponse {
                 revision: 0,
@@ -479,5 +503,67 @@ mod executable_and_entry_tests {
         // SAFETY: 同上；该响应只有 `revision` 一个字段。
         let response: &EntryPointResponse = unsafe { &*(raw as *const EntryPointResponse) };
         assert_eq!(response.revision, 0, "入口点响应只是一个 revision 标记，无其他载荷");
+    }
+}
+
+/// 用装载结果填充「可执行文件」响应。
+///
+/// 未跟踪的信息（分区索引、磁盘标识、UUID）**一律置零表示未知**，不编造；
+/// `media_type` 取 `MEDIA_TYPE_GENERIC`（未指明具体介质类型）；没有命令行则 `string` 置空。
+pub fn fill_executable_file(
+    responses: &mut Responses,
+    address: u64,
+    size: u64,
+) -> Result<(), Error> {
+    responses.executable_file_data = File {
+        revision: 0,
+        address: address as *mut core::ffi::c_void,
+        size,
+        path: KERNEL_PATH.as_ptr() as *mut core::ffi::c_char,
+        string: core::ptr::null_mut(),
+        media_type: limine::file::MEDIA_TYPE_GENERIC,
+        unused: 0,
+        tftp_ipv4: [0; 4],
+        tftp_port: 0,
+        partition_index: 0,
+        mbr_disk_id: 0,
+        gpt_disk_uuid: ZERO_UUID,
+        gpt_part_uuid: ZERO_UUID,
+        part_uuid: ZERO_UUID,
+    };
+    responses.executable_file.executable_file = &mut responses.executable_file_data;
+    Ok(())
+}
+
+#[cfg(test)]
+mod fill_executable_file_tests {
+    use super::{Responses, fill_executable_file};
+    use limine::executable_file::{EXECUTABLE_FILE_REQUEST_ID, ExecutableFileResponse};
+    use limine::file::{File, MEDIA_TYPE_GENERIC};
+
+    #[test]
+    fn the_executable_file_response_describes_the_loaded_kernel() {
+        let mut responses = Responses::new();
+        fill_executable_file(&mut responses, 0x10_0000, 24_619_400).expect("填充成功");
+        let raw = responses
+            .pointer_for(&EXECUTABLE_FILE_REQUEST_ID)
+            .expect("有响应");
+        // SAFETY: `raw` 指向容器内字段，类型为 `ExecutableFileResponse`。
+        let response: &ExecutableFileResponse =
+            unsafe { &*(raw as *const ExecutableFileResponse) };
+        assert!(!response.executable_file.is_null(), "必须给出可执行文件描述");
+        // SAFETY: 指针指向容器内的 `File`。
+        let file: &File = unsafe { &*response.executable_file };
+        assert_eq!(file.address as u64, 0x10_0000, "地址是装载后的物理位置");
+        assert_eq!(file.size, 24_619_400, "大小取自实测的内核长度");
+        assert_eq!(file.media_type, MEDIA_TYPE_GENERIC, "未指明具体介质类型时不冒充");
+        assert_eq!(file.partition_index, 0, "未跟踪分区索引就置零，不编造");
+        assert_eq!(file.mbr_disk_id, 0);
+        assert!(!file.path.is_null(), "路径必须给出");
+        // SAFETY: 路径是静态 NUL 结尾字节串。
+        let path = unsafe { core::ffi::CStr::from_ptr(file.path) };
+        assert_eq!(path.to_bytes(), b"/boot/kernel");
+        assert!(file.string.is_null(), "没有命令行就置空");
+        assert_eq!(file.tftp_port, 0, "非网络引导");
     }
 }
