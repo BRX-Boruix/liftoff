@@ -50,6 +50,13 @@ The artifact is `target/x86_64-unknown-uefi/release/liftoff.efi`; place it as
 
 ## Verification
 
+> **Layering**: `tools/boottest.ps1` (17 variants) in this repo is the **bootloader
+> unit-level fixture harness** - driven by the deterministic fixtures in
+> `mkiso/mkext2/mksysdisk/elf_oracle/modtest_oracle`, it checks liftoff's own behaviour
+> (file reads, ELF contract, modules, APs, x2APIC). **End-to-end acceptance now lives in
+> the tools repo** (`checks/liftoff/l1_boot_check.py`: OVMF -> ESP -> a canonical medium ->
+> kernel -> PID 1); new acceptance tests belong there, this repo keeps unit fixtures only.
+
 `tools/boottest.ps1` really boots the image under QEMU + OVMF and asserts on serial
 output - an assertion only passes if the firmware actually loaded liftoff and liftoff
 actually brought the kernel up.

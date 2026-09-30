@@ -47,6 +47,12 @@ cargo build --release --target x86_64-unknown-uefi
 
 ## 验收
 
+> **分层说明**：本仓库的 `tools/boottest.ps1`（17 变体）是**引导器单元级夹具**——由
+> `mkiso/mkext2/mksysdisk/elf_oracle/modtest_oracle` 确定性夹具驱动，验的是 liftoff 自身
+> 行为（文件读、ELF 契约、模块、AP、x2APIC 等）。**端到端验收已迁至 tools 仓库**
+> （`checks/liftoff/l1_boot_check.py`：OVMF → ESP → 规范介质 → 内核 → PID 1），
+> 以后新增的验收一律进 tools，本仓库只保留单元级夹具。
+
 `tools/boottest.ps1` 在 QEMU + OVMF 上真实引导并断言串口输出——只有固件真的装载了
 liftoff、liftoff 真的把内核送起来，断言才会通过。
 

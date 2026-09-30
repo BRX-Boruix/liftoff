@@ -2,6 +2,11 @@
 # Real-chain acceptance: the assertions below only pass if the firmware actually
 # loads BOOTX64.EFI and our code emits the expected lines on COM1.
 #
+# NOTE (layering): this is the **bootloader unit-level fixture harness** (17 variants,
+# driven by mkiso/mkext2/mksysdisk/elf_oracle/modtest_oracle). End-to-end acceptance
+# (OVMF -> ESP -> a canonical medium -> kernel -> PID 1) lives in the tools repo:
+# checks/liftoff/l1_boot_check.py. New acceptance tests belong there.
+#
 # Usage:
 #   pwsh tools/boottest.ps1 -Variant normal  -Expect "M2A: len=36","M2A: sum=0x0834"
 #   pwsh tools/boottest.ps1 -Variant missing -Expect "open failed status=0x800000000000000e"
