@@ -12,3 +12,4 @@ pub mod crc32;
 pub mod gpt;
 pub mod partition;
 pub mod table;
+pub mod volume;

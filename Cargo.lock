@@ -28,6 +28,9 @@ dependencies = [
 [[package]]
 name = "driver"
 version = "0.1.0"
+dependencies = [
+ "firmware",
+]
 
 [[package]]
 name = "efi"
