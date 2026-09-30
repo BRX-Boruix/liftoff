@@ -106,6 +106,25 @@ pub fn plan_hhdm(
     plan_with(ranges, out, large, |phys| offset.checked_add(phys))
 }
 
+/// 规划**内核高区**映射：物理区间 [phys_base, phys_base+len) 映射到
+/// [virt_base, virt_base+len)，保持 `virt = virt_base + (phys - phys_base)`。
+///
+/// 复用 `plan_with`：对齐与遍历逻辑单点定义；位移的减法下溢与加法溢出都报
+/// `AddressOverflow`（不回绕、不静默丢弃）。
+pub fn plan_kernel_high(
+    phys_base: u64,
+    virt_base: u64,
+    len: u64,
+    out: &mut [Mapping],
+    large: u64,
+) -> Result<usize, PlanError> {
+    let span = [UsableRange { base: PhysAddr::new(phys_base), length: len }];
+    plan_with(&span, out, large, |phys| {
+        let delta = phys.checked_sub(phys_base)?;
+        virt_base.checked_add(delta)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Mapping, PlanError, plan_identity};
@@ -230,5 +249,60 @@ mod hhdm_tests {
         let ranges = [range(0x20_0000, LARGE)];
         let mut out = [Mapping::EMPTY; 4];
         assert_eq!(plan_hhdm(&ranges, OFFSET, &mut out, 0), Err(PlanError::InvalidPageSize));
+    }
+}
+
+#[cfg(test)]
+mod kernel_high_tests {
+    use super::{Mapping, PlanError, plan_kernel_high};
+    
+
+    const LARGE: u64 = 2 * 1024 * 1024;
+    const VIRT_BASE: u64 = 0xffff_ffff_8000_0000;
+
+    #[test]
+    fn a_two_page_span_maps_with_a_constant_delta() {
+        // phys_base = 0x20_0000（2 MiB 对齐），virt_base 如上；两页。
+        let mut out = [Mapping::EMPTY; 4];
+        let count = plan_kernel_high(0x20_0000, VIRT_BASE, 2 * LARGE, &mut out, LARGE).expect("规划成功");
+        assert_eq!(count, 2);
+        assert_eq!(out[0].phys.as_u64(), 0x20_0000);
+        assert_eq!(out[0].virt.as_u64(), VIRT_BASE);
+        assert_eq!(out[1].phys.as_u64(), 0x20_0000 + LARGE);
+        assert_eq!(out[1].virt.as_u64(), VIRT_BASE + LARGE);
+    }
+
+    #[test]
+    fn an_unaligned_physical_base_is_aligned_up_and_virt_follows() {
+        // phys_base 加 0x1000：向上对齐到 0x20_0000，virt 仍是 VIRT_BASE。
+        let mut out = [Mapping::EMPTY; 4];
+        let count = plan_kernel_high(0x20_0000 + 0x1000, VIRT_BASE, 2 * LARGE, &mut out, LARGE).expect("规划成功");
+        assert_eq!(count, 1, "对齐后只剩一页");
+        assert_eq!(out[0].phys.as_u64(), 0x40_0000);
+        // 位移相对 phys_base：0x40_0000 - 0x20_1000 = 0x1F_F000
+        assert_eq!(out[0].virt.as_u64(), VIRT_BASE + 0x1F_F000);
+    }
+
+    #[test]
+    fn a_virtual_overflow_is_rejected() {
+        let mut out = [Mapping::EMPTY; 4];
+        assert_eq!(
+            plan_kernel_high(0x20_0000, u64::MAX - 0x1000, 2 * LARGE, &mut out, LARGE),
+            Err(PlanError::AddressOverflow)
+        );
+    }
+
+    #[test]
+    fn capacity_and_page_size_are_checked() {
+        let mut out = [Mapping::EMPTY; 1];
+        assert_eq!(
+            plan_kernel_high(0x20_0000, VIRT_BASE, 2 * LARGE, &mut out, LARGE),
+            Err(PlanError::BufferTooSmall)
+        );
+        let mut out2 = [Mapping::EMPTY; 4];
+        assert_eq!(
+            plan_kernel_high(0x20_0000, VIRT_BASE, LARGE, &mut out2, 0),
+            Err(PlanError::InvalidPageSize)
+        );
     }
 }
