@@ -26,3 +26,4 @@ current = { path = "../arch/current" }
 driver = { path = "../driver" }
 fs = { path = "../fs" }
 mm = { path = "../mm" }
+loader = { path = "../loader" }

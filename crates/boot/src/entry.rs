@@ -4,6 +4,7 @@
 //! 平台与固件实现的**选择**来自门面（`crate::PlatformImpl`、`firmware_current::current`），
 //! 本模块不自己挑实现。
 
+use loader::elf::{ElfError, ProgramHeader, parse_elf_header, parse_load_segments};
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
@@ -838,5 +839,158 @@ mod enter_kernel_success_tests {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&image[at..at + 8]);
         assert_ne!(usize::from_ne_bytes(buf), 0, "response 必须已被写入");
+    }
+}
+
+/// 内核装载计划。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KernelPlan {
+    /// 内核入口（`e_entry`）。
+    pub entry: u64,
+    /// 装载段数量。
+    pub segment_count: usize,
+    /// 入口落在第几段（自检：入口必须在某个装载段内）。
+    pub entry_segment: usize,
+}
+
+/// 规划内核装载的失败原因。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KernelPlanError {
+    /// ELF 解析失败。
+    Elf(ElfError),
+    /// 入口不在任何装载段内。
+    EntryOutsideSegments,
+    /// 段的虚拟区间长度为 0。
+    EmptySegment,
+    /// 段区间末端溢出。
+    Overflow,
+    /// 调用方给的输出缓冲太小。
+    BufferTooSmall,
+}
+
+/// 解析内核映像，得出入口与装载段。
+///
+/// 数值边界：每段 `vaddr + memsz` 都做 checked 加法（溢出即拒绝）；入口必须落在某段内，
+/// 否则跳过去就是执行未装载的内存。
+pub fn plan_kernel(
+    image: &[u8],
+    segments: &mut [ProgramHeader],
+) -> Result<KernelPlan, KernelPlanError> {
+    let header = parse_elf_header(image).map_err(KernelPlanError::Elf)?;
+    let count = parse_load_segments(image, &header, segments).map_err(KernelPlanError::Elf)?;
+    let entry = header.e_entry;
+    let mut entry_segment = usize::MAX;
+    for (index, segment) in segments[..count].iter().enumerate() {
+        let end = segment
+            .p_vaddr
+            .checked_add(segment.p_memsz)
+            .ok_or(KernelPlanError::Overflow)?;
+        if entry >= segment.p_vaddr && entry < end {
+            entry_segment = index;
+            break;
+        }
+    }
+    if entry_segment == usize::MAX {
+        return Err(KernelPlanError::EntryOutsideSegments);
+    }
+    Ok(KernelPlan { entry, segment_count: count, entry_segment })
+}
+
+/// 把装载段的目标虚拟区间填进 `must_stay`（跳转后这些区间必须仍然映射）。
+pub fn must_stay_from_segments(
+    segments: &[ProgramHeader],
+    out: &mut [MustStay],
+) -> Result<usize, KernelPlanError> {
+    if out.len() < segments.len() {
+        return Err(KernelPlanError::BufferTooSmall);
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.p_memsz == 0 {
+            return Err(KernelPlanError::EmptySegment);
+        }
+        segment
+            .p_vaddr
+            .checked_add(segment.p_memsz)
+            .ok_or(KernelPlanError::Overflow)?;
+        out[index] = MustStay { start: segment.p_vaddr, len: segment.p_memsz };
+    }
+    Ok(segments.len())
+}
+
+#[cfg(test)]
+mod kernel_plan_tests {
+    use super::{KernelPlanError, must_stay_from_segments, plan_kernel};
+    use loader::elf::ProgramHeader;
+    use mm::takeover::MustStay;
+
+    /// 从真实 ISO 里取出内核映像（extent 33、24,619,400 字节）。
+    fn real_kernel() -> Option<std::vec::Vec<u8>> {
+        let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
+        let bytes = std::fs::read(iso).ok()?;
+        let at = 33 * 2048;
+        let size = 24_619_400;
+        bytes.get(at..at + size).map(|s| s.to_vec())
+    }
+
+    #[test]
+    fn the_real_kernel_plan_matches_the_measured_layout() {
+        let Some(image) = real_kernel() else {
+            std::eprintln!("跳过：真实 ISO 不存在");
+            return;
+        };
+        let mut segments = [ProgramHeader::EMPTY; 8];
+        let plan = plan_kernel(&image, &mut segments).expect("内核可规划");
+        assert_eq!(plan.segment_count, 3, "实测 3 个 PT_LOAD");
+        assert_eq!(plan.entry, 0xffff_ffff_8003_78d0, "实测入口");
+        assert_eq!(plan.entry_segment, 0, "入口落在第 0 段");
+
+        let mut stays = [MustStay { start: 0, len: 0 }; 8];
+        let count = must_stay_from_segments(&segments[..plan.segment_count], &mut stays)
+            .expect("区间可生成");
+        assert_eq!(count, 3);
+        assert_eq!(stays[0].start, 0xffff_ffff_8000_0000);
+        assert_eq!(stays[0].len, 0x22_3cb0);
+        assert_eq!(stays[1].start, 0xffff_ffff_8022_4000);
+        assert_eq!(stays[1].len, 0x4d_5780);
+        assert_eq!(stays[2].start, 0xffff_ffff_806f_a000);
+        assert_eq!(stays[2].len, 0x2b_ea88);
+    }
+
+    #[test]
+    fn a_zero_length_segment_is_rejected() {
+        let mut segments = [ProgramHeader::EMPTY; 4];
+        segments[0].p_vaddr = 0xffff_ffff_8000_0000;
+        segments[0].p_memsz = 0;
+        let mut stays = [MustStay { start: 0, len: 0 }; 4];
+        assert_eq!(
+            must_stay_from_segments(&segments[..1], &mut stays),
+            Err(KernelPlanError::EmptySegment)
+        );
+    }
+
+    #[test]
+    fn a_segment_whose_end_overflows_is_rejected() {
+        let mut segments = [ProgramHeader::EMPTY; 4];
+        segments[0].p_vaddr = u64::MAX - 1;
+        segments[0].p_memsz = 8;
+        let mut stays = [MustStay { start: 0, len: 0 }; 4];
+        assert_eq!(
+            must_stay_from_segments(&segments[..1], &mut stays),
+            Err(KernelPlanError::Overflow)
+        );
+    }
+
+    #[test]
+    fn more_segments_than_the_output_buffer_is_rejected() {
+        let mut segments = [ProgramHeader::EMPTY; 4];
+        for seg in segments.iter_mut() {
+            seg.p_vaddr = 0xffff_ffff_8000_0000;
+            seg.p_memsz = 0x1000;
+        }
+        let mut stays = [MustStay { start: 0, len: 0 }; 2];
+        assert_eq!(
+            must_stay_from_segments(&segments, &mut stays),
+            Err(KernelPlanError::BufferTooSmall)
+        );
     }
 }
