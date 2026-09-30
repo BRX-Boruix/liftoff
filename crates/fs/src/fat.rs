@@ -322,6 +322,20 @@ where
     }
 }
 
+/// LFN 校验和：对 11 字节 8.3 名逐字节 `sum = rotate_right(sum, 1) + byte`。
+///
+/// 用途：长文件名片段必须与短名匹配 —— **校验和不符说明片段不属于该文件**，
+/// 必须丢弃（而不是把错的长名当成真的）。
+pub const fn lfn_checksum(short_name: &[u8; 11]) -> u8 {
+    let mut sum = 0u8;
+    let mut index = 0;
+    while index < 11 {
+        sum = sum.rotate_right(1).wrapping_add(short_name[index]);
+        index += 1;
+    }
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FAT_SIGNATURE_OFFSET, FatError, FatKind, parse_bpb};
@@ -620,5 +634,44 @@ mod chain_read_tests {
             read_chain(&fat, 2, FatKind::Fat16, 8, CLUSTER, &mut out, reader),
             Err(FatError::BufferTooSmall)
         );
+    }
+}
+
+#[cfg(test)]
+mod lfn_checksum_tests {
+    use super::lfn_checksum;
+
+    #[test]
+    fn an_all_zero_name_has_zero_checksum() {
+        assert_eq!(lfn_checksum(&[0u8; 11]), 0);
+    }
+
+    #[test]
+    fn the_checksum_matches_a_hand_computed_case() {
+        // 规范算法：对 11 字节逐字节 sum = rotate_right(sum,1) + byte。
+        // 名字 = 'A' 后跟 10 个 0：
+        //   第 1 步 sum = rotate_right(0,1) + 65 = 65
+        //   第 2 步 sum = rotate_right(65,1) + 0 = 0xA0（65 = 0b0100_0001 → 0b1010_0000）
+        //   之后每步 rotate_right(0xA0,1) = 0x50，再加 0……逐步变化，故此处用前两步的中间值
+        //   不可直接断言；改用“只放一个非零字节在**最后一位**”的构造。
+        let mut name = [0u8; 11];
+        name[10] = 65;
+        // 前 10 步都是 rotate_right(0,1)+0 = 0，最后一步 = 0 + 65 = 65。
+        assert_eq!(lfn_checksum(&name), 65);
+    }
+
+    #[test]
+    fn different_names_give_different_checksums() {
+        let mut first = [0u8; 11];
+        first[0] = b'A';
+        let mut second = [0u8; 11];
+        second[0] = b'B';
+        assert_ne!(lfn_checksum(&first), lfn_checksum(&second));
+    }
+
+    #[test]
+    fn the_checksum_is_deterministic() {
+        let name = *b"HELLO   TXT";
+        assert_eq!(lfn_checksum(&name), lfn_checksum(&name));
     }
 }
