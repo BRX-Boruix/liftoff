@@ -390,6 +390,51 @@ pub unsafe fn has_request(image_base: u64, image_size: u64, id: [u64; 2]) -> boo
     }
     false
 }
+
+/// SmpRequest.flags 是否请求使能 x2APIC（bit0）。由 scan_smp_request_flags 填充。
+///
+/// 带字段的请求只有三个（其余 16 个无字段）：
+/// - SmpRequest.flags: u32 bit0 = "Enable X2APIC, if possible"（本函数处理）；
+/// - StackSizeRequest.stack_size: u64 = AP 栈大小（liftoff 不填其响应 → 内核按
+///   "不支持"处理并用自身默认；我们的 trampoline 给 64KiB，恰为默认值）；
+/// - PagingModeRequest.flags: u64 = 分页模式（同上，不填响应）。
+/// 三者都**不得在未实现时谎报支持**：不填响应即为诚实的"不支持"。
+static SMP_WANTS_X2APIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// 内核是否请求使能 x2APIC（SmpRequest.flags bit0）。
+pub fn smp_wants_x2apic() -> bool {
+    SMP_WANTS_X2APIC.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// 扫描内核映像里 SmpRequest 的 flags 字段并记录 bit0。
+///
+/// 标记体为 48B（COMMON_MAGIC16 + id16 + revision8 + response8），**请求字段紧随其后**
+/// （vendor/brxlimine-rs lib.rs:585：SmpRequest { flags: u32 = 0 }）。这是内核的选择，
+/// 引导器必须遵守——此前 liftoff 无视该字段、只要 CPUID 支持就使能 x2APIC，等于单方面
+/// 要求内核支持 MSR 形式的 LAPIC 访问（BORUIX 请求 flags=0、只有 xAPIC 路径 → AP 崩）。
+///
+/// SAFETY：image_base..image_base+image_size 必须是已装载的内核映像区间。
+pub unsafe fn scan_smp_request_flags(image_base: u64, image_size: u64) {
+    let image = unsafe { core::slice::from_raw_parts(image_base as *const u8, image_size as usize) };
+    let mut off = 0usize;
+    while off + 52 <= image.len() {
+        let m0 = u64::from_le_bytes(image[off..off + 8].try_into().unwrap());
+        let m1 = u64::from_le_bytes(image[off + 8..off + 16].try_into().unwrap());
+        if m0 == COMMON_MAGIC[0] && m1 == COMMON_MAGIC[1] {
+            let i0 = u64::from_le_bytes(image[off + 16..off + 24].try_into().unwrap());
+            let i1 = u64::from_le_bytes(image[off + 24..off + 32].try_into().unwrap());
+            if i0 == SMP_ID[0] && i1 == SMP_ID[1] {
+                let f = u32::from_le_bytes(image[off + 48..off + 52].try_into().unwrap());
+                SMP_WANTS_X2APIC.store(f & 1 != 0, core::sync::atomic::Ordering::Release);
+                return;
+            }
+            off += 48;
+            continue;
+        }
+        off += 8;
+    }
+}
+
 /// BaseRevision 特殊处理：id 前缀不同于请求标记（无 COMMON_MAGIC），
 /// 结构是 id(16) + revision(8) = 24B；支持的 revision 原位写 0。
 ///

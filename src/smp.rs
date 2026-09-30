@@ -304,7 +304,8 @@ pub unsafe fn prepare(bs: &efi::BootServices, pml4_phys: u64, rsdp_phys: u64, hd
     unsafe {
     // M12：CPU 支持时切到 x2APIC（MSR 访问）；内核据 SmpResponse.flags bit0
     // 选择同一模式（x2APIC = MSR，xAPIC = MMIO，brxlimine-rs lib.rs 552）。
-    let x2 = x2apic_try_enable();
+    // 仅当内核在 SmpRequest.flags bit0 明确请求时才使能 x2APIC（brxLimine 同语义）。
+    let x2 = boruix::smp_wants_x2apic() && x2apic_try_enable();
     let ids = madt_lapic_ids(rsdp_phys, x2);
     let bsp = lapic_id();
     hd.smp.bsp_lapic_id = bsp;

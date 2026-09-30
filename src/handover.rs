@@ -247,6 +247,10 @@ pub unsafe fn final_ebs_and_jump(
     crate::serial::write(format_args!("[m4] memmap converted n={}\n", n));
 
     // 3b) SMP: MADT walk + AP resource alloc + SmpInfo/Response fill (pre-EBS).
+    // 先读内核的 SMP 请求字段（SmpRequest.flags bit0 = 是否要求使能 x2APIC）：
+    // 引导器必须遵守内核的选择，不能因为 CPUID 支持就自行开启。（本函数整体在
+    // unsafe 块内，故此处不再嵌套 unsafe。）
+    boruix::scan_smp_request_flags(hd.kaddr.physical_base, hd.file_struct.length);
     let aps = crate::smp::prepare(bs, pml4_phys, rsdp_phys, hd);
     crate::serial::write(format_args!("[m4] smp prepared aps={}\n", aps));
     crate::serial::write(format_args!("[m4] smp page={:#x}\n", hd.smp_infos as u64));
