@@ -351,3 +351,133 @@ mod dir_tests {
         assert_eq!(parse_directory_block(&block, &mut out), Err(IsoError::EndianMismatch));
     }
 }
+
+/// 判断目录项名字是否匹配查询名。
+///
+/// 归一化规则**来自真实 ISO 的观察**（不是猜的）：去掉 `;N` 版本后缀 → 去掉结尾的 `.`
+/// → 大小写不敏感全等比较。真实 ISO 上内核的名字是 `KERNEL.;1`：无扩展名的 `kernel`
+/// 被改写成「点 + 版本后缀」，只去 `;N` 会剩下 `KERNEL.`，与 `kernel` 不等。
+/// 必须**全等**而非前缀/包含匹配，否则 `KERNELX.;1` 会被误配成 `kernel`。
+pub fn name_matches(entry: &[u8], wanted: &[u8]) -> bool {
+    fn normalized(name: &[u8]) -> &[u8] {
+        let end = name.iter().position(|b| *b == b';').unwrap_or(name.len());
+        let mut slice = &name[..end];
+        while slice.last() == Some(&b'.') {
+            slice = &slice[..slice.len() - 1];
+        }
+        slice
+    }
+    let left = normalized(entry);
+    let right = normalized(wanted);
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// 在一个目录 extent 里按名字查找（**不递归**）。
+///
+/// 目录数据按 `block_size` 分块；每条记录以长度字节开头，长度为 0 表示本块剩余为填充。
+/// 读块由调用方注入，故可在宿主上测。
+pub fn find_in_directory<F>(
+    extent_lba: u32,
+    data_length: u32,
+    block_size: u16,
+    wanted: &[u8],
+    block: &mut [u8],
+    mut read_block: F,
+) -> Result<Option<Entry>, IsoError>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<(), IsoError>,
+{
+    let size = block_size as usize;
+    if size == 0 {
+        return Err(IsoError::BadBlockSize);
+    }
+    if block.len() < size {
+        return Err(IsoError::BufferTooSmall);
+    }
+    let count = (data_length as usize).div_ceil(size);
+    let mut entries = [Entry::EMPTY; 64];
+    for index in 0..count {
+        let lba = extent_lba.checked_add(index as u32).ok_or(IsoError::ShortImage)?;
+        read_block(lba, &mut block[..size])?;
+        let found = parse_directory_block(&block[..size], &mut entries)?;
+        for entry in &entries[..found] {
+            if name_matches(entry.name(), wanted) {
+                return Ok(Some(*entry));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod path_lookup_tests {
+    use super::{Entry, find_in_directory, name_matches};
+    use std::vec::Vec;
+
+    #[test]
+    fn the_real_iso_name_forms_are_normalized() {
+        // 真实 ISO 上内核的名字就是 `KERNEL.;1`（无扩展名 → 点 + 版本后缀）。
+        assert!(name_matches(b"KERNEL.;1", b"kernel"), "真实形态必须匹配");
+        assert!(name_matches(b"BOOT", b"boot"));
+        assert!(name_matches(b"INIT.ELF;1", b"init.elf"));
+        assert!(name_matches(b"KERNEL;1", b"kernel"), "没有尾点的形态也要匹配");
+        assert!(!name_matches(b"KERNEL.;1", b"boot"));
+        assert!(!name_matches(b"KERNELX.;1", b"kernel"), "不得前缀匹配");
+        assert!(!name_matches(b"KERNEL.ELF;1", b"kernel"), "扩展名不同不得匹配");
+    }
+
+    /// 按 ISO9660 规格拼一个目录块：每条记录以长度字节开头。
+    fn dir_block(entries: &[(&[u8], u32, u32, u8)]) -> Vec<u8> {
+        let mut block = std::vec![0u8; 2048];
+        let mut at = 0usize;
+        for (name, lba, size, flags) in entries {
+            let rec_len = 33 + name.len() + (name.len() % 2 == 0) as usize;
+            block[at] = rec_len as u8;
+            block[at + 1] = 0;
+            block[at + 2..at + 6].copy_from_slice(&lba.to_le_bytes());
+            block[at + 6..at + 10].copy_from_slice(&lba.to_be_bytes());
+            block[at + 10..at + 14].copy_from_slice(&size.to_le_bytes());
+            block[at + 14..at + 18].copy_from_slice(&size.to_be_bytes());
+            block[at + 25] = *flags;
+            block[at + 32] = name.len() as u8;
+            block[at + 33..at + 33 + name.len()].copy_from_slice(name);
+            at += rec_len;
+        }
+        block
+    }
+
+    #[test]
+    fn a_real_shaped_directory_yields_the_kernel_entry() {
+        let block = dir_block(&[
+            (b"\x00", 20, 2048, 2),
+            (b"\x01", 18, 2048, 2),
+            (b"KERNEL.;1", 33, 24619400, 0),
+            (b"LIMINE", 21, 2048, 2),
+        ]);
+        let mut scratch = std::vec![0u8; 2048];
+        let mut reader = |lba: u32, out: &mut [u8]| {
+            assert_eq!(lba, 20, "只该读这个 extent");
+            out.copy_from_slice(&block);
+            Ok(())
+        };
+        let found: Entry = find_in_directory(20, 2048, 2048, b"kernel", &mut scratch, &mut reader)
+            .expect("查找成功")
+            .expect("必须找到内核");
+        assert_eq!(found.extent_lba, 33);
+        assert_eq!(found.data_length, 24619400);
+        assert_eq!(found.flags & 2, 0, "内核是文件，不是目录");
+    }
+
+    #[test]
+    fn a_missing_name_yields_none() {
+        let block = dir_block(&[(b"BOOT", 20, 2048, 2)]);
+        let mut scratch = std::vec![0u8; 2048];
+        let mut reader = |_lba: u32, out: &mut [u8]| {
+            out.copy_from_slice(&block);
+            Ok(())
+        };
+        let found = find_in_directory(18, 2048, 2048, b"kernel", &mut scratch, &mut reader)
+            .expect("查找成功");
+        assert!(found.is_none());
+    }
+}
