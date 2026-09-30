@@ -76,6 +76,30 @@ pub enum MapError {
     MisalignedLength,
     /// 区间端点计算溢出。
     Overflow,
+    /// 页帧分配耗尽（实现方的帧来源无可用帧）。
+    OutOfMemory,
+}
+
+/// 覆盖 `len` 字节所需的页数（向上取整）。
+///
+/// `len == 0`、`page_size == 0`、或“页数 × 页大小”溢出时返回 `None`。
+pub const fn pages_for(len: u64, page_size: u64) -> Option<u64> {
+    if len == 0 || page_size == 0 {
+        return None;
+    }
+    let whole = len / page_size;
+    let pages = if len % page_size == 0 {
+        whole
+    } else {
+        match whole.checked_add(1) {
+            Some(p) => p,
+            None => return None,
+        }
+    };
+    match pages.checked_mul(page_size) {
+        Some(_) => Some(pages),
+        None => None,
+    }
 }
 
 /// 校验一个映射请求。所有实现共用（单点定义，严格模式 S15）。
@@ -124,8 +148,19 @@ pub trait PageTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{MapError, PageFlags, validate_range};
+    use super::{MapError, PageFlags, pages_for, validate_range};
     use crate::addr::{Alignment, PhysAddr, VirtAddr};
+
+
+    #[test]
+    fn pages_for_rejects_zero_page_size_and_reports_overflow() {
+        assert_eq!(pages_for(0x1000, 0), None);
+        assert_eq!(pages_for(0, 0x1000), None);
+        assert_eq!(pages_for(0x1000, 0x1000), Some(1));
+        assert_eq!(pages_for(0x2000, 0x1000), Some(2));
+        assert_eq!(pages_for(0x1001, 0x1000), Some(2), "非整倍数向上取整");
+        assert_eq!(pages_for(u64::MAX, 0x1000), None, "页数计算溢出应报错");
+    }
 
     #[test]
     fn flags_are_semantic_bits() {
