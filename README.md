@@ -8,11 +8,11 @@ BORUIX 的 UEFI 引导程序：按 Limine 协议加载内核并交接给内核�
 
 从 UEFI 固件启动，读取内核映像，填写内核声明的 Limine 请求，退出引导服务后跳转内核入口。
 
-gen2 重写进行中：当前只有 UEFI 入口与 COM1 串口输出，尚未加载内核。
+当前仓库只有 cargo 建立的项目骨架，引导逻辑尚未实现。
 
 ## 已知限制
 
-- 当前版本不加载内核，启动后初始化 COM1 并输出一行信息后返回固件
+- 引导逻辑尚未实现，当前没有 UEFI 入口，构建在链接阶段之前即失败
 - 只支持 x86_64
 
 ## 构建
@@ -26,9 +26,7 @@ nightly，并安装 `rust-src`、`llvm-tools` 与 `x86_64-unknown-uefi` 目标�
 
 ## 仓库布局
 
-- `src/main.rs` —— UEFI 入口、panic 处理与 halt
-- `src/efi.rs` —— EFI 类型与协议
-- `src/serial.rs` —— COM1 串口输出
+- `src/main.rs` —— 程序入口
 
 ## 相关项目
 
