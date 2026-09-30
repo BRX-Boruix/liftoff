@@ -4,6 +4,7 @@
 //! 页表接管）属于 L3/L4，不在本模块。
 
 use core::ffi::c_void;
+use crate::responses::Responses;
 use limine::fill::fill_response;
 use limine::scan::{RequestHit, ScanError, scan};
 
@@ -32,6 +33,27 @@ where
     for hit in hits.iter().take(count) {
         if let Some(response) = response_for(hit) {
             fill_response(image, hit, response).map_err(|_| ScanError::UnclosedRegion)?;
+            filled += 1;
+        }
+    }
+    Ok(ScanReport { hits: count, filled })
+}
+
+/// 扫描映像，并把命中的请求的 `response` 指向 `responses` 里对应的响应结构。
+///
+/// 我们**不提供**响应的请求（容器里没有）会被跳过：既不写入，也不计入 `filled`
+/// （故 `filled <= hits` 恒成立 —— **不虚报**填充数）。
+pub fn fill_responses(
+    image: &mut [u8],
+    hits: &mut [RequestHit],
+    responses: &mut Responses,
+) -> Result<ScanReport, ScanError> {
+    let count = scan(image, hits)?;
+    let mut filled = 0;
+    for index in 0..count {
+        let hit = hits[index];
+        if let Some(pointer) = responses.pointer_for(&hit.id) {
+            fill_response(image, &hit, pointer).map_err(|_| ScanError::UnclosedRegion)?;
             filled += 1;
         }
     }
@@ -91,6 +113,88 @@ mod tests {
         let mut hits = [RequestHit::EMPTY; 4];
         assert_eq!(
             prepare_responses(&mut image, &mut hits, |_| None),
+            Err(ScanError::NoStartMarker)
+        );
+    }
+}
+
+#[cfg(test)]
+mod fill_responses_tests {
+    use super::{ScanReport, fill_responses};
+    use crate::responses::Responses;
+    use limine::base::HHDM_REQUEST_ID;
+    use limine::memmap::MEMMAP_REQUEST_ID;
+    use limine::scan::{RequestHit, ScanError, END_MARKER, START_MARKER};
+
+    fn push_words(image: &mut std::vec::Vec<u8>, words: &[u64]) {
+        for word in words {
+            image.extend_from_slice(&word.to_ne_bytes());
+        }
+    }
+
+    /// 造一个映像：填充 + START + 给定 ID 的请求 + END。
+    fn image_with(ids: &[[u64; 4]]) -> std::vec::Vec<u8> {
+        let mut image = std::vec![0u8; 64];
+        push_words(&mut image, &START_MARKER);
+        for id in ids {
+            push_words(&mut image, id);
+            push_words(&mut image, &[0, 0, 0]);
+        }
+        push_words(&mut image, &END_MARKER);
+        image
+    }
+
+    #[test]
+    fn a_known_request_gets_the_container_address_written_into_it() {
+        let mut image = image_with(&[HHDM_REQUEST_ID]);
+        let mut responses = Responses::new();
+        responses.set_hhdm_offset(0xffff_8000_0000_0000);
+        let expected = responses.pointer_for(&HHDM_REQUEST_ID).expect("有响应");
+        let mut hits = [RequestHit::EMPTY; 4];
+        let report: ScanReport =
+            fill_responses(&mut image, &mut hits, &mut responses).expect("填充成功");
+        assert_eq!(report.hits, 1);
+        assert_eq!(report.filled, 1);
+        // 请求头里 response 在 +40；把那里读出来应与容器给出的地址一致。
+        let at = hits[0].offset + 40;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&image[at..at + 8]);
+        assert_eq!(usize::from_ne_bytes(buf), expected as usize);
+    }
+
+    #[test]
+    fn a_request_we_have_no_response_for_is_left_unfilled() {
+        // 用一个不在容器里的 ID：命中数 > 填充数。
+        let mut image = image_with(&[[0xAAAA_BBBB_CCCC_DDDD, 1, 2, 3]]);
+        let mut responses = Responses::new();
+        let mut hits = [RequestHit::EMPTY; 4];
+        let report = fill_responses(&mut image, &mut hits, &mut responses).expect("填充成功");
+        assert_eq!(report.hits, 0, "未知 ID 不算命中（扫描表里没有它）");
+        assert_eq!(report.filled, 0);
+    }
+
+    #[test]
+    fn two_known_requests_are_both_filled() {
+        let mut image = image_with(&[HHDM_REQUEST_ID, MEMMAP_REQUEST_ID]);
+        let mut responses = Responses::new();
+        responses.set_memmap(&[limine::memmap::MemmapEntry {
+            base: 0x1000,
+            length: 0x2000,
+            kind: limine::memmap::USABLE,
+        }]);
+        let mut hits = [RequestHit::EMPTY; 4];
+        let report = fill_responses(&mut image, &mut hits, &mut responses).expect("填充成功");
+        assert_eq!(report.hits, 2);
+        assert_eq!(report.filled, 2);
+    }
+
+    #[test]
+    fn an_image_without_markers_is_rejected() {
+        let mut image = std::vec![0u8; 64];
+        let mut responses = Responses::new();
+        let mut hits = [RequestHit::EMPTY; 4];
+        assert_eq!(
+            fill_responses(&mut image, &mut hits, &mut responses),
             Err(ScanError::NoStartMarker)
         );
     }
