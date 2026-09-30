@@ -98,13 +98,15 @@ pub fn start_with<P: Platform>(
     static mut HITS: [RequestHit; 64] = [RequestHit::EMPTY; 64];
     static mut MUST_STAY: [MustStay; 32] = [MustStay { start: 0, len: 0 }; 32];
     static mut RESPONSES: Responses = Responses::new();
-    static mut MAP_BUFFER: [MemoryEntry; 512] = [MemoryEntry {
+    static mut MAP_BUFFER: [MemoryEntry; 2048] = [MemoryEntry {
         base: PhysAddr::new(0),
         length: 0,
         kind: firmware::memory::MemoryKind::Reserved,
-    }; 512];
+    }; 2048];
     static mut MAP_KEY: Option<usize> = None;
-    static mut DESCRIPTORS: [u8; 4096] = [0; 4096];
+    // 真实 UEFI 内存映射的字节数远大于 4 KiB（描述符每条约 40 字节、动辄上百条），
+    // 缓冲不足会让两段式 `GetMemoryMap` 直接失败。
+    static mut DESCRIPTORS: [u8; 65536] = [0; 65536];
 
     // SAFETY: 上述静态均为引导阶段单线程独占使用；`DESCRIPTORS` 的借用在此作用域内有效。
     let result = unsafe {
@@ -153,7 +155,9 @@ fn stage_text(stage: BringUpError) -> &'static [u8] {
         BringUpError::Media(_) => b"[liftoff] stage: media\n",
         BringUpError::Kernel(_) => b"[liftoff] stage: kernel elf\n",
         BringUpError::Plan(_) => b"[liftoff] stage: plan\n",
-        BringUpError::MemoryMap(_) => b"[liftoff] stage: memory map\n",
+        BringUpError::MemoryMapLoad(_) => b"[liftoff] stage: memmap load\n",
+        BringUpError::MemoryMapRanges(_) => b"[liftoff] stage: memmap ranges\n",
+        BringUpError::PageTable => b"[liftoff] stage: page table\n",
         BringUpError::Load(_) => b"[liftoff] stage: load+activate\n",
         BringUpError::Handoff(_) => b"[liftoff] stage: handoff\n",
     }
@@ -1291,8 +1295,12 @@ pub enum BringUpError {
     Kernel(KernelPlanError),
     /// 页表规划失败。
     Plan(PlanBuildError),
-    /// 内存映射不可用。
-    MemoryMap(Error),
+    /// 加载内存映射失败（缓冲不足或固件拒绝）。
+    MemoryMapLoad(Error),
+    /// 从内存映射里取可用区间失败。
+    MemoryMapRanges(Error),
+    /// 建页表（根帧/HHDM 直接映射）失败。
+    PageTable,
     /// 装载并激活失败。
     Load(KernelPlanError),
     /// 交接编排失败。
@@ -1330,8 +1338,12 @@ pub unsafe fn bring_up(
     let stays = must_stay_from_segments(&c.segments[..info.segment_count], c.must_stay)
         .map_err(BringUpError::Kernel)?;
     // 4) 可用物理区间（HHDM 与恒等映射都从这里来）。
-    let map = c.memory_map.memory_map(c.map_buffer).map_err(BringUpError::MemoryMap)?;
-    let usable_count = mm::usable::usable_ranges(map, c.usable).map_err(BringUpError::MemoryMap)?;
+    let map = c
+        .memory_map
+        .memory_map(c.map_buffer)
+        .map_err(BringUpError::MemoryMapLoad)?;
+    let usable_count =
+        mm::usable::usable_ranges(map, c.usable).map_err(BringUpError::MemoryMapRanges)?;
     // 5) 页表规划：内核高区 + HHDM + 恒等。
     let kernel_virt = c.segments[..info.segment_count]
         .iter()
@@ -1356,8 +1368,8 @@ pub unsafe fn bring_up(
     .map_err(BringUpError::Plan)?;
     // 6) 页表：根帧 + HHDM 直接映射 + 固件帧来源。
     let mut frames = EfiFrameAllocator::new(table.allocate_pages);
-    let root = frames.allocate_zeroed().ok_or(BringUpError::MemoryMap(Error::Io))?;
-    let direct = DirectMap::new(HHDM_OFFSET, u64::MAX).ok_or(BringUpError::MemoryMap(Error::Io))?;
+    let root = frames.allocate_zeroed().ok_or(BringUpError::PageTable)?;
+    let direct = DirectMap::new(HHDM_OFFSET, u64::MAX).ok_or(BringUpError::PageTable)?;
     let mut page_table = X86PageTable::new(root, direct, frames);
     // 7) 拷段到物理目标（真机：直接写物理地址，UEFI 阶段恒等映射有效）。
     let mut write = |phys: u64, bytes: &[u8]| -> Result<(), ElfError> {
