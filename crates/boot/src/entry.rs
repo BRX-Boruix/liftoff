@@ -7,6 +7,8 @@
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
+use crate::responses::Responses;
+use limine::scan::RequestHit;
 use mm::plan::Mapping;
 use mm::takeover::{MustStay, TakeoverError};
 use firmware::error::Error;
@@ -486,5 +488,223 @@ mod before_entry_tests {
             check_before_entry(0xffff_ffff_8000_0100, &[], &must),
             Err(EntryError::NotCovered { address: 0xffff_ffff_8000_0000 })
         );
+    }
+}
+
+/// 交接编排的全部输入（一次装配好，避免长参数列表）。
+pub struct Handoff<'a, 'b> {
+    /// 内核映像（**可写**：要把响应指针写进请求头）。
+    pub image: &'a mut [u8],
+    /// 扫描用的命中缓冲。
+    pub hits: &'a mut [RequestHit],
+    /// 我们准备的响应结构。
+    pub responses: &'a mut Responses,
+    /// 页表规划（用于覆盖检查）。
+    pub plan: &'a [Mapping],
+    /// 必须保持映射的区间（调用方提供）。
+    pub must_stay: &'a [MustStay],
+    /// 内核入口地址。
+    pub entry: u64,
+    /// 内存映射来源（退出前要用它记录的键）。
+    pub source: &'a mut UefiMemoryMapSource<'b>,
+    /// 内存映射缓冲。
+    pub map_buffer: &'a mut [MemoryEntry],
+    /// 退出引导服务的固件函数。
+    pub exit: ExitBootServices,
+    /// 映像句柄。
+    pub image_handle: Handle,
+    /// 键的存放槽。
+    pub map_key: &'a mut Option<usize>,
+}
+
+/// 交接失败原因（**保留来源**，不做有损扁平化）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandoffError {
+    /// 响应填充阶段的扫描错误。
+    Fill(limine::scan::ScanError),
+    /// 跳转前检查失败。
+    BeforeEntry(EntryError),
+    /// 退出引导服务失败。
+    Exit(Error),
+}
+
+/// 完整交接编排：填充响应 → 跳转前检查 → 取键并退出 → 跳转。
+///
+/// 顺序与门禁是硬要求：**检查不通过绝不跳转**；**退出失败绝不跳转**。
+/// 跳转以 `enter` 注入（真实路径传 `Platform::jump_to`），故本函数宿主可测。
+///
+/// # Safety
+///
+/// 由 `enter` 的实现与调用方共同保证：跳转后不再调用任何固件服务，且目标已映射。
+pub unsafe fn enter_kernel<F>(h: Handoff<'_, '_>, enter: F) -> Result<usize, HandoffError>
+where
+    F: FnOnce(u64) -> !,
+{
+    let report = crate::protocol::fill_responses(h.image, h.hits, h.responses)
+        .map_err(HandoffError::Fill)?;
+    let entry =
+        check_before_entry(h.entry, h.plan, h.must_stay).map_err(HandoffError::BeforeEntry)?;
+    // 映射条目数只作诊断：本函数**必然发散**（`enter` 的返回类型是 `!`），故显式标记为有意不用。
+    let _count = unsafe { handoff(h.source, h.map_buffer, h.exit, h.image_handle, h.map_key) }
+        .map_err(HandoffError::Exit)?;
+    let _ = report;
+    enter(entry);
+}
+
+#[cfg(test)]
+mod enter_kernel_tests {
+    use super::{EntryError, Handoff, HandoffError, enter_kernel};
+    use core::ffi::c_void;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use firmware::memory::MemoryEntry;
+    use firmware_current::current::{
+        BUFFER_TOO_SMALL, DEVICE_ERROR, Handle, Status, SUCCESS, UefiMemoryMapSource,
+    };
+    use limine::base::HHDM_REQUEST_ID;
+    use limine::scan::{RequestHit, END_MARKER, START_MARKER};
+    use mm::plan::Mapping;
+    use mm::takeover::MustStay;
+    use arch::addr::{PhysAddr, VirtAddr};
+    use arch::paging::PageFlags;
+    use crate::responses::Responses;
+
+    const LARGE: u64 = 2 * 1024 * 1024;
+
+    /// 记录“是否被要求跳转”。若真跳了，本测试会因计数不符而失败（而不是真的跳走）。
+    static ENTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "efiapi" fn good_map(
+        map_size: *mut usize,
+        map: *mut c_void,
+        map_key: *mut usize,
+        descriptor_size: *mut usize,
+        _version: *mut u32,
+    ) -> Status {
+        unsafe {
+            *map_key = 0x1234;
+            *descriptor_size = 40;
+            *map_size = 40;
+            if map.is_null() {
+                BUFFER_TOO_SMALL
+            } else {
+                core::ptr::write_bytes(map.cast::<u8>(), 0, 40);
+                SUCCESS
+            }
+        }
+    }
+
+    unsafe extern "efiapi" fn never_exit(_image: Handle, _map_key: usize) -> Status {
+        DEVICE_ERROR
+    }
+
+    /// 测试用的“跳转”：只计数，然后 panic 终止（绝不真的跳走）。
+    fn counting_enter(_entry: u64) -> ! {
+        ENTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        panic!("测试中不应真的跳转")
+    }
+
+    fn push_words(image: &mut std::vec::Vec<u8>, words: &[u64]) {
+        for word in words {
+            image.extend_from_slice(&word.to_ne_bytes());
+        }
+    }
+
+    /// 映像：START + 一个 HHDM 请求 + END。
+    fn image_with_hhdm() -> std::vec::Vec<u8> {
+        let mut image = std::vec![0u8; 64];
+        push_words(&mut image, &START_MARKER);
+        push_words(&mut image, &HHDM_REQUEST_ID);
+        push_words(&mut image, &[0, 0, 0]);
+        push_words(&mut image, &END_MARKER);
+        image
+    }
+
+    fn mapping(virt: u64, len: u64) -> Mapping {
+        Mapping {
+            virt: VirtAddr::new(virt),
+            phys: PhysAddr::new(virt),
+            len,
+            flags: PageFlags::present(),
+        }
+    }
+
+    fn stay(start: u64, len: u64) -> MustStay {
+        MustStay { start, len }
+    }
+
+    fn empty_entry() -> MemoryEntry {
+        MemoryEntry {
+            base: arch::addr::PhysAddr::new(0),
+            length: 0,
+            kind: firmware::memory::MemoryKind::Reserved,
+        }
+    }
+
+    #[test]
+    fn an_uncovered_span_stops_before_any_jump() {
+        let mut image = image_with_hhdm();
+        let mut hits = [RequestHit::EMPTY; 4];
+        let mut responses = Responses::new();
+        let plan = [mapping(0xffff_ffff_8000_0000, LARGE)];
+        let must = [stay(0xffff_ffff_9000_0000, LARGE)];
+        let mut descriptors = [0u8; 128];
+        let mut source = UefiMemoryMapSource::new(good_map, &mut descriptors);
+        let mut map_buffer = [empty_entry(); 4];
+        let mut slot = None;
+        let h = Handoff {
+            image: &mut image,
+            hits: &mut hits,
+            responses: &mut responses,
+            plan: &plan,
+            must_stay: &must,
+            entry: 0xffff_ffff_8000_0100,
+            source: &mut source,
+            map_buffer: &mut map_buffer,
+            exit: never_exit,
+            image_handle: core::ptr::null_mut(),
+            map_key: &mut slot,
+        };
+        let result = unsafe { enter_kernel(h, counting_enter) };
+        assert_eq!(
+            result,
+            Err(HandoffError::BeforeEntry(EntryError::NotCovered {
+                address: 0xffff_ffff_9000_0000
+            })),
+            "覆盖不全必须报错"
+        );
+        assert_eq!(ENTER_CALLS.load(Ordering::SeqCst), 0, "覆盖不全时绝不能跳转");
+    }
+
+    #[test]
+    fn a_zero_entry_stops_before_any_jump() {
+        let mut image = image_with_hhdm();
+        let mut hits = [RequestHit::EMPTY; 4];
+        let mut responses = Responses::new();
+        let plan = [mapping(0xffff_ffff_8000_0000, LARGE)];
+        let must = [stay(0xffff_ffff_8000_0000, LARGE)];
+        let mut descriptors = [0u8; 128];
+        let mut source = UefiMemoryMapSource::new(good_map, &mut descriptors);
+        let mut map_buffer = [empty_entry(); 4];
+        let mut slot = None;
+        let h = Handoff {
+            image: &mut image,
+            hits: &mut hits,
+            responses: &mut responses,
+            plan: &plan,
+            must_stay: &must,
+            entry: 0,
+            source: &mut source,
+            map_buffer: &mut map_buffer,
+            exit: never_exit,
+            image_handle: core::ptr::null_mut(),
+            map_key: &mut slot,
+        };
+        let result = unsafe { enter_kernel(h, counting_enter) };
+        assert_eq!(
+            result,
+            Err(HandoffError::BeforeEntry(EntryError::NoEntry)),
+            "入口为 0 必须报错"
+        );
+        assert_eq!(ENTER_CALLS.load(Ordering::SeqCst), 0, "入口为 0 时绝不能跳转");
     }
 }
