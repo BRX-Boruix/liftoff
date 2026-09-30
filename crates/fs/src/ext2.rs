@@ -326,6 +326,53 @@ where
     Ok(written)
 }
 
+/// 块组描述符（每项 32 字节）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GroupDescriptor {
+    /// `bg_block_bitmap`（@0）。
+    pub block_bitmap: u32,
+    /// `bg_inode_bitmap`（@4）。
+    pub inode_bitmap: u32,
+    /// `bg_inode_table`（@8）：**inode 表所在块**。
+    pub inode_table: u32,
+    /// `bg_free_blocks_count`（@12，u16）。
+    pub free_blocks: u16,
+    /// `bg_free_inodes_count`（@14，u16）。
+    pub free_inodes: u16,
+    /// `bg_used_dirs_count`（@16，u16）。
+    pub used_dirs: u16,
+}
+
+/// 块组描述符表所在的**块号**。
+///
+/// 规范规定：块大小为 1024 时描述符表在**块 2**（块 1 被超级块在块内的偏移占用），
+/// 更大的块大小则在**块 1**。这是 EXT2 里最容易写错的一处分支。
+pub fn group_descriptor_block(block_size: u32) -> Result<u64, Ext2Error> {
+    if block_size == 0 {
+        return Err(Ext2Error::BadBlockSize);
+    }
+    Ok(if block_size == 1024 { 2 } else { 1 })
+}
+
+/// 解析块组描述符表里的第 `index` 项（每项 32 字节）。
+///
+/// 数值边界：偏移 `index × 32` 用 checked 运算；越界一律 `ShortImage`（先判后读）。
+pub fn parse_group_descriptor(table: &[u8], index: u32) -> Result<GroupDescriptor, Ext2Error> {
+    let at = (index as usize)
+        .checked_mul(32)
+        .ok_or(Ext2Error::ShortImage)?;
+    let end = at.checked_add(32).ok_or(Ext2Error::ShortImage)?;
+    let raw = table.get(at..end).ok_or(Ext2Error::ShortImage)?;
+    Ok(GroupDescriptor {
+        block_bitmap: read_u32(raw, 0).ok_or(Ext2Error::ShortImage)?,
+        inode_bitmap: read_u32(raw, 4).ok_or(Ext2Error::ShortImage)?,
+        inode_table: read_u32(raw, 8).ok_or(Ext2Error::ShortImage)?,
+        free_blocks: read_u16(raw, 12).ok_or(Ext2Error::ShortImage)?,
+        free_inodes: read_u16(raw, 14).ok_or(Ext2Error::ShortImage)?,
+        used_dirs: read_u16(raw, 16).ok_or(Ext2Error::ShortImage)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EXT2_MAGIC, EXT2_SUPERBLOCK_OFFSET, Ext2Error, Superblock, parse_superblock};
@@ -809,5 +856,68 @@ mod double_indirect_tests {
             Err(Ext2Error::UnsupportedLayout)
             , "三级间接仍未支持，必须响亮报错"
         );
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::{Ext2Error, GroupDescriptor, group_descriptor_block, parse_group_descriptor};
+    use std::vec::Vec;
+
+    /// 造一张块组描述符表。
+    fn table(entries: &[(u32, u32, u32, u16)]) -> Vec<u8> {
+        let mut raw = std::vec![0u8; entries.len() * 32];
+        for (index, (block_bitmap, inode_bitmap, inode_table, free_blocks)) in entries.iter().enumerate() {
+            let at = index * 32;
+            raw[at..at + 4].copy_from_slice(&block_bitmap.to_le_bytes());
+            raw[at + 4..at + 8].copy_from_slice(&inode_bitmap.to_le_bytes());
+            raw[at + 8..at + 12].copy_from_slice(&inode_table.to_le_bytes());
+            raw[at + 12..at + 14].copy_from_slice(&free_blocks.to_le_bytes());
+            raw[at + 14..at + 16].copy_from_slice(&7u16.to_le_bytes());
+            raw[at + 16..at + 18].copy_from_slice(&2u16.to_le_bytes());
+        }
+        raw
+    }
+
+    #[test]
+    fn the_descriptor_block_depends_on_the_block_size() {
+        // 1 KiB 块时描述符表在块 2；更大块时在块 1。
+        assert_eq!(group_descriptor_block(1024).expect("合法"), 2);
+        assert_eq!(group_descriptor_block(2048).expect("合法"), 1);
+        assert_eq!(group_descriptor_block(4096).expect("合法"), 1);
+        assert_eq!(group_descriptor_block(0), Err(Ext2Error::BadBlockSize));
+    }
+
+    #[test]
+    fn a_descriptor_yields_the_inode_table_location() {
+        let raw = table(&[(5, 6, 7, 1234)]);
+        let group: GroupDescriptor = parse_group_descriptor(&raw, 0).expect("解析成功");
+        assert_eq!(group.block_bitmap, 5);
+        assert_eq!(group.inode_bitmap, 6);
+        assert_eq!(group.inode_table, 7, "inode 表位置在偏移 8");
+        assert_eq!(group.free_blocks, 1234);
+        assert_eq!(group.free_inodes, 7);
+        assert_eq!(group.used_dirs, 2);
+    }
+
+    #[test]
+    fn the_second_descriptor_is_thirty_two_bytes_later() {
+        let raw = table(&[(5, 6, 7, 1), (9, 10, 11, 2)]);
+        let group = parse_group_descriptor(&raw, 1).expect("解析成功");
+        assert_eq!(group.block_bitmap, 9);
+        assert_eq!(group.inode_table, 11);
+        assert_eq!(group.free_blocks, 2);
+    }
+
+    #[test]
+    fn a_descriptor_past_the_table_is_rejected() {
+        let raw = table(&[(5, 6, 7, 1)]);
+        assert_eq!(parse_group_descriptor(&raw, 1), Err(Ext2Error::ShortImage));
+    }
+
+    #[test]
+    fn a_short_table_is_rejected() {
+        let raw = std::vec![0u8; 16];
+        assert_eq!(parse_group_descriptor(&raw, 0), Err(Ext2Error::ShortImage));
     }
 }
