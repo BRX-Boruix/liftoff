@@ -26,12 +26,18 @@ pub fn pixel_format_of(mode: &ModeInformation) -> Result<PixelFormat, Error> {
             red_shift: 0,
             green_shift: 8,
             blue_shift: 16,
+            red_mask_size: 8,
+            green_mask_size: 8,
+            blue_mask_size: 8,
         }),
         PIXEL_FORMAT_BGR8 => Ok(PixelFormat {
             bits_per_pixel: 32,
             red_shift: 16,
             green_shift: 8,
             blue_shift: 0,
+            red_mask_size: 8,
+            green_mask_size: 8,
+            blue_mask_size: 8,
         }),
         PIXEL_FORMAT_BITMASK => {
             let masks = &mode.pixel_information;
@@ -47,6 +53,10 @@ pub fn pixel_format_of(mode: &ModeInformation) -> Result<PixelFormat, Error> {
                 red_shift,
                 green_shift,
                 blue_shift,
+                // 宽度逐通道来自掩码 —— 不做「32bpp 就是 8/8/8」的假设。
+                red_mask_size: red_bits as u8,
+                green_mask_size: green_bits as u8,
+                blue_mask_size: blue_bits as u8,
             })
         }
         _ => Err(Error::Unsupported),
@@ -81,9 +91,21 @@ mod tests {
     #[test]
     fn rgb_and_bgr_have_fixed_channel_layouts() {
         let rgb = pixel_format_of(&mode(PIXEL_FORMAT_RGBR8, [0; 4])).expect("RGBR8");
-        assert_eq!((rgb.bits_per_pixel, rgb.red_shift, rgb.green_shift, rgb.blue_shift), (32, 0, 8, 16));
+        assert_eq!(
+            (rgb.bits_per_pixel, rgb.red_shift, rgb.green_shift, rgb.blue_shift),
+            (32, 0, 8, 16)
+        );
+        assert_eq!(
+            (rgb.red_mask_size, rgb.green_mask_size, rgb.blue_mask_size),
+            (8, 8, 8),
+            "固定格式的通道宽度也是 8/8/8"
+        );
         let bgr = pixel_format_of(&mode(PIXEL_FORMAT_BGR8, [0; 4])).expect("BGR8");
-        assert_eq!((bgr.bits_per_pixel, bgr.red_shift, bgr.green_shift, bgr.blue_shift), (32, 16, 8, 0));
+        assert_eq!(
+            (bgr.bits_per_pixel, bgr.red_shift, bgr.green_shift, bgr.blue_shift),
+            (32, 16, 8, 0)
+        );
+        assert_eq!((bgr.red_mask_size, bgr.green_mask_size, bgr.blue_mask_size), (8, 8, 8));
     }
 
     #[test]
@@ -92,6 +114,25 @@ mod tests {
             .expect("BitMask");
         assert_eq!((fmt.red_shift, fmt.green_shift, fmt.blue_shift), (16, 8, 0));
         assert_eq!(fmt.bits_per_pixel, 24, "通道位宽之和即像素宽度");
+        assert_eq!(
+            (fmt.red_mask_size, fmt.green_mask_size, fmt.blue_mask_size),
+            (8, 8, 8),
+            "通道宽度必须由掩码数出来"
+        );
+    }
+
+    #[test]
+    fn non_uniform_masks_yield_their_own_widths_not_a_guess() {
+        // RGB565：红 5 位、绿 6 位、蓝 5 位 —— 按 8/8/8 想当然地填就会错。
+        let fmt = pixel_format_of(&mode(PIXEL_FORMAT_BITMASK, [0xF800, 0x07E0, 0x001F, 0]))
+            .expect("BitMask");
+        assert_eq!(
+            (fmt.red_mask_size, fmt.green_mask_size, fmt.blue_mask_size),
+            (5, 6, 5),
+            "宽度必须逐通道来自掩码"
+        );
+        assert_eq!((fmt.red_shift, fmt.green_shift, fmt.blue_shift), (11, 5, 0));
+        assert_eq!(fmt.bits_per_pixel, 16);
     }
 
     #[test]

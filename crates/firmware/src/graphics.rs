@@ -17,6 +17,12 @@ pub struct PixelFormat {
     pub green_shift: u8,
     /// 蓝色通道位偏移。
     pub blue_shift: u8,
+    /// 红通道掩码宽度（位）。
+    pub red_mask_size: u8,
+    /// 绿通道掩码宽度（位）。
+    pub green_mask_size: u8,
+    /// 蓝通道掩码宽度（位）。
+    pub blue_mask_size: u8,
 }
 
 /// 线性帧缓冲描述。
@@ -83,7 +89,15 @@ mod tests {
             width,
             height,
             pitch,
-            format: PixelFormat { bits_per_pixel: bpp, red_shift: red, green_shift: green, blue_shift: blue },
+            format: PixelFormat {
+                bits_per_pixel: bpp,
+                red_shift: red,
+                green_shift: green,
+                blue_shift: blue,
+                red_mask_size: 8,
+                green_mask_size: 8,
+                blue_mask_size: 8,
+            },
         }
     }
 
