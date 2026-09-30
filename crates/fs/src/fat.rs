@@ -40,6 +40,8 @@ pub enum FatError {
     BadFatCount,
     /// 判型算术溢出或布局自相矛盾。
     ArithmeticOverflow,
+    /// 表项越出 FAT 表范围。
+    TableOutOfBounds,
 }
 
 /// BPB 的关键字段。
@@ -153,6 +155,37 @@ pub fn parse_bpb(sector: &[u8]) -> Result<Bpb, FatError> {
     })
 }
 
+/// 读 FAT 表里第 `index` 个表项。
+///
+/// FAT12 的项是 **12 位**且**跨字节边界**：项 n 的字节偏移是 `n + n / 2`；
+/// **偶项**取低 12 位、**奇项**取高 12 位（右移 4）。这是 FAT12 最经典的陷阱。
+/// FAT32 的高 4 位是**保留位**，必须屏蔽（否则会读出 0xFFFF_FFFF 这类非法值）。
+/// 越界一律报错（先判范围再读，不越界读）。
+pub fn fat_entry(fat: &[u8], index: u32, kind: FatKind) -> Result<u32, FatError> {
+    match kind {
+        FatKind::Fat12 => {
+            let slot = index as usize;
+            let offset = slot
+                .checked_add(slot / 2)
+                .ok_or(FatError::TableOutOfBounds)?;
+            let raw = read_u16(fat, offset).ok_or(FatError::TableOutOfBounds)? as u32;
+            Ok(if slot % 2 == 0 { raw & 0x0FFF } else { raw >> 4 })
+        }
+        FatKind::Fat16 => {
+            let offset = (index as usize)
+                .checked_mul(2)
+                .ok_or(FatError::TableOutOfBounds)?;
+            Ok(read_u16(fat, offset).ok_or(FatError::TableOutOfBounds)? as u32)
+        }
+        FatKind::Fat32 => {
+            let offset = (index as usize)
+                .checked_mul(4)
+                .ok_or(FatError::TableOutOfBounds)?;
+            Ok(read_u32(fat, offset).ok_or(FatError::TableOutOfBounds)? & 0x0FFF_FFFF)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FAT_SIGNATURE_OFFSET, FatError, FatKind, parse_bpb};
@@ -243,5 +276,46 @@ mod tests {
     fn a_zero_sectors_per_cluster_is_rejected() {
         let raw = sector(512, 0, 1, 2, 512, 65536, 256, 0, 0);
         assert_eq!(parse_bpb(&raw), Err(FatError::BadClusterSize));
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::{FatError, FatKind, fat_entry};
+    
+
+    #[test]
+    fn fat12_even_entries_take_the_low_twelve_bits() {
+        // index 0 → 偏移 0 → 两字节 0xF8,0xFF → LE = 0xFFF8 → 偶项取低 12 位 = 0xFF8。
+        let fat = std::vec![0xF8u8, 0xFF, 0xFF, 0xFF];
+        assert_eq!(fat_entry(&fat, 0, FatKind::Fat12).expect("读取成功"), 0x0FF8);
+    }
+
+    #[test]
+    fn fat12_odd_entries_shift_across_a_byte_boundary() {
+        // index 1 → 偏移 1 + 0 = 1 → 两字节 0xFF,0x0F → LE = 0x0FFF → 奇项右移 4 位 = 0x0FF。
+        let fat = std::vec![0xF8u8, 0xFF, 0x0F, 0x00];
+        assert_eq!(fat_entry(&fat, 1, FatKind::Fat12).expect("读取成功"), 0x0FF);
+    }
+
+    #[test]
+    fn fat16_entries_are_little_endian() {
+        let fat = std::vec![0x34u8, 0x12, 0x78, 0x56];
+        assert_eq!(fat_entry(&fat, 0, FatKind::Fat16).expect("读取成功"), 0x1234);
+        assert_eq!(fat_entry(&fat, 1, FatKind::Fat16).expect("读取成功"), 0x5678);
+    }
+
+    #[test]
+    fn fat32_entries_mask_the_reserved_high_bits() {
+        // 高 4 位是保留位，必须屏蔽：全 0xFF 应得到 0x0FFF_FFFF 而不是 0xFFFF_FFFF。
+        let fat = std::vec![0xFFu8; 8];
+        assert_eq!(fat_entry(&fat, 0, FatKind::Fat32).expect("读取成功"), 0x0FFF_FFFF);
+    }
+
+    #[test]
+    fn an_entry_past_the_table_is_rejected() {
+        let fat = std::vec![0u8; 4];
+        assert_eq!(fat_entry(&fat, 100, FatKind::Fat16), Err(FatError::TableOutOfBounds));
+        assert_eq!(fat_entry(&fat, u32::MAX, FatKind::Fat12), Err(FatError::TableOutOfBounds));
     }
 }
