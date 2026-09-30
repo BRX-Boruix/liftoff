@@ -42,3 +42,5 @@ pub mod guid;
 pub mod protocol;
 
 pub mod protocol_lookup;
+
+pub mod discover;
