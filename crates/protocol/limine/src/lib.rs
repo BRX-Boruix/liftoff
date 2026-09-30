@@ -10,6 +10,8 @@ extern crate std;
 
 pub mod base;
 pub mod executable_address;
+pub mod executable_file;
+pub mod module;
 pub mod file;
 pub mod framebuffer;
 pub mod memmap;
