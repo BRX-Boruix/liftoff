@@ -6,6 +6,7 @@
 
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
+use firmware::memory::{MemoryEntry, MemoryMapSource};
 use firmware::error::Error;
 use firmware_current::current::{
     ExitBootServices, Handle, SystemTable, UefiBootServices, UefiMemoryMapSource, boot_services_of,
@@ -28,6 +29,32 @@ pub fn start_with<P: Platform>(system_table: *mut SystemTable) -> Result<Outcome
 /// 生产入口：平台固定为门面选定的实现。
 pub fn start(system_table: *mut SystemTable) -> Result<Outcome, Error> {
     start_with::<crate::PlatformImpl>(system_table)
+}
+
+/// 交接编排：**先加载内存映射**（键由此被记录）→ 取键 → 退出引导服务。
+///
+/// 顺序是硬要求：`ExitBootServices` 只接受**最近一次** `GetMemoryMap` 返回的键；
+/// 加载失败或取不到键时**绝不退出**（否则固件服务被提前废掉，后续什么都做不了）。
+///
+/// # Safety
+///
+/// 与 [`exit_prepared`] 相同：退出后不得再调用任何固件服务，且当前代码与栈在新页表中
+/// 仍须被映射。
+pub unsafe fn handoff(
+    source: &mut UefiMemoryMapSource<'_>,
+    map_buffer: &mut [MemoryEntry],
+    exit: ExitBootServices,
+    image_handle: Handle,
+    map_key: &mut Option<usize>,
+) -> Result<usize, Error> {
+    let map = source.memory_map(map_buffer)?;
+    let count = map.len();
+    if !capture_map_key(source, map_key) {
+        return Err(Error::InvalidState);
+    }
+    // SAFETY: 由调用方保证（见函数文档与 `exit_prepared` 的 SAFETY 契约）。
+    unsafe { exit_prepared(exit, image_handle, map_key)? };
+    Ok(count)
 }
 
 /// 交接前取键：把内存映射来源里记录的 `map_key` 写进槽。
@@ -246,5 +273,118 @@ mod handoff_tests {
         let mut slot = None;
         assert!(!capture_map_key(&source, &mut slot), "没加载就不该有键");
         assert_eq!(slot, None, "不得凭空编造键");
+    }
+}
+
+#[cfg(test)]
+mod handoff_flow_tests {
+    use super::handoff;
+    use core::ffi::c_void;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use firmware::memory::MemoryEntry;
+    use firmware_current::current::{
+        BUFFER_TOO_SMALL, DEVICE_ERROR, Handle, Status, SUCCESS, UefiMemoryMapSource,
+    };
+
+    static LOAD_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXIT_KEY: AtomicUsize = AtomicUsize::new(0);
+    /// 失败路径专用：与成功路径**分开**计数，避免两个测试互相干扰（顺序相关/偶发）。
+    static EXIT_CALLS_FAIL: AtomicUsize = AtomicUsize::new(0);
+
+    /// 成功的 GetMemoryMap：探测返回 BUFFER_TOO_SMALL，正式调用写描述符并记录键。
+    /// SAFETY: 调用方按 UEFI 契约传入有效指针；本测试中始终如此。
+    unsafe extern "efiapi" fn good_map(
+        map_size: *mut usize,
+        map: *mut c_void,
+        map_key: *mut usize,
+        descriptor_size: *mut usize,
+        _version: *mut u32,
+    ) -> Status {
+        unsafe {
+            LOAD_CALLS.fetch_add(1, Ordering::SeqCst);
+            *map_key = 0x1234;
+            *descriptor_size = 40;
+            *map_size = 40;
+            if map.is_null() {
+                BUFFER_TOO_SMALL
+            } else {
+                core::ptr::write_bytes(map.cast::<u8>(), 0, 40);
+                SUCCESS
+            }
+        }
+    }
+
+    /// 失败的 GetMemoryMap：直接返回错误状态（探测阶段就失败）。
+    /// SAFETY: 同上；本实现不写任何指针。
+    unsafe extern "efiapi" fn bad_map(
+        _map_size: *mut usize,
+        _map: *mut c_void,
+        _map_key: *mut usize,
+        _descriptor_size: *mut usize,
+        _version: *mut u32,
+    ) -> Status {
+        DEVICE_ERROR
+    }
+
+    /// 失败路径用的退出服务：若被调用就计数（用于断言“从未调用”）。
+/// SAFETY: 无内存访问。
+unsafe extern "efiapi" fn counting_exit_fail(_image: Handle, _map_key: usize) -> Status {
+    EXIT_CALLS_FAIL.fetch_add(1, Ordering::SeqCst);
+    SUCCESS
+}
+
+/// 成功的 ExitBootServices：记录调用次数与收到的键。
+    /// SAFETY: 无内存访问。
+    unsafe extern "efiapi" fn good_exit(_image: Handle, map_key: usize) -> Status {
+        EXIT_CALLS.fetch_add(1, Ordering::SeqCst);
+        EXIT_KEY.store(map_key, Ordering::SeqCst);
+        SUCCESS
+    }
+
+    fn empty_entry() -> MemoryEntry {
+        MemoryEntry {
+            base: arch::addr::PhysAddr::new(0),
+            length: 0,
+            kind: firmware::memory::MemoryKind::Reserved,
+        }
+    }
+
+    #[test]
+    fn a_successful_handoff_loads_captures_and_exits() {
+        let mut descriptors = [0u8; 128];
+        let mut source = UefiMemoryMapSource::new(good_map, &mut descriptors);
+        let mut buffer = [empty_entry(); 4];
+        let mut slot = None;
+        let count = unsafe { handoff(&mut source, &mut buffer, good_exit, core::ptr::null_mut(), &mut slot) }
+            .expect("交接成功");
+        assert_eq!(count, 1, "描述符数来自假固件");
+        assert_eq!(slot, Some(0x1234), "键必须被取到");
+        assert_eq!(EXIT_CALLS.load(Ordering::SeqCst), 1, "必须调用一次退出");
+        assert_eq!(EXIT_KEY.load(Ordering::SeqCst), 0x1234, "退出必须收到同一个键");
+    }
+
+    #[test]
+    fn a_failed_map_load_never_reaches_the_exit() {
+        let mut descriptors = [0u8; 128];
+        let mut source = UefiMemoryMapSource::new(bad_map, &mut descriptors);
+        let mut buffer = [empty_entry(); 4];
+        let mut slot = None;
+        let result = unsafe {
+            handoff(
+                &mut source,
+                &mut buffer,
+                counting_exit_fail,
+                core::ptr::null_mut(),
+                &mut slot,
+            )
+        };
+        assert!(result.is_err(), "加载失败必须报错");
+        assert_eq!(slot, None, "没有键就不该有键");
+        assert_eq!(
+            EXIT_CALLS_FAIL.load(Ordering::SeqCst),
+            0,
+            "加载失败绝不能退出引导服务"
+        );
     }
 }
