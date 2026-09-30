@@ -31,6 +31,13 @@ name = "efi"
 version = "0.1.0"
 
 [[package]]
+name = "firmware"
+version = "0.1.0"
+dependencies = [
+ "arch",
+]
+
+[[package]]
 name = "fs"
 version = "0.1.0"
 

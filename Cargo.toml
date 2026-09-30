@@ -13,6 +13,7 @@ members = [
     "crates/loader",
     "crates/utils",
     "crates/efi",
+    "crates/firmware",
 ]
 
 [workspace.package]
