@@ -1,12 +1,31 @@
-[package]
-name = "liftoff"
+[workspace]
+resolver = "3"
+exclude = ["crates/flanterm_rust"]
+members = [
+    "crates/boot",
+    "crates/protocol/limine",
+    "crates/arch/arch",
+    "crates/arch/x86_64",
+    "crates/mm",
+    "crates/fs",
+    "crates/driver",
+    "crates/loader",
+    "crates/utils",
+    "crates/efi",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "BORUIX bootloader (gen2 rewrite): UEFI entry + Limine protocol semantics"
 license = "MIT"
 publish = false
 
-[dependencies]
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 
 [profile.dev]
 panic = "abort"

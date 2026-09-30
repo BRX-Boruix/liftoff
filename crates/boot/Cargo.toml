@@ -1,0 +1,15 @@
+[package]
+name = "boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "liftoff"
+path = "src/main.rs"
+
+[dependencies]

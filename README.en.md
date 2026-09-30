@@ -27,6 +27,13 @@ installs `rust-src`, `llvm-tools` and the `x86_64-unknown-uefi` target.
 
 ## Repository layout
 
+- `crates/boot` -- the executable (binary name `liftoff`): UEFI entry, orchestration and wiring
+- `crates/protocol/limine` -- Limine protocol contract and request handling
+- `crates/arch/arch`, `crates/arch/x86_64` -- architecture abstraction and the x86_64 implementation
+- `crates/mm`, `crates/fs`, `crates/driver`, `crates/loader`, `crates/utils` -- architecture-independent layers
+- `crates/efi` -- UEFI types and protocol bindings
+- `crates/flanterm_rust` -- vendored framebuffer terminal (MIT + BSD-2)
+
 - `src/main.rs` -- program entry
 
 ## Related projects

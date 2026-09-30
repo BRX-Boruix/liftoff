@@ -3,5 +3,41 @@
 version = 4
 
 [[package]]
-name = "liftoff"
+name = "arch"
+version = "0.1.0"
+
+[[package]]
+name = "boot"
+version = "0.1.0"
+
+[[package]]
+name = "driver"
+version = "0.1.0"
+
+[[package]]
+name = "efi"
+version = "0.1.0"
+
+[[package]]
+name = "fs"
+version = "0.1.0"
+
+[[package]]
+name = "limine"
+version = "0.1.0"
+
+[[package]]
+name = "loader"
+version = "0.1.0"
+
+[[package]]
+name = "mm"
+version = "0.1.0"
+
+[[package]]
+name = "utils"
+version = "0.1.0"
+
+[[package]]
+name = "x86_64"
 version = "0.1.0"
