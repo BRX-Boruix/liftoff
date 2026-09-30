@@ -1214,31 +1214,35 @@ where
     let mut write_phys = write_phys;
     let loaded = {
         let mut write = |vaddr: u64, bytes: &[u8]| -> Result<(), ElfError> {
-            let len = bytes.len() as u64;
-            let end = vaddr.checked_add(len).ok_or(ElfError::SegmentOutOfBounds)?;
-            // 必须落在**同一条**映射内（不允许跨映射拼接）。
-            let mut found = None;
-            for candidate in plan {
-                let Some(mapping_end) = candidate.virt.as_u64().checked_add(candidate.len) else {
-                    continue;
+            // 一段可能**跨多条映射**：真实内核的第 1 段有 0x4d5780（约 4.8 MiB），
+            // 远大于一条 2 MiB 映射。所以按映射**切分**写入，而不是要求单条映射覆盖整段
+            // —— 后者在真机上直接报 NotMapped（宿主测试已复现）。
+            let mut at = vaddr;
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                let Some(mapping) = plan.iter().find(|m| {
+                    let base = m.virt.as_u64();
+                    at >= base && at < base.saturating_add(m.len)
+                }) else {
+                    not_mapped = true;
+                    return Err(ElfError::SegmentOutOfBounds);
                 };
-                if vaddr >= candidate.virt.as_u64() && end <= mapping_end {
-                    found = Some(candidate);
-                    break;
-                }
+                let base = mapping.virt.as_u64();
+                let offset = at - base;
+                let room = mapping.len - offset;
+                let take = core::cmp::min(room, rest.len() as u64) as usize;
+                let phys = mapping
+                    .phys
+                    .as_u64()
+                    .checked_add(offset)
+                    .ok_or(ElfError::SegmentOutOfBounds)?;
+                write_phys(phys, &rest[..take])?;
+                total += take;
+                at = at
+                    .checked_add(take as u64)
+                    .ok_or(ElfError::SegmentOutOfBounds)?;
+                rest = &rest[take..];
             }
-            let Some(mapping) = found else {
-                not_mapped = true;
-                return Err(ElfError::SegmentOutOfBounds);
-            };
-            let offset = vaddr - mapping.virt.as_u64();
-            let phys = mapping
-                .phys
-                .as_u64()
-                .checked_add(offset)
-                .ok_or(ElfError::SegmentOutOfBounds)?;
-            write_phys(phys, bytes)?;
-            total += bytes.len();
             Ok(())
         };
         load_segments(image, segments, &mut write)
@@ -1606,6 +1610,39 @@ mod copy_segments_tests {
             &image[0x1000..0x1010],
             "第 0 段字节必须落到 plan 给的物理地址"
         );
+    }
+
+    #[test]
+    fn a_segment_larger_than_one_mapping_is_written_across_mappings() {
+        // 真实内核的第 1 段有 0x4d5780（约 4.8 MiB），**大于一条 2 MiB 映射**，
+        // 所以写入必须按映射切分，而不是要求单条映射覆盖整段。
+        let mut segments = [ProgramHeader::EMPTY; 2];
+        segments[0].p_offset = 0;
+        segments[0].p_vaddr = 0xffff_ffff_8000_0000;
+        segments[0].p_filesz = 5 * 1024 * 1024;
+        segments[0].p_memsz = 5 * 1024 * 1024;
+        let image = std::vec![0xABu8; 5 * 1024 * 1024];
+        let plan = [
+            mapping(0xffff_ffff_8000_0000, 0x20_0000, 2 * 1024 * 1024),
+            mapping(0xffff_ffff_8020_0000, 0x40_0000, 2 * 1024 * 1024),
+            mapping(0xffff_ffff_8040_0000, 0x60_0000, 2 * 1024 * 1024),
+        ];
+        let mut memory = std::vec![0u8; 0x80_0000];
+        let mut write = |phys: u64, bytes: &[u8]| {
+            let at = usize::try_from(phys).map_err(|_| ElfError::SegmentOutOfBounds)?;
+            let slot = memory
+                .get_mut(at..at + bytes.len())
+                .ok_or(ElfError::SegmentOutOfBounds)?;
+            slot.copy_from_slice(bytes);
+            Ok(())
+        };
+        let total = copy_kernel_segments(&image, &segments[..1], &plan, &mut write)
+            .expect("跨多条映射的段必须能写入");
+        assert_eq!(total, 5 * 1024 * 1024);
+        // 三条映射各自的开头都应被写到（说明是**切分**写入，不是只写第一条）。
+        assert_eq!(memory[0x20_0000], 0xAB);
+        assert_eq!(memory[0x40_0000], 0xAB);
+        assert_eq!(memory[0x60_0000], 0xAB);
     }
 
     #[test]
