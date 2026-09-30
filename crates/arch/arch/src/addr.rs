@@ -12,7 +12,7 @@ pub const PAGE_SIZE: u64 = 4096;
 /// 对齐量（字节）。
 ///
 /// 不变量：取值恒为 2 的幂且非零——只能经 [`Alignment::new_power_of_two`] 构造，
-/// 因此对齐运算不会收到非法对齐量（严格模式：宁可报错，不靠文档前置条件）。
+/// 因此对齐运算不可能收到非法对齐量（严格模式：宁可报错，不靠文档前置条件）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Alignment(u64);
 
@@ -73,19 +73,19 @@ macro_rules! byte_address {
                 }
             }
 
-            /// 是否按 `align` 对齐。`align` 必须为 2 的幂（调用方保证）。
+            /// 是否按 `align` 对齐。
             #[inline]
             pub const fn is_aligned_to(self, align: Alignment) -> bool {
                 self.0 % align.0 == 0
             }
 
-            /// 向下对齐。`align` 必须为 2 的幂（调用方保证）。
+            /// 向下对齐。
             #[inline]
             pub const fn align_down(self, align: Alignment) -> Self {
                 Self(self.0 & !(align.0 - 1))
             }
 
-            /// 向上对齐；溢出时返回 `None`。`align` 必须为 2 的幂（调用方保证）。
+            /// 向上对齐；溢出时返回 `None`。
             #[inline]
             pub const fn align_up(self, align: Alignment) -> Option<Self> {
                 match self.0.checked_add(align.0 - 1) {
@@ -158,21 +158,21 @@ mod tests {
     #[test]
     fn align_down_rounds_towards_zero() {
         assert_eq!(PhysAddr::new(0x1234).align_down(Alignment::PAGE).as_u64(), 0x1000);
-        assert_eq!(PhysAddr::new(0x1000).align_down(PAGE_SIZE).as_u64(), 0x1000);
-        assert_eq!(PhysAddr::new(0).align_down(PAGE_SIZE).as_u64(), 0);
+        assert_eq!(PhysAddr::new(0x1000).align_down(Alignment::PAGE).as_u64(), 0x1000);
+        assert_eq!(PhysAddr::new(0).align_down(Alignment::PAGE).as_u64(), 0);
     }
 
     #[test]
     fn align_up_keeps_aligned_values_unchanged() {
         assert_eq!(PhysAddr::new(0x1000).align_up(Alignment::PAGE).map(|a| a.as_u64()), Some(0x1000));
-        assert_eq!(PhysAddr::new(0x1001).align_up(PAGE_SIZE).map(|a| a.as_u64()), Some(0x2000));
-        assert_eq!(PhysAddr::new(0).align_up(PAGE_SIZE).map(|a| a.as_u64()), Some(0));
+        assert_eq!(PhysAddr::new(0x1001).align_up(Alignment::PAGE).map(|a| a.as_u64()), Some(0x2000));
+        assert_eq!(PhysAddr::new(0).align_up(Alignment::PAGE).map(|a| a.as_u64()), Some(0));
     }
 
     #[test]
     fn align_up_reports_overflow_instead_of_wrapping() {
-        assert_eq!(PhysAddr::new(u64::MAX).align_up(PAGE_SIZE), None);
-        assert_eq!(VirtAddr::new(u64::MAX).align_up(PAGE_SIZE), None);
+        assert_eq!(PhysAddr::new(u64::MAX).align_up(Alignment::PAGE), None);
+        assert_eq!(VirtAddr::new(u64::MAX).align_up(Alignment::PAGE), None);
     }
 
     #[test]
@@ -185,10 +185,7 @@ mod tests {
     #[test]
     fn page_frame_maps_to_its_first_address() {
         assert_eq!(PhysFrame::containing(PhysAddr::new(0x1FFF)).index(), 1);
-        assert_eq!(
-            PhysFrame::containing(PhysAddr::new(0x1FFF)).start_address().map(|a| a.as_u64()),
-            Some(0x1000)
-        );
+        assert_eq!(PhysFrame::containing(PhysAddr::new(0x1FFF)).start_address().map(|a| a.as_u64()), Some(0x1000));
         assert_eq!(PhysFrame::from_index(2).start_address().map(|a| a.as_u64()), Some(0x2000));
     }
 
@@ -204,7 +201,7 @@ mod tests {
             assert_eq!(PhysAddr::new(u64::MAX).as_usize(), None);
         }
     }
-}
+
     #[test]
     fn alignment_rejects_non_power_of_two_and_zero() {
         assert_eq!(Alignment::new_power_of_two(0), None);
@@ -218,4 +215,5 @@ mod tests {
         assert!(PhysAddr::new(0x2000).is_aligned_to(Alignment::PAGE));
         assert!(!PhysAddr::new(0x2001).is_aligned_to(Alignment::PAGE));
         assert_eq!(PhysAddr::new(0x2001).align_up(Alignment::PAGE).map(|a| a.as_u64()), Some(0x3000));
-    }}
+    }
+}
