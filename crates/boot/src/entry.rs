@@ -17,7 +17,7 @@ use mm::takeover::{MustStay, TakeoverError};
 use firmware::error::Error;
 use arch::addr::PhysAddr;
 use arch::hhdm::DirectMap;
-use arch::paging::FrameAllocator;
+use arch::paging::{FrameAllocator, PageFlags};
 use current::X86PageTable;
 use firmware::block::DeviceIndex;
 use firmware_current::current::{
@@ -1305,12 +1305,23 @@ pub fn build_plan(
             * large
     };
     let mut total = 0usize;
-    total += mm::plan::plan_kernel_high(kernel_phys, kernel_virt, kernel_len, &mut out[total..], large)
+    let kernel_count = mm::plan::plan_kernel_high(kernel_phys, kernel_virt, kernel_len, &mut out[total..], large)
         .map_err(PlanBuildError::Plan)?;
+    total += kernel_count;
     total += mm::plan::plan_hhdm(hhdm, HHDM_OFFSET, &mut out[total..], large)
         .map_err(PlanBuildError::Plan)?;
     total += mm::plan::plan_identity(identity, &mut out[total..], large)
         .map_err(PlanBuildError::Plan)?;
+    // 规划器只产出 `present()` —— 在 x86-64 上那等于 **NX 置位**：内核入口所在的代码段
+    // 不可执行，一跳过去就指令取指故障（真实运行表现为机器复位）。这里按用途补权限：
+    // 内核段 R/W/X（它要执行代码、写数据）；HHDM 与恒等 R/W（引导器与内核都要读写）。
+    let kernel_flags = PageFlags::present()
+        .with(PageFlags::writable())
+        .with(PageFlags::executable());
+    let data_flags = PageFlags::present().with(PageFlags::writable());
+    for (index, mapping) in out[..total].iter_mut().enumerate() {
+        mapping.flags = if index < kernel_count { kernel_flags } else { data_flags };
+    }
     Ok(total)
 }
 
@@ -1518,6 +1529,14 @@ mod build_plan_tests {
             MustStay { start: 0, len: 0x80_0000 },
         ];
         check_coverage(&plan[..count], &must_stay).expect("覆盖检查必须通过");
+        // 内核段必须**可执行**：规划器默认只给 present()，那在 x86-64 上等于 NX，
+        // 跳进内核就是指令取指故障（真实运行里表现为机器复位）。
+        let kernel_map = plan[..count]
+            .iter()
+            .find(|m| m.virt.as_u64() == kernel_virt)
+            .expect("内核映射必须在");
+        assert!(kernel_map.flags.is_executable(), "内核段必须可执行");
+        assert!(kernel_map.flags.is_writable(), "内核段必须可写");
     }
 
     #[test]
