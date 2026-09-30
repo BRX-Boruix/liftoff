@@ -10,6 +10,7 @@ extern crate std;
 
 pub mod base;
 pub mod bootloader_info;
+pub mod entry_point;
 pub mod executable_address;
 pub mod executable_file;
 pub mod module;
