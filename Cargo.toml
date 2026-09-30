@@ -6,6 +6,7 @@ members = [
     "crates/protocol/limine",
     "crates/arch/arch",
     "crates/arch/x86_64",
+    "crates/arch/current",
     "crates/mm",
     "crates/fs",
     "crates/driver",

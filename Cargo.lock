@@ -11,6 +11,13 @@ name = "boot"
 version = "0.1.0"
 
 [[package]]
+name = "current"
+version = "0.1.0"
+dependencies = [
+ "x86_64",
+]
+
+[[package]]
 name = "driver"
 version = "0.1.0"
 
