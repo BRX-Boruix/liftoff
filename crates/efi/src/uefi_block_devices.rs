@@ -19,6 +19,31 @@ impl<'a> UefiBlockDevices<'a> {
         Self { devices }
     }
 
+    /// 从两个固件函数指针发现并构造，**存储由本模块自己持有**。
+    ///
+    /// 入口不该知道 `BlockIo` 这种实现类型（边界），所以设备表放在本模块的静态里；
+    /// 调用方只拿到一个可用的来源。静态表在引导阶段只初始化一次。
+    ///
+    /// # Safety
+    ///
+    /// 引导阶段单线程调用一次；重复调用会覆盖同一张静态表。
+    pub unsafe fn from_boot_services(
+        locate_handle: crate::boot_services_table::LocateHandle,
+        handle_protocol: crate::boot_services_table::HandleProtocol,
+    ) -> Result<UefiBlockDevices<'static>, Error> {
+        const MAX: usize = 16;
+        static mut HANDLES: [Handle; MAX] = [core::ptr::null_mut(); MAX];
+        static mut DEVICES: [*mut BlockIo; MAX] = [core::ptr::null_mut(); MAX];
+        // SAFETY: 由调用方保证引导阶段单线程、只调一次。
+        let (handles, devices) = unsafe {
+            (
+                &mut *core::ptr::addr_of_mut!(HANDLES),
+                &mut *core::ptr::addr_of_mut!(DEVICES),
+            )
+        };
+        UefiBlockDevices::discover(locate_handle, handle_protocol, handles, devices)
+    }
+
     /// 从引导服务表**发现**块设备并构造（方案 B：能力挂在已转出的类型上）。
     ///
     /// `handles` 与 `devices` 由调用方提供 —— 引导阶段不该在内核态偷偷分配。
@@ -159,6 +184,92 @@ mod tests {
         assert_eq!(SEEN_BYTES.load(Ordering::SeqCst), 1024, "必须传字节数");
         assert_eq!(buffer[0], 0x5A);
         assert_eq!(source.read_blocks(DeviceIndex(9), 0, 1, &mut buffer), Err(Error::NotFound));
+    }
+}
+
+#[cfg(test)]
+mod from_boot_services_tests {
+    use super::UefiBlockDevices;
+    use crate::block_io::{BlockIo, BlockIoMedia};
+    use crate::types::{BUFFER_TOO_SMALL, Handle, Status, SUCCESS};
+    use core::ffi::c_void;
+    use core::mem::size_of;
+    use firmware::block::BlockDeviceSource;
+
+    static MEDIA: BlockIoMedia = BlockIoMedia {
+        media_id: 1,
+        removable_media: 0,
+        media_present: 1,
+        logical_partition: 0,
+        read_only: 0,
+        write_caching: 0,
+        block_size: 512,
+        io_align: 0,
+        last_block: 7,
+        lowest_aligned_lba: 0,
+        logical_blocks_per_physical_block: 1,
+        optimal_transfer_length_granularity: 0,
+    };
+
+    unsafe extern "efiapi" fn unused_read(
+        _this: *mut BlockIo,
+        _media_id: u32,
+        _lba: u64,
+        _size: usize,
+        _buffer: *mut c_void,
+    ) -> Status {
+        SUCCESS
+    }
+
+    static mut IO: BlockIo = BlockIo {
+        revision: 1,
+        media: core::ptr::null_mut(),
+        reset: core::ptr::null_mut(),
+        read_blocks: unused_read,
+        write_blocks: core::ptr::null_mut(),
+        flush_blocks: core::ptr::null_mut(),
+    };
+
+    unsafe extern "efiapi" fn fake_locate(
+        _search_type: u32,
+        _protocol: *const c_void,
+        _key: *mut c_void,
+        size: *mut usize,
+        buffer: *mut Handle,
+    ) -> Status {
+        let unit = size_of::<Handle>();
+        // SAFETY: 调用方按 UEFI 契约传入有效指针。
+        unsafe {
+            if buffer.is_null() {
+                *size = unit;
+                BUFFER_TOO_SMALL
+            } else {
+                *size = unit;
+                *buffer = 0x10usize as *mut c_void;
+                SUCCESS
+            }
+        }
+    }
+
+    unsafe extern "efiapi" fn fake_handle_protocol(
+        _handle: Handle,
+        _protocol: *const c_void,
+        interface: *mut *mut c_void,
+    ) -> Status {
+        // SAFETY: 同上。
+        unsafe { *interface = core::ptr::addr_of_mut!(IO) as *mut c_void };
+        SUCCESS
+    }
+
+    #[test]
+    fn the_type_owns_its_storage_so_the_caller_need_not_name_block_io() {
+        // SAFETY: 测试内单线程初始化静态夹具。
+        unsafe { IO.media = core::ptr::addr_of!(MEDIA) as *mut BlockIoMedia };
+        // SAFETY: 引导阶段单线程调用一次；此处即测试线程。
+        let source =
+            unsafe { UefiBlockDevices::from_boot_services(fake_locate, fake_handle_protocol) }
+                .expect("发现应成功");
+        assert_eq!(source.device_count(), 1);
     }
 }
 
