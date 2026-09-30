@@ -250,6 +250,15 @@ impl Volume {
         Ok(cache.l1_entry((rem2 % PER_BLOCK) as usize))
     }
 
+    /// 连续物理块一次读完（len 为 1024 的倍数）：省掉每块一次固件往返。
+    fn read_block_run(&self, dev: &mut dyn BlockRead, phys: u32, buf: &mut [u8]) -> Result<(), usize> {
+        let n = buf.len() as u64;
+        if phys == 0 || phys as u64 + n / BS > self.sb.blocks_count as u64 {
+            return Err(err::BLOCK_RANGE);
+        }
+        dev.read_at(self.base + phys as u64 * BS, buf)
+    }
+
     fn read_block(&self, dev: &mut dyn BlockRead, phys: u32, buf: &mut [u8]) -> Result<(), usize> {
         if phys == 0 || phys as u64 >= self.sb.blocks_count as u64 {
             return Err(err::BLOCK_RANGE);
@@ -271,16 +280,43 @@ impl Volume {
         while done < want {
             let logical = (done / 1024) as u32;
             let in_block = done % 1024;
-            let take = core::cmp::min(want - done, 1024 - in_block);
             let phys = self.map_logical(dev, inode, logical, &mut cache)?;
             if phys == 0 {
+                let take = core::cmp::min(want - done, 1024 - in_block);
                 for b in &mut buf[done..done + take] {
                     *b = 0;
                 }
-            } else {
-                self.read_block(dev, phys, &mut scratch)?;
-                buf[done..done + take].copy_from_slice(&scratch[in_block..in_block + take]);
+                done += take;
+                continue;
             }
+            // 合并**连续物理块**：一次 BlockIo 读一整段。
+            // 此前每 1KiB 一次读（release 内核 24MB → 2.4 万次固件往返，TCG 下数分钟）；
+            // 连续段读取把调用次数降一到两个数量级（Limine 同思路）。仅在块边界起合并
+            // （非对齐首块走下面的单块路径），上限 31 块 = 31KiB：read_at 的 span 会多算
+            // 一块，31 块刚好一次调用读完（32 块×设备块大小 ≤ 既有 ATAPI 上限）。
+            let mut run = 1usize;
+            if in_block == 0 {
+                const MAX_RUN_BLOCKS: usize = 31;
+                while run < MAX_RUN_BLOCKS {
+                    if (done + run * 1024) >= want {
+                        break;
+                    }
+                    let next = self.map_logical(dev, inode, logical + run as u32, &mut cache)?;
+                    if next != phys + run as u32 {
+                        break;
+                    }
+                    run += 1;
+                }
+            }
+            if run > 1 {
+                let run_bytes = core::cmp::min(run * 1024, want - done);
+                self.read_block_run(dev, phys, &mut buf[done..done + run_bytes])?;
+                done += run_bytes;
+                continue;
+            }
+            let take = core::cmp::min(want - done, 1024 - in_block);
+            self.read_block(dev, phys, &mut scratch)?;
+            buf[done..done + take].copy_from_slice(&scratch[in_block..in_block + take]);
             done += take;
         }
         Ok(done)
