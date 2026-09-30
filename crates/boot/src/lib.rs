@@ -14,3 +14,4 @@ extern crate std;
 pub use current::PlatformImpl;
 
 pub mod diag;
+pub mod entry;

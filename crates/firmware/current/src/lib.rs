@@ -17,6 +17,9 @@ compile_error!("必须启用一个固件实现 feature：目前是 `impl-uefi`")
 /// 将来加 BIOS 时也只改这里。
 #[cfg(feature = "impl-uefi")]
 pub mod current {
+    pub use efi::boot_services_table::BootServicesTable;
+    pub use efi::system_table::boot_services_of;
+    pub use efi::types::SystemTable;
     pub use efi::uefi_block_devices::UefiBlockDevices;
     pub use efi::uefi_boot_services::UefiBootServices;
     pub use efi::uefi_files::UefiFiles;

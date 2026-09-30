@@ -19,4 +19,6 @@ test = false
 
 [dependencies]
 arch = { path = "../arch/arch" }
+firmware = { path = "../firmware" }
+firmware-current = { path = "../firmware/current" }
 current = { path = "../arch/current" }

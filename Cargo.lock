@@ -12,6 +12,8 @@ version = "0.1.0"
 dependencies = [
  "arch",
  "current",
+ "firmware",
+ "firmware-current",
 ]
 
 [[package]]
