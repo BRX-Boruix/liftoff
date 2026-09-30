@@ -10,3 +10,4 @@ workspace = true
 
 [dependencies]
 firmware = { path = "../firmware" }
+arch = { path = "../arch/arch" }

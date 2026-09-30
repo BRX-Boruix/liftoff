@@ -12,3 +12,5 @@ pub mod boot_services;
 pub mod block_io;
 
 pub mod file;
+
+pub mod graphics;

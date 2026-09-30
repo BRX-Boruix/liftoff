@@ -30,6 +30,7 @@ version = "0.1.0"
 name = "efi"
 version = "0.1.0"
 dependencies = [
+ "arch",
  "firmware",
 ]
 
