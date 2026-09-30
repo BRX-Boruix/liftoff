@@ -11,3 +11,4 @@ extern crate std;
 pub mod crc32;
 pub mod gpt;
 pub mod partition;
+pub mod table;
