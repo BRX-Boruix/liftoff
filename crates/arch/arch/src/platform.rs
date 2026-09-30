@@ -26,6 +26,9 @@ impl InterruptState {
 
 /// 平台基础操作。
 pub trait Platform {
+    /// 初始化平台（诊断通道等）。必须在任何输出之前调用一次。
+    fn init();
+
     /// 平台名（诊断用）。
     fn name() -> &'static str;
 

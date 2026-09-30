@@ -32,7 +32,19 @@ pub mod current {
     /// 宿主测试用平台。
     pub struct Mock;
 
+    /// 是否已初始化。
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
     impl Mock {
+        /// 重置初始化标志（仅宿主测试使用）。
+        pub fn reset_init_flag() {
+            INITIALIZED.store(false, Ordering::SeqCst);
+        }
+
+        /// 是否已初始化（仅宿主测试使用）。
+        pub fn initialized() -> bool {
+            INITIALIZED.load(Ordering::SeqCst)
+        }
         /// 显式设置中断开关状态（仅宿主测试使用）。
         pub fn set_interrupts_enabled(enabled: bool) {
             INTERRUPTS_ENABLED.store(enabled, Ordering::SeqCst);
@@ -45,6 +57,10 @@ pub mod current {
     }
 
     impl Platform for Mock {
+        fn init() {
+            INITIALIZED.store(true, Ordering::SeqCst);
+        }
+
         fn name() -> &'static str {
             "mock"
         }
@@ -73,6 +89,17 @@ pub mod current {
 mod tests {
     use crate::current::Mock;
     use arch::platform::Platform;
+
+
+    #[test]
+    fn mock_init_is_observable_and_idempotent() {
+        Mock::reset_init_flag();
+        assert!(!Mock::initialized());
+        Mock::init();
+        assert!(Mock::initialized());
+        Mock::init();
+        assert!(Mock::initialized(), "重复初始化不应回退状态");
+    }
 
     #[test]
     fn mock_reports_its_own_name() {

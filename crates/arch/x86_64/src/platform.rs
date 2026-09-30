@@ -19,6 +19,18 @@ impl Platform for X86_64 {
         "x86_64"
     }
 
+    fn init() {
+        // 16550 初始化：115200 8N1、FIFO 使能并清空、DTR/RTS 置位；
+        // 引导阶段只走轮询，故关闭中断。
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 3, 0x80);
+        outb(COM1 + 0, 0x01);
+        outb(COM1 + 1, 0x00);
+        outb(COM1 + 3, 0x03);
+        outb(COM1 + 2, 0xC7);
+        outb(COM1 + 4, 0x03);
+    }
+
     fn halt() -> ! {
         loop {
             // SAFETY: `hlt` 在 ring 0 合法；不访问内存、不改变通用寄存器。
