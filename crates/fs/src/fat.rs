@@ -44,6 +44,14 @@ pub enum FatError {
     TableOutOfBounds,
     /// 调用方给的输出缓冲太小。
     BufferTooSmall,
+    /// 链上遇到坏簇。
+    BadCluster,
+    /// 链断裂（遇到空闲簇 0）。
+    BrokenChain,
+    /// 簇链回环（游标不前进）。
+    ChainLoop,
+    /// 簇号超出卷范围。
+    ClusterOutOfRange,
 }
 
 /// BPB 的关键字段。
@@ -266,6 +274,54 @@ pub fn parse_directory(sector: &[u8], out: &mut [Entry]) -> Result<usize, FatErr
     Ok(count)
 }
 
+/// 按簇链读取文件内容，返回写入的字节数。
+///
+/// 命门是**游标必须前进**：链尾正常结束；坏簇 → `BadCluster`；空闲簇 0 → `BrokenChain`；
+/// 簇号超出卷 → `ClusterOutOfRange`；**回环 → `ChainLoop`**。
+///
+/// 回环判定用**步数上限 = 总簇数**（一条链最多访问 `total_clusters` 个不同簇），
+/// **不假设簇号递增** —— 簇号在链中并无顺序保证。
+pub fn read_chain<F>(
+    fat: &[u8],
+    start_cluster: u32,
+    kind: FatKind,
+    total_clusters: u32,
+    cluster_size: usize,
+    out: &mut [u8],
+    mut read_cluster: F,
+) -> Result<usize, FatError>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<(), FatError>,
+{
+    if cluster_size == 0 {
+        return Err(FatError::BadClusterSize);
+    }
+    let mut written = 0usize;
+    let mut cluster = start_cluster;
+    let mut steps = 0u32;
+    loop {
+        if cluster == 0 || cluster >= total_clusters {
+            return Err(if cluster == 0 { FatError::BrokenChain } else { FatError::ClusterOutOfRange });
+        }
+        if steps > total_clusters {
+            return Err(FatError::ChainLoop);
+        }
+        let end = written.checked_add(cluster_size).ok_or(FatError::BufferTooSmall)?;
+        let slot = out.get_mut(written..end).ok_or(FatError::BufferTooSmall)?;
+        read_cluster(cluster, slot)?;
+        written = end;
+        steps += 1;
+        let next = fat_entry(fat, cluster, kind)?;
+        if is_end_of_chain(kind, next) {
+            return Ok(written);
+        }
+        if is_bad_cluster(kind, next) {
+            return Err(FatError::BadCluster);
+        }
+        cluster = next;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FAT_SIGNATURE_OFFSET, FatError, FatKind, parse_bpb};
@@ -471,5 +527,98 @@ mod dir_tests {
         let sector = std::vec![0u8; 16];
         let mut out = [Entry::EMPTY; 8];
         assert_eq!(parse_directory(&sector, &mut out), Err(FatError::ShortSector));
+    }
+}
+
+#[cfg(test)]
+mod chain_read_tests {
+    use super::{FatError, FatKind, read_chain};
+    use std::vec::Vec;
+
+    const CLUSTER: usize = 512;
+
+    /// 造一张 FAT16 表：`entries[i]` 是第 i 簇的下一个簇号。
+    fn fat16(entries: &[u16]) -> Vec<u8> {
+        let mut fat = std::vec![0u8; entries.len() * 2];
+        for (index, value) in entries.iter().enumerate() {
+            fat[index * 2..index * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        fat
+    }
+
+    /// 假簇读取器：按簇号返回一个用该簇号填充的块。
+    fn reader(cluster: u32, buffer: &mut [u8]) -> Result<(), FatError> {
+        for byte in buffer.iter_mut() {
+            *byte = cluster as u8;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_normal_chain_is_read_in_order() {
+        // 簇 2 → 3 → 4 → 链尾。
+        let fat = fat16(&[0, 0, 3, 4, 0xFFFF]);
+        let mut out = std::vec![0u8; 3 * CLUSTER];
+        let written = read_chain(&fat, 2, FatKind::Fat16, 8, CLUSTER, &mut out, reader).expect("读取成功");
+        assert_eq!(written, 3 * CLUSTER);
+        assert_eq!(out[0], 2);
+        assert_eq!(out[CLUSTER], 3);
+        assert_eq!(out[2 * CLUSTER], 4);
+    }
+
+    #[test]
+    fn a_bad_cluster_stops_with_an_error() {
+        // 簇 2 → 0xFFF7（坏簇）。
+        let fat = fat16(&[0, 0, 0xFFF7]);
+        let mut out = std::vec![0u8; 4 * CLUSTER];
+        assert_eq!(
+            read_chain(&fat, 2, FatKind::Fat16, 8, CLUSTER, &mut out, reader),
+            Err(FatError::BadCluster)
+        );
+    }
+
+    #[test]
+    fn a_free_cluster_means_a_broken_chain() {
+        // 簇 2 → 0（空闲）：链断裂，不是正常结束。
+        let fat = fat16(&[0, 0, 0]);
+        let mut out = std::vec![0u8; 4 * CLUSTER];
+        assert_eq!(
+            read_chain(&fat, 2, FatKind::Fat16, 8, CLUSTER, &mut out, reader),
+            Err(FatError::BrokenChain)
+        );
+    }
+
+    #[test]
+    fn a_loop_in_the_chain_is_rejected_instead_of_spinning_forever() {
+        // 簇 2 → 2：自环，必须报错（否则死循环）。
+        let fat = fat16(&[0, 0, 2]);
+        // 缓冲必须大到让“步数上限”先触发（总簇数 8），否则会先撞 BufferTooSmall。
+        let mut out = std::vec![0u8; 16 * CLUSTER];
+        assert_eq!(
+            read_chain(&fat, 2, FatKind::Fat16, 8, CLUSTER, &mut out, reader),
+            Err(FatError::ChainLoop)
+            , "自环必须报错，不能原地打转"
+        );
+    }
+
+    #[test]
+    fn a_cluster_beyond_the_volume_is_rejected() {
+        // 簇 2 → 99，但卷只有 8 个簇。
+        let fat = fat16(&[0, 0, 99]);
+        let mut out = std::vec![0u8; 4 * CLUSTER];
+        assert_eq!(
+            read_chain(&fat, 2, FatKind::Fat16, 8, CLUSTER, &mut out, reader),
+            Err(FatError::ClusterOutOfRange)
+        );
+    }
+
+    #[test]
+    fn a_too_small_output_buffer_is_reported() {
+        let fat = fat16(&[0, 0, 3, 0xFFFF]);
+        let mut out = std::vec![0u8; CLUSTER];
+        assert_eq!(
+            read_chain(&fat, 2, FatKind::Fat16, 8, CLUSTER, &mut out, reader),
+            Err(FatError::BufferTooSmall)
+        );
     }
 }
