@@ -11,6 +11,7 @@ pub type Handle = *mut c_void;
 /// 固件调用返回码。
 ///
 /// 用 newtype 而非裸 `usize`：`is_error()` 才有归属，且避免与普通整数混淆。
+#[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Status(pub usize);
 
