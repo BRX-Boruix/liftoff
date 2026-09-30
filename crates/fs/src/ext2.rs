@@ -26,6 +26,12 @@ pub enum Ext2Error {
     NotExt2,
     /// `s_log_block_size` 超出上限。
     BadBlockSize,
+    /// 目录项的 `rec_len` 非法（为 0 会死循环，越出块尾会越界读）。
+    BadRecLen,
+    /// 目录项的 `name_len` 超出其记录范围。
+    BadNameLen,
+    /// 调用方给的输出缓冲太小。
+    BufferTooSmall,
 }
 
 /// 超级块关键字段。
@@ -91,6 +97,69 @@ pub fn parse_superblock(image: &[u8]) -> Result<Superblock, Ext2Error> {
         first_ino: read_u32(raw, 84).ok_or(Ext2Error::ShortImage)?,
         inode_size,
     })
+}
+
+/// 目录项（`ext2_dir_entry`：inode@0、rec_len@4、name_len@6、file_type@7、name@8）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DirEntry {
+    /// inode 号（0 表示已删除）。
+    pub inode: u32,
+    /// 名字长度。
+    pub name_len: u8,
+    /// 文件类型。
+    pub file_type: u8,
+    /// 名字（定长存放，避免分配；有效范围是前 `name_len` 字节）。
+    pub name: [u8; 255],
+}
+
+impl DirEntry {
+    /// 占位值。
+    pub const EMPTY: Self = Self { inode: 0, name_len: 0, file_type: 0, name: [0; 255] };
+
+    /// 名字切片。
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+}
+
+/// 解析一个目录块里的条目，返回条目数。
+///
+/// 数值边界：`rec_len == 0` 会让游标原地不动（**死循环**），故立即报错；
+/// `at + rec_len` 越出块尾同样报错（不越界读）；`name_len` 必须落在 `rec_len - 8` 之内。
+/// `inode == 0` 表示已删除：跳过该条目，但**仍按 `rec_len` 前进**。
+pub fn parse_dir_entries(block: &[u8], out: &mut [DirEntry]) -> Result<usize, Ext2Error> {
+    let mut count = 0;
+    let mut at = 0usize;
+    while at + 8 <= block.len() {
+        let inode = read_u32(block, at).ok_or(Ext2Error::ShortImage)?;
+        let rec_len = read_u16(block, at + 4).ok_or(Ext2Error::ShortImage)? as usize;
+        let name_len = *block.get(at + 6).ok_or(Ext2Error::ShortImage)? as usize;
+        let file_type = *block.get(at + 7).ok_or(Ext2Error::ShortImage)?;
+        if rec_len == 0 {
+            return Err(Ext2Error::BadRecLen);
+        }
+        let end = at.checked_add(rec_len).ok_or(Ext2Error::BadRecLen)?;
+        if end > block.len() {
+            return Err(Ext2Error::BadRecLen);
+        }
+        if name_len > rec_len - 8 {
+            return Err(Ext2Error::BadNameLen);
+        }
+        if inode != 0 {
+            if count == out.len() {
+                return Err(Ext2Error::BufferTooSmall);
+            }
+            let mut entry = DirEntry::EMPTY;
+            entry.inode = inode;
+            entry.name_len = name_len as u8;
+            entry.file_type = file_type;
+            entry.name[..name_len].copy_from_slice(&block[at + 8..at + 8 + name_len]);
+            out[count] = entry;
+            count += 1;
+        }
+        at = end;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -162,5 +231,85 @@ mod tests {
     fn a_short_image_is_rejected() {
         let raw = std::vec![0u8; 512];
         assert_eq!(parse_superblock(&raw), Err(Ext2Error::ShortImage));
+    }
+}
+
+#[cfg(test)]
+mod dir_tests {
+    use super::{DirEntry, Ext2Error, parse_dir_entries};
+    use std::vec::Vec;
+
+    /// 造一个目录块：按顺序写入 (inode, name, file_type) 条目，最后一项吃掉剩余空间。
+    fn dir_block(items: &[(u32, &str, u8)]) -> Vec<u8> {
+        let mut block = std::vec![0u8; 1024];
+        let mut at = 0usize;
+        for (index, (inode, name, kind)) in items.iter().enumerate() {
+            let need = 8 + name.len();
+            let rec_len = if index + 1 == items.len() {
+                1024 - at
+            } else {
+                (need + 3) & !3
+            };
+            block[at..at + 4].copy_from_slice(&inode.to_le_bytes());
+            block[at + 4..at + 6].copy_from_slice(&(rec_len as u16).to_le_bytes());
+            block[at + 6] = name.len() as u8;
+            block[at + 7] = *kind;
+            block[at + 8..at + 8 + name.len()].copy_from_slice(name.as_bytes());
+            at += rec_len;
+        }
+        block
+    }
+
+    fn empty_out() -> [DirEntry; 8] {
+        [DirEntry::EMPTY; 8]
+    }
+
+    #[test]
+    fn entries_are_walked_by_rec_len() {
+        let block = dir_block(&[(2, ".", 2), (2, "..", 2), (11, "HELLO.TXT", 1)]);
+        let mut out = empty_out();
+        let count = parse_dir_entries(&block, &mut out).expect("解析成功");
+        assert_eq!(count, 3);
+        assert_eq!(out[0].inode, 2);
+        assert_eq!(out[2].inode, 11);
+        assert_eq!(out[2].name_len, 9);
+        assert_eq!(&out[2].name[..9], b"HELLO.TXT");
+        assert_eq!(out[2].file_type, 1);
+    }
+
+    #[test]
+    fn a_zero_rec_len_is_rejected_instead_of_looping_forever() {
+        let mut block = dir_block(&[(2, ".", 2)]);
+        block[4..6].copy_from_slice(&0u16.to_le_bytes());
+        let mut out = empty_out();
+        assert_eq!(parse_dir_entries(&block, &mut out), Err(Ext2Error::BadRecLen));
+    }
+
+    #[test]
+    fn a_rec_len_past_the_block_is_rejected() {
+        let mut block = dir_block(&[(2, ".", 2)]);
+        block[4..6].copy_from_slice(&2000u16.to_le_bytes());
+        let mut out = empty_out();
+        assert_eq!(parse_dir_entries(&block, &mut out), Err(Ext2Error::BadRecLen));
+    }
+
+    #[test]
+    fn a_name_longer_than_its_record_is_rejected() {
+        // 唯一一项会吃掉整块，故先把 rec_len 改小（12 = 8 + 4 字节名字），
+        // 再声称 name_len = 200：200 > 12 - 8 = 4，必须报错。
+        let mut block = dir_block(&[(2, ".", 2)]);
+        block[4..6].copy_from_slice(&12u16.to_le_bytes());
+        block[6] = 200;
+        let mut out = empty_out();
+        assert_eq!(parse_dir_entries(&block, &mut out), Err(Ext2Error::BadNameLen));
+    }
+
+    #[test]
+    fn deleted_entries_are_skipped_but_still_advance() {
+        let block = dir_block(&[(0, "GONE", 1), (11, "KEEP", 1)]);
+        let mut out = empty_out();
+        let count = parse_dir_entries(&block, &mut out).expect("解析成功");
+        assert_eq!(count, 1, "inode 为 0 的条目表示已删除");
+        assert_eq!(&out[0].name[..4], b"KEEP");
     }
 }
