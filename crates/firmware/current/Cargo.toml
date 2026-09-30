@@ -1,0 +1,17 @@
+[package]
+name = "firmware-current"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["impl-uefi"]
+impl-uefi = ["dep:efi"]
+
+[dependencies]
+efi = { path = "../../efi", optional = true }
+firmware = { path = ".." }
