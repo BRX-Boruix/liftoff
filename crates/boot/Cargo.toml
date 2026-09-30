@@ -19,6 +19,7 @@ test = false
 
 [dependencies]
 arch = { path = "../arch/arch" }
+limine = { path = "../protocol/limine" }
 firmware = { path = "../firmware" }
 firmware-current = { path = "../firmware/current" }
 current = { path = "../arch/current" }

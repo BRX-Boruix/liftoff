@@ -15,3 +15,4 @@ pub use current::PlatformImpl;
 
 pub mod diag;
 pub mod entry;
+pub mod protocol;
