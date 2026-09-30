@@ -30,6 +30,12 @@ pub enum IsoError {
     BadBlockSize,
     /// 双端序两份不一致（映像损坏）。
     EndianMismatch,
+    /// 目录记录长度非法（< 33 或越出块尾）。
+    BadRecordLength,
+    /// 目录记录的名字长度超出其记录范围。
+    BadNameLength,
+    /// 调用方给的输出缓冲太小。
+    BufferTooSmall,
 }
 
 /// 一个目录记录。
@@ -127,6 +133,79 @@ pub fn parse_primary_descriptor(image: &[u8]) -> Result<VolumeDescriptor, IsoErr
     Ok(VolumeDescriptor { block_size, root: DirRecord { extent_lba, data_length, name_len, name } })
 }
 
+/// 一个目录记录。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Entry {
+    /// 数据起始 LBA。
+    pub extent_lba: u32,
+    /// 数据长度（字节）。
+    pub data_length: u32,
+    /// 标志位（bit1 = 目录）。
+    pub flags: u8,
+    /// 名字长度。
+    pub name_len: u8,
+    /// 名字（定长存放，避免分配）。
+    pub name: [u8; 255],
+}
+
+impl Entry {
+    /// 占位值。
+    pub const EMPTY: Self = Self { extent_lba: 0, data_length: 0, flags: 0, name_len: 0, name: [0; 255] };
+
+    /// 名字切片。
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+}
+
+/// 遍历一个逻辑块里的目录记录，返回条目数。
+///
+/// **关键边界**：`len == 0` 表示**本逻辑块结束** → 立即停止（否则游标原地不动会**死循环**）。
+/// `len < 33` 或 `at + len` 越出块尾视为损坏；`name_len` 必须落在 `len - 33` 之内。
+/// 记录里的双端序两份都要按各自字节序读并核对。
+pub fn parse_directory_block(block: &[u8], out: &mut [Entry]) -> Result<usize, IsoError> {
+    let mut count = 0;
+    let mut at = 0usize;
+    loop {
+        let len = match block.get(at) {
+            Some(value) => *value as usize,
+            None => break,
+        };
+        if len == 0 {
+            break;
+        }
+        if len < 33 {
+            return Err(IsoError::BadRecordLength);
+        }
+        let end = at.checked_add(len).ok_or(IsoError::BadRecordLength)?;
+        if end > block.len() {
+            return Err(IsoError::BadRecordLength);
+        }
+        let record = block.get(at..end).ok_or(IsoError::BadRecordLength)?;
+        let extent_lba = read_both_u32(record, 2)?;
+        let data_length = read_both_u32(record, 10)?;
+        let flags = *record.get(25).ok_or(IsoError::ShortImage)?;
+        let name_len = *record.get(32).ok_or(IsoError::ShortImage)? as usize;
+        if name_len > len - 33 {
+            return Err(IsoError::BadNameLength);
+        }
+        if count == out.len() {
+            return Err(IsoError::BufferTooSmall);
+        }
+        let mut entry = Entry::EMPTY;
+        entry.extent_lba = extent_lba;
+        entry.data_length = data_length;
+        entry.flags = flags;
+        entry.name_len = name_len as u8;
+        let source = record.get(33..33 + name_len).ok_or(IsoError::ShortImage)?;
+        entry.name[..name_len].copy_from_slice(source);
+        out[count] = entry;
+        count += 1;
+        at = end;
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -195,5 +274,80 @@ mod tests {
     fn a_short_image_is_rejected() {
         let raw = std::vec![0u8; 1024];
         assert_eq!(parse_primary_descriptor(&raw), Err(IsoError::ShortImage));
+    }
+}
+
+#[cfg(test)]
+mod dir_tests {
+    use super::{Entry, IsoError, parse_directory_block};
+    
+
+    const BLOCK: usize = 2048;
+
+    fn put_both_endian(target: &mut [u8], le_at: usize, value: u32) {
+        target[le_at..le_at + 4].copy_from_slice(&value.to_le_bytes());
+        target[le_at + 4..le_at + 8].copy_from_slice(&value.to_be_bytes());
+    }
+
+    /// 往块里写一条目录记录；返回该记录占用的长度。
+    fn put_record(block: &mut [u8], at: usize, extent: u32, length: u32, name: &[u8]) -> usize {
+        let record_len = 33 + name.len();
+        block[at] = record_len as u8;
+        put_both_endian(block, at + 2, extent);
+        put_both_endian(block, at + 10, length);
+        block[at + 25] = 2;
+        block[at + 32] = name.len() as u8;
+        block[at + 33..at + 33 + name.len()].copy_from_slice(name);
+        record_len
+    }
+
+    #[test]
+    fn records_are_walked_and_the_zero_length_terminates_the_block() {
+        let mut block = std::vec![0u8; BLOCK];
+        let first = put_record(&mut block, 0, 20, 2048, &[0x00]);
+        let _second = put_record(&mut block, first, 20, 2048, &[0x01]);
+        // 偏移 first+second 处已是 0 → 表示本块结束。
+        let mut out = [Entry::EMPTY; 8];
+        let count = parse_directory_block(&block, &mut out).expect("解析成功");
+        assert_eq!(count, 2, "len == 0 必须终止遍历（不能原地打转）");
+        assert_eq!(out[0].extent_lba, 20);
+        assert_eq!(out[0].data_length, 2048);
+        assert_eq!(out[1].name_len, 1);
+        assert_eq!(out[1].name[0], 0x01, "名字 0x01 表示上级目录");
+    }
+
+    #[test]
+    fn an_empty_block_yields_no_entries() {
+        let block = std::vec![0u8; BLOCK];
+        let mut out = [Entry::EMPTY; 8];
+        assert_eq!(parse_directory_block(&block, &mut out).expect("解析成功"), 0);
+    }
+
+    #[test]
+    fn a_record_length_past_the_block_is_rejected() {
+        // 用 100 字节的小块：len = 200 必然越界（2048 字节块里 200 并不越界）。
+        let mut block = std::vec![0u8; 100];
+        block[0] = 200;
+        block[32] = 1;
+        let mut out = [Entry::EMPTY; 8];
+        assert_eq!(parse_directory_block(&block, &mut out), Err(IsoError::BadRecordLength));
+    }
+
+    #[test]
+    fn a_name_length_past_its_record_is_rejected() {
+        let mut block = std::vec![0u8; BLOCK];
+        block[0] = 34;
+        block[32] = 200;
+        let mut out = [Entry::EMPTY; 8];
+        assert_eq!(parse_directory_block(&block, &mut out), Err(IsoError::BadNameLength));
+    }
+
+    #[test]
+    fn a_double_endian_mismatch_in_a_record_is_rejected() {
+        let mut block = std::vec![0u8; BLOCK];
+        put_record(&mut block, 0, 20, 2048, &[0x00]);
+        block[2 + 4..2 + 8].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        let mut out = [Entry::EMPTY; 8];
+        assert_eq!(parse_directory_block(&block, &mut out), Err(IsoError::EndianMismatch));
     }
 }
