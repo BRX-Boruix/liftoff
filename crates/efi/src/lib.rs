@@ -60,3 +60,5 @@ pub mod pixel_format;
 pub mod file_info;
 
 pub mod file_get_info;
+
+pub mod file_open_info;
