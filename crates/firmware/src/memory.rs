@@ -5,6 +5,8 @@
 
 use arch::addr::PhysAddr;
 
+use crate::error::Error;
+
 /// 内存区类型。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -71,6 +73,11 @@ impl MemoryEntry {
     pub const fn is_empty(self) -> bool {
         self.length == 0
     }
+    /// 由固件原始三元组构造；未知类型返回 `Error::Unsupported`（不猜）。
+    pub fn from_raw(base: PhysAddr, length: u64, protocol_kind: u32) -> Result<Self, Error> {
+        let kind = MemoryKind::from_protocol(protocol_kind).ok_or(Error::Unsupported)?;
+        Ok(Self { base, length, kind })
+    }
 }
 
 /// 内存映射：固件给出的条目序列。
@@ -110,10 +117,28 @@ impl<'a> MemoryMap<'a> {
         self.entries.is_empty()
     }
 }
+/// 把 `source` 的条目复制进 `buffer`；容量不足返回 `Error::BufferTooSmall`。
+///
+/// 宿主测试与各固件实现共用（单点定义）：缓冲由调用方拥有，符合 no_std 下无隐式分配的约定。
+pub fn copy_map<'b>(buffer: &'b mut [MemoryEntry], source: &[MemoryEntry]) -> Result<MemoryMap<'b>, Error> {
+    if source.len() > buffer.len() {
+        return Err(Error::BufferTooSmall);
+    }
+    buffer[..source.len()].copy_from_slice(source);
+    Ok(MemoryMap::new(&buffer[..source.len()]))
+}
+
+/// 内存映射来源：固件层能力 trait 之一。
+///
+/// 分成小 trait 而非巨 trait：BIOS 可只实现它支持的部分，测试替身也可按需实现。
+pub trait MemoryMapSource {
+    /// 取内存映射；条目数超过 `buffer` 容量时返回 `Error::BufferTooSmall`。
+    fn memory_map<'b>(&mut self, buffer: &'b mut [MemoryEntry]) -> Result<MemoryMap<'b>, Error>;
+}
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryEntry, MemoryKind, MemoryMap};
+    use super::{MemoryEntry, MemoryKind, MemoryMap, MemoryMapSource, copy_map};
     use arch::addr::PhysAddr;
 
     #[test]
