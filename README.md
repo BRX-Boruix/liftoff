@@ -43,3 +43,5 @@ nightly，并安装 `rust-src`、`llvm-tools` 与 `x86_64-unknown-uefi` 目标�
 ## 许可
 
 MIT License，版权归 Yang Borui 所有。详见 [LICENSE](LICENSE)。
+
+本仓库包含的第三方组件见 [NOTICE.md](NOTICE.md)。

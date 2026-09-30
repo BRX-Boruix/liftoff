@@ -44,3 +44,5 @@ installs `rust-src`, `llvm-tools` and the `x86_64-unknown-uefi` target.
 ## License
 
 MIT License, copyright Yang Borui. See [LICENSE](LICENSE).
+
+Third-party components bundled in this repository are listed in [NOTICE.md](NOTICE.md).
