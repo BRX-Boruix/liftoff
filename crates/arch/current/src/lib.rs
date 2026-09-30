@@ -17,6 +17,10 @@ compile_error!("必须启用一个实现 feature：`impl-x86_64` 或 `impl-mock`
 #[cfg(feature = "impl-x86_64")]
 pub use x86_64::platform::X86_64 as PlatformImpl;
 
+/// 当前架构的页表实现（选择器职责：把具体实现接到抽象上）。
+#[cfg(feature = "impl-x86_64")]
+pub use x86_64::paging::X86PageTable;
+
 #[cfg(feature = "impl-mock")]
 pub mod mock {
     //! 宿主测试用实现：不触碰硬件，但状态机行为真实（不是"假数据"）。
