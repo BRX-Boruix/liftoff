@@ -8,6 +8,7 @@
 //! 项数组 CRC32 @88。全部**小端**。
 
 use crate::crc32::crc32;
+use crate::partition::Partition;
 
 /// GPT 签名。
 pub const GPT_SIGNATURE: [u8; 8] = *b"EFI PART";
@@ -29,6 +30,14 @@ pub enum GptError {
     HeaderCrcMismatch,
     /// `entry_size` 不合理。
     BadEntrySize,
+    /// 项数组 CRC32 不匹配（表被破坏）。
+    EntriesCrcMismatch,
+    /// 项数组越出映像范围。
+    EntriesOutOfBounds,
+    /// 分区项区间倒置（`last < first`，减法会下溢）。
+    BadEntryRange,
+    /// 调用方给的输出缓冲太小。
+    BufferTooSmall,
 }
 
 /// GPT 头的关键字段。
@@ -100,6 +109,55 @@ pub fn parse_gpt_header(image: &[u8], sector_size: u64) -> Result<GptHeader, Gpt
         entry_size,
         entries_crc: read_u32(head, 88).ok_or(GptError::ShortImage)?,
     })
+}
+
+/// 解析 GPT 分区项数组（含项数组 CRC32 校验），返回分区数。
+///
+/// 全零类型 GUID 的项表示“未使用”，跳过；`last < first` 视为表损坏，报 `BadEntryRange`
+/// （绝不回绕成巨大扇区数）。所有偏移与长度都用 checked 运算，防溢出。
+pub fn parse_gpt_entries(
+    image: &[u8],
+    sector_size: u64,
+    header: &GptHeader,
+    out: &mut [Partition],
+) -> Result<usize, GptError> {
+    let start = usize::try_from(
+        header
+            .entries_lba
+            .checked_mul(sector_size)
+            .ok_or(GptError::EntriesOutOfBounds)?,
+    )
+    .map_err(|_| GptError::EntriesOutOfBounds)?;
+    let total = (header.entry_count as usize)
+        .checked_mul(header.entry_size as usize)
+        .ok_or(GptError::EntriesOutOfBounds)?;
+    let end = start.checked_add(total).ok_or(GptError::EntriesOutOfBounds)?;
+    let raw = image.get(start..end).ok_or(GptError::EntriesOutOfBounds)?;
+    if crc32(raw) != header.entries_crc {
+        return Err(GptError::EntriesCrcMismatch);
+    }
+    let entry_size = header.entry_size as usize;
+    let mut count = 0;
+    for index in 0..header.entry_count as usize {
+        let at = index.checked_mul(entry_size).ok_or(GptError::EntriesOutOfBounds)?;
+        let item = raw.get(at..at + entry_size).ok_or(GptError::EntriesOutOfBounds)?;
+        if item.get(..16).map_or(true, |guid| guid.iter().all(|byte| *byte == 0)) {
+            continue;
+        }
+        let first = read_u64(item, 32).ok_or(GptError::EntriesOutOfBounds)?;
+        let last = read_u64(item, 40).ok_or(GptError::EntriesOutOfBounds)?;
+        let sector_count = last
+            .checked_sub(first)
+            .ok_or(GptError::BadEntryRange)?
+            .checked_add(1)
+            .ok_or(GptError::BadEntryRange)?;
+        if count == out.len() {
+            return Err(GptError::BufferTooSmall);
+        }
+        out[count] = Partition { start_lba: first, sector_count };
+        count += 1;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -180,5 +238,101 @@ mod tests {
     fn an_absurd_entry_size_is_rejected() {
         let image = image_with_header(&header(2, 128, 3, 0));
         assert_eq!(parse_gpt_header(&image, SECTOR as u64), Err(GptError::BadEntrySize));
+    }
+}
+
+#[cfg(test)]
+mod entry_tests {
+    use super::{GPT_ENTRY_SIZE, GptError, GptHeader, Partition, parse_gpt_entries};
+    use crate::crc32::crc32;
+    use std::vec::Vec;
+
+    const SECTOR: usize = 512;
+    const ENTRY_COUNT: u32 = 4;
+
+    /// 造一项：类型 GUID 首字节非零表示“已使用”。
+    fn entry(used: bool, first: u64, last: u64) -> [u8; 128] {
+        let mut item = [0u8; 128];
+        if used {
+            item[0] = 0x0F;
+        }
+        item[32..40].copy_from_slice(&first.to_le_bytes());
+        item[40..48].copy_from_slice(&last.to_le_bytes());
+        item
+    }
+
+    /// 造一个 3 扇区映像：头在 LBA 1，项数组在 LBA 2。
+    fn image(entries: &[[u8; 128]]) -> Vec<u8> {
+        let mut raw = std::vec![0u8; 3 * SECTOR];
+        for (index, item) in entries.iter().enumerate() {
+            let at = 2 * SECTOR + index * 128;
+            raw[at..at + 128].copy_from_slice(item);
+        }
+        let crc = crc32(&raw[2 * SECTOR..2 * SECTOR + ENTRY_COUNT as usize * 128]);
+        // 头：签名 + header_size + 项数组信息
+        raw[SECTOR..SECTOR + 8].copy_from_slice(b"EFI PART");
+        raw[SECTOR + 12..SECTOR + 16].copy_from_slice(&92u32.to_le_bytes());
+        raw[SECTOR + 72..SECTOR + 80].copy_from_slice(&2u64.to_le_bytes());
+        raw[SECTOR + 80..SECTOR + 84].copy_from_slice(&ENTRY_COUNT.to_le_bytes());
+        raw[SECTOR + 84..SECTOR + 88].copy_from_slice(&(GPT_ENTRY_SIZE).to_le_bytes());
+        raw[SECTOR + 88..SECTOR + 92].copy_from_slice(&crc.to_le_bytes());
+        raw
+    }
+
+    fn header(entries_crc: u32) -> GptHeader {
+        GptHeader { entries_lba: 2, entry_count: ENTRY_COUNT, entry_size: GPT_ENTRY_SIZE, entries_crc }
+    }
+
+    #[test]
+    fn used_entries_are_returned_with_their_span() {
+        let items = [
+            entry(true, 2048, 4095),
+            entry(true, 8192, 8192),
+            entry(false, 0, 0),
+            entry(false, 0, 0),
+        ];
+        let raw = image(&items);
+        let crc = crc32(&raw[2 * SECTOR..2 * SECTOR + ENTRY_COUNT as usize * 128]);
+        let mut out = [Partition { start_lba: 0, sector_count: 0 }; 4];
+        let count = parse_gpt_entries(&raw, SECTOR as u64, &header(crc), &mut out).expect("解析成功");
+        assert_eq!(count, 2, "全零 GUID 的项应被跳过");
+        assert_eq!(out[0].start_lba, 2048);
+        assert_eq!(out[0].sector_count, 2048, "4095-2048+1");
+        assert_eq!(out[1].start_lba, 8192);
+        assert_eq!(out[1].sector_count, 1);
+    }
+
+    #[test]
+    fn a_bad_entries_crc_is_rejected() {
+        let items = [entry(true, 2048, 4095), entry(false, 0, 0), entry(false, 0, 0), entry(false, 0, 0)];
+        let raw = image(&items);
+        let mut out = [Partition { start_lba: 0, sector_count: 0 }; 4];
+        assert_eq!(
+            parse_gpt_entries(&raw, SECTOR as u64, &header(0xDEAD_BEEF), &mut out),
+            Err(GptError::EntriesCrcMismatch)
+        );
+    }
+
+    #[test]
+    fn entries_past_the_end_of_the_image_are_rejected() {
+        let raw = std::vec![0u8; 2 * SECTOR];
+        let mut out = [Partition { start_lba: 0, sector_count: 0 }; 4];
+        let head = GptHeader { entries_lba: 2, entry_count: ENTRY_COUNT, entry_size: GPT_ENTRY_SIZE, entries_crc: 0 };
+        assert_eq!(
+            parse_gpt_entries(&raw, SECTOR as u64, &head, &mut out),
+            Err(GptError::EntriesOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn an_inverted_span_is_rejected() {
+        let items = [entry(true, 4095, 2048), entry(false, 0, 0), entry(false, 0, 0), entry(false, 0, 0)];
+        let raw = image(&items);
+        let crc = crc32(&raw[2 * SECTOR..2 * SECTOR + ENTRY_COUNT as usize * 128]);
+        let mut out = [Partition { start_lba: 0, sector_count: 0 }; 4];
+        assert_eq!(
+            parse_gpt_entries(&raw, SECTOR as u64, &header(crc), &mut out),
+            Err(GptError::BadEntryRange)
+        );
     }
 }
