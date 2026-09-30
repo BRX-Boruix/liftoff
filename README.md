@@ -1,31 +1,40 @@
-# Liftoff (gen2)
+# liftoff
 
-BORUIX bootloader, gen2: a clean-room rewrite in Rust that follows the semantics
-of brxLimine (the project fork of Limine) item by item.
+BORUIX 的 UEFI 引导程序：按 Limine 协议加载内核并交接给内核。
 
-## Goal
+[English](README.en.md)
 
-- Boot the BORUIX kernel from UEFI through a Limine-protocol subset.
-- Match brxLimine on AP bring-up semantics (GDT/TSS, IA32_APIC_BASE, MTRR, LAPIC
-  handoff state, iretq entry with zeroed GPRs).
-- Stay decoupled from any specific kernel: depend only on the Limine protocol and
-  the x86 architecture definitions.
+## 用途
 
-## Layout (by responsibility)
+从 UEFI 固件启动，读取内核映像，填写内核声明的 Limine 请求，退出引导服务后跳转内核入口。
 
-| Layer | Path | Responsibility |
-| --- | --- | --- |
-| Entry | `src/main.rs` | UEFI entry point, panic handler, halt |
-| Firmware bindings | `src/efi.rs` | EFI types and protocols, expanded on demand |
-| Debug output | `src/serial.rs` | COM1 console |
+gen2 重写进行中：当前只有 UEFI 入口与 COM1 串口输出，尚未加载内核。
 
-Later stages add `arch/` (cpu, gdt, lapic, smp, trampoline), `mm/` (paging,
-memmap, mtrr), `protos/` (Limine requests) and `loader/` (ELF, filesystems).
+## 已知限制
 
-## Build
+- 当前版本不加载内核，启动后初始化 COM1 并输出一行信息后返回固件
+- 只支持 x86_64
+
+## 构建
 
 ```
 cargo build --release --target x86_64-unknown-uefi
 ```
 
-Artifact: `target/x86_64-unknown-uefi/release/liftoff.efi`.
+产物是 `target/x86_64-unknown-uefi/release/liftoff.efi`。工具链由 `rust-toolchain.toml` 固定为
+nightly，并安装 `rust-src`、`llvm-tools` 与 `x86_64-unknown-uefi` 目标。
+
+## 仓库布局
+
+- `src/main.rs` —— UEFI 入口、panic 处理与 halt
+- `src/efi.rs` —— EFI 类型与协议
+- `src/serial.rs` —— COM1 串口输出
+
+## 相关项目
+
+- [`kernel`](https://github.com/BRX-Boruix/kernel) —— 被加载的内核
+- [`tools`](https://github.com/BRX-Boruix/tools) —— 构建与验收
+
+## 许可
+
+MIT License，版权归 Yang Borui 所有。详见 [LICENSE](LICENSE)。
