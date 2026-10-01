@@ -433,8 +433,17 @@ pub fn fill_framebuffer(responses: &mut Responses, info: &FramebufferInfo) -> Re
     if !info.is_valid() {
         return Err(Error::InvalidArgument);
     }
+    // **报 HHDM 地址，不是物理地址**（对照 brxLimine `limine.c:1487`：
+    // `fbp[i].address = reported_addr(fbs[i].framebuffer_addr)`，而
+    // `reported_addr(a) = a + direct_map_offset`）。
+    //
+    // 这不是风格问题：HHDM 地址在**内核的所有地址空间**里都映射；裸物理地址只在
+    // 初始恒等映射里映射。真机实测的后果：内核终端在内核地址空间初始化成功
+    // （`fb=0x80000000`），切到 PID 1 的地址空间后写同一地址即 #PF
+    // （`CR2=0x803d46e8`、错误码 `0x2`）。
+    let address = crate::entry::HHDM_OFFSET.wrapping_add(info.base.as_u64());
     let entry = limine::framebuffer::Framebuffer {
-        address: info.base.as_u64() as *mut core::ffi::c_void,
+        address: address as *mut core::ffi::c_void,
         width: info.width as u64,
         height: info.height as u64,
         pitch: info.pitch as u64,
@@ -493,7 +502,14 @@ mod fill_framebuffer_tests {
         assert_eq!(response.framebuffer_count, 1);
         // SAFETY: `framebuffers` 指向容器内指针数组，长度为 1。
         let entry = unsafe { **(response.framebuffers) };
-        assert_eq!(entry.address as u64, 0xfd00_0000);
+        // **必须是 HHDM 地址**（对照 brxLimine `reported_addr`）：HHDM 在内核所有
+        // 地址空间都映射，裸物理地址只在初始恒等映射里映射 —— 后者会在切到用户
+        // 地址空间后 #PF（真机实测 CR2=0x803d46e8）。
+        assert_eq!(
+            entry.address as u64,
+            crate::entry::HHDM_OFFSET + 0xfd00_0000,
+            "帧缓冲地址必须是物理地址 + direct_map_offset"
+        );
         assert_eq!(entry.width, 1024);
         assert_eq!(entry.height, 768);
         assert_eq!(entry.pitch, 4096);
