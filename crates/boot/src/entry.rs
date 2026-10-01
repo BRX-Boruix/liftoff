@@ -775,7 +775,19 @@ where
     }
     // 映射条目数只作诊断：本函数**必然发散**（`enter` 的返回类型是 `!`），故显式标记为有意不用。
     let _count = unsafe { handoff(h.source, h.map_buffer, h.exit, h.image_handle, h.map_key) }
-        .map_err(HandoffError::Exit)?;
+        .map_err(|err| {
+            // **Exit 失败不是终点**：如果 Exit 被固件拒绝（最常见 EFI_INVALID_PARAMETER =
+            // 键已失效），协议允许重取内存映射再试 —— 但**必须在错误留痕里区分**，
+            // 否则真机上「退出失败」与「退出后死」无法区分（已实测混淆过一轮）。
+            #[cfg(target_os = "uefi")]
+            for byte in match err {
+                firmware::error::Error::Io => b"[liftoff] h: exit REFUSED\n" as &[u8],
+                _ => b"[liftoff] h: exit INVALID\n" as &[u8],
+            } {
+                crate::PlatformImpl::write_byte(*byte);
+            }
+            HandoffError::Exit(err)
+        })?;
     let _ = report;
     // **Exit 成功之后到 `enter(entry)` 之间必须没有任何其他操作**：引导服务已失效，
     // 固件随时可能回收我们仍在借用的资源 —— 真机数据显示 Exit 后从未回到我们代码。
