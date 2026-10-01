@@ -1486,6 +1486,24 @@ pub unsafe fn bring_up(
         &mut write,
     )
     .map_err(BringUpError::Copy)?;
+    // 激活前**决定性地**检查：当前 RIP 是否被规划覆盖？换表后取指的就是这里。
+    // 不覆盖就是必然的三重故障，先查出来，别等到复位后猜。
+    {
+        let rip: u64;
+        // SAFETY: 只读当前指令指针，不改状态。
+        unsafe { core::arch::asm!("lea {0}, [rip]", out(reg) rip) };
+        let covered = c.plan[..plan_count].iter().any(|m| {
+            let base = m.virt.as_u64();
+            rip >= base && rip < base.saturating_add(m.len)
+        });
+        for byte in if covered {
+            b"[liftoff] step: rip covered\n" as &[u8]
+        } else {
+            b"[liftoff] step: rip NOT covered\n" as &[u8]
+        } {
+            crate::PlatformImpl::write_byte(*byte);
+        }
+    }
     for byte in b"[liftoff] step: activating\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
