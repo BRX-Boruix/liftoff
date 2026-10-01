@@ -25,6 +25,10 @@ pub use x86_64::paging::X86PageTable;
 #[cfg(feature = "impl-x86_64")]
 pub use x86_64::spinup;
 
+/// CPU 特性探测（NX / LA57）。跳板参数必须来自探测而非硬编码假设（S04）。
+#[cfg(feature = "impl-x86_64")]
+pub use x86_64::features;
+
 #[cfg(feature = "impl-mock")]
 pub mod mock {
     //! 宿主测试用实现：不触碰硬件，但状态机行为真实（不是"假数据"）。

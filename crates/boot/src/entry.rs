@@ -1960,7 +1960,16 @@ pub unsafe fn bring_up(
     };
     let stack_phys = kernel_stack.as_ptr() as u64;
     let kernel_stack_top = HHDM_OFFSET + stack_phys + KERNEL_STACK_BYTES as u64;
+    // **探测而非假设**（E4）：`nx_available` 决定 32 位跳板是否给 `EFER` 置 `NXE`。
+    // 在没有 NX 的 CPU 上，那是保留位写入 → `#GP`。QEMU 默认 CPU 有 NX，所以
+    // 硬编码 1 一直「恰好成立」—— 这正是硬编码假设的典型形态（S04）。
+    let nx_available = if current::features::nx_available() { 1 } else { 0 };
     let spinup_args = current::spinup::SpinupArgs {
+        // **0 = 4 级分页，且这是正确的、不需要探测**：跳板在 `spinup_go32` 里先
+        // `xor eax,eax; mov cr4,eax` **整体清零 CR4**，所以 LA57 必然已被清除；
+        // 我们建的也是 4 级表。brxLimine 同样是 `mov cr4, 0` 之后按需重建
+        // （`spinup.asm_uefi_x86_64:109`）。传 0 表示「不要重新启用 LA57」，与
+        // 清零后的状态一致。
         level5pg: 0,
         pagemap_top: root.start_address().expect("根帧必有地址").as_u64() as u32,
         entry_lo: (info.entry & 0xFFFF_FFFF) as u32,
@@ -1968,7 +1977,7 @@ pub unsafe fn bring_up(
         stack_lo: (kernel_stack_top & 0xFFFF_FFFF) as u32,
         stack_hi: (kernel_stack_top >> 32) as u32,
         gdt: 0,
-        nx_available: 1,
+        nx_available,
         dmo_lo: (HHDM_OFFSET & 0xFFFF_FFFF) as u32,
         dmo_hi: (HHDM_OFFSET >> 32) as u32,
         // **0 = 不卸低半区**。base_revision 是**内核声明的协议版本**，不是我们可以

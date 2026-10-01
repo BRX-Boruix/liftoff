@@ -9,6 +9,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod features;
 pub mod platform;
 pub mod paging;
 pub mod spinup;
