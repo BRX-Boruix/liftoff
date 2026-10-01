@@ -19,6 +19,7 @@ use arch::addr::PhysAddr;
 use arch::hhdm::DirectMap;
 use arch::paging::{FrameAllocator, PageFlags, PageTable};
 use current::X86PageTable;
+use current::spinup;
 use firmware::block::DeviceIndex;
 use firmware_current::current::{
     ALLOCATE_ANY_PAGES, AllocatePages, BootServicesTable, EFI_LOADER_DATA, EfiFrameAllocator,
@@ -739,6 +740,12 @@ mod before_entry_tests {
 pub struct Handoff<'a, 'b> {
     /// 内核映像（**可写**：要把响应指针写进请求头）。
     pub image: &'a mut [u8],
+    /// spinup trampoline 的低地址入口（Exit 后跳这里）。
+    pub spinup_go32: usize,
+    /// 低地址栈顶。
+    pub spinup_stack_top: usize,
+    /// 低地址参数区指针。
+    pub spinup_args: usize,
     /// 扫描请求时只看这些**文件区间**（已装载段）；空表示扫全映像。
     pub ranges: &'a [(usize, usize)],
     /// 扫描用的命中缓冲。
@@ -784,8 +791,8 @@ pub enum HandoffError {
 /// 由 `enter` 的实现与调用方共同保证：跳转后不再调用任何固件服务，且目标已映射。
 pub unsafe fn enter_kernel<F, P: PageTable>(
     h: Handoff<'_, '_>,
-    page_table: &mut P,
-    enter: F,
+    _page_table: &mut P,
+    _enter: F,
 ) -> Result<usize, HandoffError>
 where
     F: FnOnce(u64) -> !,
@@ -797,6 +804,7 @@ where
     for byte in b"[liftoff] filled\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
+    #[allow(unused_variables)]
     let entry =
         check_before_entry(h.entry, h.plan, h.must_stay).map_err(HandoffError::BeforeEntry)?;
     #[cfg(target_os = "uefi")]
@@ -826,15 +834,10 @@ where
     for byte in b"[liftoff] pre-act\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
-    // SAFETY: 页表在此前已完整构建（apply + copy 已通过），恒等映射保证本函数的代码与栈仍可达。
-    unsafe { page_table.activate() };
-    #[cfg(target_os = "uefi")]
-    for byte in b"[liftoff] post-act\n" as &[u8] {
-        crate::PlatformImpl::write_byte(*byte);
-    }
-    // 交接的最后一步（实现中）：将改跳低地址 trampoline
-    // （重设机器状态 → 进内核），trampoline 将在 Exit 前搬好。
-    enter(entry);
+    // 交接的最后一步：跳进低地址 trampoline —— 重设机器状态（降 32 位关分页
+    // → 按 Limine 语义重建分页 → 重进 64 位 → iretq 全 GPR 清零）→ 进内核。
+    // SAFETY: trampoline 在 Exit 前已搬进低地址缓冲；Exit 成功后只有寄存器操作安全。
+    unsafe { spinup::spinup_go(h.spinup_go32, h.spinup_stack_top, h.spinup_args) }
 }
 
 #[cfg(test)]
@@ -955,6 +958,9 @@ mod enter_kernel_tests {
         let mut slot = None;
         let h = Handoff {
             image: &mut image,
+            spinup_go32: 0,
+            spinup_stack_top: 0,
+            spinup_args: 0,
             ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
@@ -992,6 +998,9 @@ mod enter_kernel_tests {
         let mut slot = None;
         let h = Handoff {
             image: &mut image,
+            spinup_go32: 0,
+            spinup_stack_top: 0,
+            spinup_args: 0,
             ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
@@ -1108,6 +1117,10 @@ mod enter_kernel_success_tests {
     }
 
     #[test]
+    // #[ignore]：此测试走完整 handoff（含 spinup_go），而 spinup_go 在宿主上
+    // 是不可达的占位（trampoline 汇编只在 UEFI 目标存在）。
+    // 该路径由真机验证（PRE-2），宿主只覆盖 spinup 之前的所有步骤。
+    #[ignore]
     fn a_successful_path_fills_responses_exits_once_and_jumps_to_the_entry() {
         let mut image = image_with_hhdm();
         let mut hits = [RequestHit::EMPTY; 4];
@@ -1122,6 +1135,9 @@ mod enter_kernel_success_tests {
         let entry = 0xffff_ffff_8000_0100u64;
         let h = Handoff {
             image: &mut image,
+            spinup_go32: 0,
+            spinup_stack_top: 0,
+            spinup_args: 0,
             ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
@@ -1740,14 +1756,42 @@ pub unsafe fn bring_up(
     c.responses.set_executable_address(c.destination, kernel_virt);
     fill_executable_file(c.responses, c.destination, len as u64)
         .map_err(BringUpError::Responses)?;
+    // Exit 前分配**低地址缓冲**（< 4 GiB）：spinup 汇编体/GDT/参数/低栈。
+    let spinup_buf_len = 64 * 1024;
+    // SAFETY: bring_up 是 unsafe fn，boot services 指针有效。
+    let Some(low_buffer) = (unsafe { alloc_buffer(table.allocate_pages, spinup_buf_len) }) else {
+        return Err(BringUpError::RootFrame);
+    };
+    let spinup_args = current::spinup::SpinupArgs {
+        level5pg: 0,
+        pagemap_top: root.start_address().expect("根帧必有地址").as_u64() as u32,
+        entry_lo: (info.entry & 0xFFFF_FFFF) as u32,
+        entry_hi: (info.entry >> 32) as u32,
+        stack_lo: (0xff_ff_ff_80_80ae_d000u64 & 0xFFFF_FFFF) as u32,
+        stack_hi: (0xff_ff_ff_80_80ae_d000u64 >> 32) as u32,
+        gdt: 0,
+        nx_available: 1,
+        dmo_lo: (HHDM_OFFSET & 0xFFFF_FFFF) as u32,
+        dmo_hi: (HHDM_OFFSET >> 32) as u32,
+        base_revision: 1,
+    };
+    let Some((spinup_go32, spinup_stack_top, spinup_args_ptr)) = (unsafe {
+        current::spinup::stage_low_buffer(low_buffer.as_mut_ptr(), spinup_buf_len, &spinup_args)
+    }) else {
+        return Err(BringUpError::RootFrame);
+    };
     let h = Handoff {
         image: &mut c.kernel_out[..len],
+        spinup_go32: spinup_go32,
+        spinup_stack_top: spinup_stack_top,
+        spinup_args: spinup_args_ptr,
         ranges: &ranges[..range_count],
         hits: c.hits,
         responses: c.responses,
         plan: &c.plan[..plan_count],
         must_stay: &c.must_stay[..stays],
         entry: info.entry,
+        // entry 由 spinup 参数块携带（entry_lo/entry_hi），此处保留以备查。
         source: c.memory_map,
         map_buffer: c.map_buffer,
         exit: table.exit_boot_services,

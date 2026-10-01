@@ -268,6 +268,7 @@ pub struct SpinupArgs {
     pub base_revision: u32,
 }
 
+#[cfg(target_os = "uefi")]
 unsafe extern "C" {
     static spinup_text_start: u8;
     static spinup_text_end: u8;
@@ -280,6 +281,7 @@ unsafe extern "C" {
 /// # Safety
 ///
 /// `buffer` 必须指向 `buffer_len` 的可写内存，且 Exit 后保持有效。
+#[cfg(target_os = "uefi")]
 pub unsafe fn stage_low_buffer(
     buffer: *mut u8,
     buffer_len: usize,
@@ -312,11 +314,21 @@ pub unsafe fn stage_low_buffer(
     Some((buffer as usize, stack_top, buffer as usize + text_len + 72))
 }
 
+#[cfg(not(target_os = "uefi"))]
+pub unsafe fn stage_low_buffer(
+    _buffer: *mut u8,
+    _buffer_len: usize,
+    _args: &SpinupArgs,
+) -> Option<(usize, usize, usize)> {
+    None // 宿主无 trampoline；等价性由真机验证
+}
+
 /// Exit 后调用：跳进低地址 trampoline（不返回）。
 ///
 /// # Safety
 ///
 /// 只能 Exit 成功后调用一次；三个指针必须来自 [`stage_low_buffer`]。
+#[cfg(target_os = "uefi")]
 pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize) -> ! {
     // SAFETY: 调用方保证三指针来自 stage_low_buffer 且 Exit 已成功；
     // jmp 目标是本模块汇编导出的 64 位入口（不返回）。
@@ -333,4 +345,10 @@ pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize) -> ! {
             options(noreturn),
         )
     }
+}
+
+#[cfg(not(target_os = "uefi"))]
+pub unsafe fn spinup_go(_go32: usize, _stack_top: usize, _args: usize) -> ! {
+    // 宿主测试二进制无法链接裸 32 位 trampoline —— 该调用只发生在真机。
+    unreachable!("spinup_go 只在 UEFI 目标上有意义")
 }
