@@ -82,14 +82,6 @@ pub enum MapError {
     TableNotAccessible,
     /// 参数合法，但实现不支持该页粒度。
     UnsupportedGranularity,
-    /// 目标位置已有**更大粒度**的映射，无法在其下建立更细的页表。
-    ///
-    /// 这不是参数错误：要建立更细的粒度，必须**先拆分**已存在的大页，
-    /// 或者在规划阶段就避免两个区间重叠。
-    ///
-    /// **绝不可**退而把大页里的地址当作页表帧地址使用 —— 大页项里存的是**页帧
-    /// 基址**而非页表帧地址，那样做等于往任意物理内存写 PTE，是静默的内存损坏。
-    AlreadyMappedLarger,
 }
 
 impl core::fmt::Display for MapError {
@@ -103,7 +95,6 @@ impl core::fmt::Display for MapError {
             Self::OutOfMemory => "页帧分配耗尽",
             Self::TableNotAccessible => "页表帧不在直接映射内",
             Self::UnsupportedGranularity => "实现不支持该页粒度",
-            Self::AlreadyMappedLarger => "该位置已有更大粒度的映射，需先拆分",
         };
         f.write_str(text)
     }

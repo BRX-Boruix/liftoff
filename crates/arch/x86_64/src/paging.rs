@@ -26,6 +26,16 @@ const FRAME_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const LARGE_ADDR_MASK: u64 = 0x000F_FFFF_FFE0_0000;
 /// 每级页表项数。
 const ENTRIES_PER_TABLE: u64 = 512;
+/// 1 GiB 大页大小（PDPT 项可表示的最大粒度）。
+const HUGE_PAGE_SIZE: u64 = 1 << 30;
+
+/// 某一级大页的物理基址掩码：掩掉页内偏移，再与可寻址位掩码相与。
+///
+/// 用算式而不是三个硬编码常量：`2 MiB` 与 `1 GiB` 的结果都能由它推出，
+/// 少一处抄错的机会。
+fn large_mask(page_size: u64) -> u64 {
+    !(page_size - 1) & FRAME_ADDR_MASK
+}
 
 /// 把沿途各级页表项折算成**语义权限**：取交集。
 ///
@@ -94,21 +104,62 @@ impl<A: FrameAllocator> X86PageTable<A> {
         Ok(())
     }
 
-    /// 取（必要时创建）下级页表帧。
-    fn table_or_create(&mut self, frame: PhysFrame, index: u64) -> Result<PhysFrame, MapError> {
+    /// 取（必要时创建或**拆分**）下级页表帧。
+    ///
+    /// `child_page_size` 是本级项所代表的**下级页大小**：
+    /// PML4 项 → 1 GiB；PDPT 项 → 2 MiB；PD 项 → 4 KiB。
+    ///
+    /// 若该位置已是**更大粒度**的映射（PS=1），这里把它**拆分**成下一级页表并如实
+    /// 复制原有映射。**绝不能**把大页项里的地址当作页表帧地址使用 —— 那存的是**页帧
+    /// 基址**，下钻等于往任意物理内存写 PTE（静默内存损坏，真机实测为复位循环）。
+    fn table_or_create(
+        &mut self,
+        frame: PhysFrame,
+        index: u64,
+        child_page_size: u64,
+    ) -> Result<PhysFrame, MapError> {
         let entry = self.read_entry(frame, index)?;
         if entry & PTE_PRESENT != 0 {
-            // **必须检查 PS 位。** 若此处已是 2 MiB / 1 GiB 大页，项里存的是**页帧
-            // 基址**而不是页表帧地址；不检查就会把大页指向的物理内存当作页表来写 ——
-            // 往任意物理地址写 PTE，是静默的内存损坏（真机表现为复位循环，已实测）。
             if entry & PTE_HUGE != 0 {
-                return Err(MapError::AlreadyMappedLarger);
+                return self.split_large(frame, index, entry, child_page_size);
             }
             return Ok(PhysFrame::containing(PhysAddr::new(entry & FRAME_ADDR_MASK)));
         }
         let fresh = self.allocator.allocate_zeroed().ok_or(MapError::OutOfMemory)?;
         let base = fresh.start_address().ok_or(MapError::Overflow)?.as_u64();
         self.write_entry(frame, index, base | PTE_PRESENT | PTE_WRITABLE)?;
+        Ok(fresh)
+    }
+
+    /// 把已有的大页**拆分**成下一级页表，返回新表帧。
+    ///
+    /// **如实复制是核心契约**：每个子项映射 `base + slot * child_page_size`，并继承
+    /// 父项的**可写**与 **NX** 位（present 由自己置）。少一项、或权限不对，原本可
+    /// 访问的地址就会突然不可访问 —— 这类故障在真机上表现为随机复位，极难定位。
+    fn split_large(
+        &mut self,
+        frame: PhysFrame,
+        index: u64,
+        entry: u64,
+        child_page_size: u64,
+    ) -> Result<PhysFrame, MapError> {
+        let fresh = self.allocator.allocate_zeroed().ok_or(MapError::OutOfMemory)?;
+        let base = entry & large_mask(child_page_size);
+        let child_flags = PTE_PRESENT | (entry & (PTE_WRITABLE | PTE_NX));
+        // 下级若仍是**大页**（拆分 1 GiB 得到 2 MiB 项），子项要带 PS 位。
+        let child_huge = if child_page_size > PAGE_SIZE { PTE_HUGE } else { 0 };
+        for slot in 0..ENTRIES_PER_TABLE {
+            let addr = base + slot * child_page_size;
+            self.write_entry(fresh, slot, addr | child_flags | child_huge)?;
+        }
+        // 父项改为指向新表：清 PS 位；**保留 NX**（非叶项的 NX 同样生效，丢掉就等于
+        // 悄悄放开了执行权限）。
+        let fresh_base = fresh.start_address().ok_or(MapError::Overflow)?.as_u64();
+        self.write_entry(
+            frame,
+            index,
+            fresh_base | PTE_PRESENT | PTE_WRITABLE | (entry & PTE_NX),
+        )?;
         Ok(fresh)
     }
 
@@ -143,9 +194,9 @@ impl<A: FrameAllocator> X86PageTable<A> {
         while remaining > 0 {
             // 三级下钻：PML4 -> PDPT -> PD ->（本函数创建）PT。
             // 每张 4 KiB 页表覆盖 2 MiB，挂在 PD 上（PD 项 PS=0）。
-            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF)?;
-            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF)?;
-            let pt = self.table_or_create(pd, (v >> 21) & 0x1FF)?;
+            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF, HUGE_PAGE_SIZE)?;
+            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF, LARGE_PAGE_SIZE)?;
+            let pt = self.table_or_create(pd, (v >> 21) & 0x1FF, PAGE_SIZE)?;
             let pt_index = (v >> 12) & 0x1FF;
             let pte = (p & FRAME_ADDR_MASK) | pte_flags;
             self.write_entry(pt, pt_index, pte)?;
@@ -183,8 +234,8 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
             // validate_range 已保证 virt + len 与 phys + len 不溢出，且 page < pages，故两处加法安全。
             let v = virt.as_u64() + page * LARGE_PAGE_SIZE;
             let p = phys.as_u64() + page * LARGE_PAGE_SIZE;
-            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF)?;
-            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF)?;
+            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF, HUGE_PAGE_SIZE)?;
+            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF, LARGE_PAGE_SIZE)?;
             self.write_entry(pd, (v >> 21) & 0x1FF, (p & LARGE_ADDR_MASK) | pte_flags | PTE_HUGE)?;
         }
         Ok(())
@@ -480,10 +531,10 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_descend_into_an_existing_large_page() {
-        // 潜在损坏缺陷的回归护栏：先建 2 MiB 大页，再在同一 2 MiB 区间里建 4 KiB 页。
-        // 旧实现在 `table_or_create` 里只看 present 位，会把**大页的页帧基址**当成
-        // 页表帧地址，然后往那块物理内存写 PTE —— 静默损坏，真机表现为复位循环。
+    fn splits_an_existing_large_page_and_preserves_the_mapping() {
+        // 拆分：已有 2 MiB 大页时，要在其区间内建 4 KiB 页，必须把大页**拆成**
+        // 一张页表，并**如实复制**原有映射 —— 少一项或权限不对，原本可访问的地址
+        // 就会突然不可访问。
         let (mut alloc, dm) = harness(64);
         let root = alloc.allocate_zeroed().expect("根表帧");
         let mut pt = X86PageTable::new(root, dm, alloc);
@@ -491,23 +542,35 @@ mod tests {
             VirtAddr::new(0x200000),
             PhysAddr::new(0x400000),
             LARGE_PAGE_SIZE,
-            PageFlags::present(),
+            PageFlags::present().with(PageFlags::writable()),
         )
         .expect("大页映射成功");
-        let before = pt.allocator.allocated();
-        let result = pt.map_range_pages(
+
+        // 在大页区间内建一页 4 KiB —— 应当触发拆分。
+        pt.map_range_pages(
             VirtAddr::new(0x201000),
-            PhysAddr::new(0x5000),
+            PhysAddr::new(0x9000),
             PAGE_SIZE,
             PageFlags::present(),
-        );
-        assert_eq!(result, Err(MapError::AlreadyMappedLarger), "必须拒绝下钻，而不是损坏内存");
-        assert_eq!(
-            pt.allocator.allocated(),
-            before,
-            "拒绝必须发生在**分配页表帧之前** —— 分配了就意味着已经开始写别人的内存",
-        );
+        )
+        .expect("应拆分而不是报错");
+
+        // ① 新页生效。
+        let (phys, _) = pt.translate(VirtAddr::new(0x201000)).expect("新页可翻译");
+        assert_eq!(phys.as_u64(), 0x9000, "新映射应覆盖拆分后的那一页");
+
+        // ② **大页的其余部分必须原样保留** —— 这是拆分的核心契约。
+        for offset in [0u64, 0x1000, 0x2000, 0x1FF000] {
+            let v = 0x200000 + offset;
+            if v == 0x201000 {
+                continue;
+            }
+            let (phys, flags) = pt.translate(VirtAddr::new(v)).expect("拆分后仍应可翻译");
+            assert_eq!(phys.as_u64(), 0x400000 + offset, "地址 {:#x} 的映射被拆分破坏了", v);
+            assert!(flags.is_writable(), "权限必须在拆分中保留: {:#x}", v);
+        }
     }
+
 
     #[test]
     fn reports_out_of_memory_when_the_frame_source_is_exhausted() {
