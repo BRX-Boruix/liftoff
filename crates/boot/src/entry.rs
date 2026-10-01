@@ -257,10 +257,23 @@ pub unsafe fn handoff(
     image_handle: Handle,
     map_key: &mut Option<usize>,
 ) -> Result<usize, Error> {
+    // 三步留痕是真机专用（`out` 指令在宿主用户态是特权指令 ✗）。
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] h: mmap\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     let map = source.memory_map(map_buffer)?;
     let count = map.len();
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] h: key\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     if !capture_map_key(source, map_key) {
         return Err(Error::InvalidState);
+    }
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] h: exit\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
     }
     // SAFETY: 由调用方保证（见函数文档与 `exit_prepared` 的 SAFETY 契约）。
     unsafe { exit_prepared(exit, image_handle, map_key)? };
