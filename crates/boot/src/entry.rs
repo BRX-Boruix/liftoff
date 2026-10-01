@@ -1651,6 +1651,43 @@ pub unsafe fn bring_up(
         }
     }
     let _ = stays;
+    // **直接问内核要什么**：扫描它声明的请求并逐条打印（不读内核代码也能知道）。
+    // 这比猜“它可能缺什么”可靠得多。
+    {
+        let mut hits = [RequestHit::EMPTY; 64];
+        if let Ok(count) = limine::scan::scan(&c.kernel_out[..len], &mut hits) {
+            for hit in &hits[..count] {
+                let name: &[u8] = if hit.id == limine::base::HHDM_REQUEST_ID {
+                    b"[liftoff] req: hhdm\n"
+                } else if hit.id == limine::memmap::MEMMAP_REQUEST_ID {
+                    b"[liftoff] req: memmap\n"
+                } else if hit.id == limine::framebuffer::FRAMEBUFFER_REQUEST_ID {
+                    b"[liftoff] req: framebuffer\n"
+                } else if hit.id == limine::rsdp::RSDP_REQUEST_ID {
+                    b"[liftoff] req: rsdp\n"
+                } else if hit.id == limine::executable_file::EXECUTABLE_FILE_REQUEST_ID {
+                    b"[liftoff] req: executable_file\n"
+                } else if hit.id == limine::executable_address::EXECUTABLE_ADDRESS_REQUEST_ID {
+                    b"[liftoff] req: executable_address\n"
+                } else if hit.id == limine::entry_point::ENTRY_POINT_REQUEST_ID {
+                    b"[liftoff] req: entry_point\n"
+                } else if hit.id == limine::module::MODULE_REQUEST_ID {
+                    b"[liftoff] req: modules\n"
+                } else if hit.id == limine::mp::MP_REQUEST_ID {
+                    b"[liftoff] req: smp\n"
+                } else if hit.id == limine::firmware_type::FIRMWARE_TYPE_REQUEST_ID {
+                    b"[liftoff] req: firmware_type\n"
+                } else if hit.id == limine::bootloader_info::BOOTLOADER_INFO_REQUEST_ID {
+                    b"[liftoff] req: bootloader_info\n"
+                } else {
+                    b"[liftoff] req: other\n"
+                };
+                for byte in name {
+                    crate::PlatformImpl::write_byte(*byte);
+                }
+            }
+        }
+    }
     // 8) 交接：填响应 → 检查 → 取键退出 → 跳转。
     //
     // HHDM 偏移是**必须**的：内核靠它把物理地址翻成虚拟地址。不填（或填 0）它会算错地址，
