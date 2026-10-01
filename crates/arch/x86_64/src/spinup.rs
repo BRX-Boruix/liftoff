@@ -87,8 +87,8 @@ core::arch::global_asm!(
     // 64 位入口（Exit 后从 enter_kernel 跳到这里）：加载自建 GDT/IDT，降 32 位。
     // rdi = spinup_go32 低地址拷贝，rsi = 低地址栈顶，rdx = 32 位参数区指针。
     "    cli",
-    "    lgdt [rip + spinup_gdt_ptr]",
-    "    lidt [rip + spinup_idt_ptr]",
+    "    lgdt [rdx]",
+    "    lidt [rdx + 10]",
     "    lea rbx, [rip + .reload_cs]",
     "    push 0x28",
     "    push rbx",
@@ -316,11 +316,28 @@ pub unsafe fn stage_low_buffer(
     unsafe {
         // 1) 拷贝 text（含 spinup_common64 / go32 / limine_spinup_32）
         core::ptr::copy_nonoverlapping(text_start as *const u8, buffer, text_len);
-        // 2) GDT 数据放在 text 之后
-        let gdt_at = buffer as usize + text_len;
+        // **读回校验**：确认低地址拷贝与源一致（不一致说明缓冲异常）。
+        for offset in [0usize, text_len / 2, text_len - 1] {
+            let src = *((text_start + offset) as *const u8);
+            let dst = *(buffer.add(offset));
+            if src != dst {
+                return None;
+            }
+        }
+        // GDT/args 全放参数区之后 ✗ —— 统一布局：text | args | GDTR | IDTR | GDT | stack
+        let args_at = buffer as usize + text_len;
+        let gdtr_at = args_at + 52;
+        let idtr_at = gdtr_at + 10;
+        let gdt_at = idtr_at + 10;
         for (index, word) in build_gdt().iter().enumerate() {
             core::ptr::write_unaligned((gdt_at + index * 8) as *mut u64, *word);
         }
+        // GDTR：limit = 71，base = gdt_at
+        core::ptr::write_unaligned(gdtr_at as *mut u16, 71u16);
+        core::ptr::write_unaligned((gdtr_at + 2) as *mut u64, gdt_at as u64);
+        // IDTR：limit = 0，base = 0（空 IDT）
+        core::ptr::write_unaligned(idtr_at as *mut u16, 0u16);
+        core::ptr::write_unaligned((idtr_at + 2) as *mut u64, 0u64);
         // 3) **修正拷贝里的 GDTR**：base 指向低地址 GDT（limit 已在原数据里 ✓）
         let gdt_ptr_site = buffer as usize + gdt_ptr_off;
         core::ptr::write_unaligned((gdt_ptr_site + 2) as *mut u64, gdt_at as u64);
