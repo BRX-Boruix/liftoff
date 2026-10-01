@@ -821,8 +821,17 @@ where
     let _ = report;
     // **Exit 成功之后立刻激活并跳转**：引导服务已失效，只有纯寄存器操作是安全的。
     // 真机数据显示「先激活再 Exit」会让固件在 Exit 内部挂死 —— 所以激活必须放这里。
+    // 激活前打印：若它在 `mov cr3` 之后死，说明新表的恒等映射没覆盖引导器映像。
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] pre-act\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     // SAFETY: 页表在此前已完整构建（apply + copy 已通过），恒等映射保证本函数的代码与栈仍可达。
     unsafe { page_table.activate() };
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] post-act\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     enter(entry);
 }
 
