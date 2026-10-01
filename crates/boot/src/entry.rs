@@ -1655,7 +1655,18 @@ pub unsafe fn bring_up(
     // 这比猜“它可能缺什么”可靠得多。
     {
         let mut hits = [RequestHit::EMPTY; 64];
-        if let Ok(count) = limine::scan::scan_requests(&c.kernel_out[..len], &mut hits) {
+        match limine::scan::scan_requests(&c.kernel_out[..len], &mut hits) {
+            Err(_) => {
+                for byte in b"[liftoff] scan ERR\n" as &[u8] {
+                    crate::PlatformImpl::write_byte(*byte);
+                }
+            }
+            Ok(0) => {
+                for byte in b"[liftoff] scan 0 hits\n" as &[u8] {
+                    crate::PlatformImpl::write_byte(*byte);
+                }
+            }
+            Ok(count) => {
             for hit in &hits[..count] {
                 let name: &[u8] = if hit.id == limine::base::HHDM_REQUEST_ID {
                     b"[liftoff] req: hhdm\n"
@@ -1685,6 +1696,7 @@ pub unsafe fn bring_up(
                 for byte in name {
                     crate::PlatformImpl::write_byte(*byte);
                 }
+            }
             }
         }
     }
