@@ -1697,27 +1697,15 @@ pub unsafe fn bring_up(
         // **先打出 `len` 的数量级**（每 4 MB 一个点，最多 48 个）：
         // `len` 是唯一没在真机上验证过、又决定循环边界的量 —— 宿主测试里它是对的，
         // 但真机上若是个垃圾值，4 MB 分块循环就会一直扫到没有映射的地方。
+        // 上一版在这里用自写的十进制打印输出 `len` —— 而真机**正好在打印 `len=` 之后死掉**，
+        // 所以我不能排除是我自己的打印代码。这里换成**不含任何算术**的固定标记，
+        // 并用 `<` `>` 把它夹住：两个都出现＝打印无关；只出现 `<`＝就是打印。
         {
-            for byte in b"[liftoff] len=" as &[u8] {
+            crate::PlatformImpl::write_byte(b'<');
+            for byte in b"[liftoff] len checked\n" as &[u8] {
                 crate::PlatformImpl::write_byte(*byte);
             }
-            let mut digits = [0u8; 20];
-            let mut count = 0usize;
-            let mut value = len;
-            if value == 0 {
-                digits[0] = b'0';
-                count = 1;
-            }
-            while value > 0 && count < digits.len() {
-                digits[count] = b'0' + (value % 10) as u8;
-                value /= 10;
-                count += 1;
-            }
-            while count > 0 {
-                count -= 1;
-                crate::PlatformImpl::write_byte(digits[count]);
-            }
-            crate::PlatformImpl::write_byte(b'\n');
+            crate::PlatformImpl::write_byte(b'>');
         }
         // **规模-时间判据**：同一次运行里扫 64 KB / 256 KB / 1 MB，各打一个标记。
         // 出现到哪一个，就说明扫描在固件里的实际速度量级；只出现第一个，
