@@ -1499,6 +1499,25 @@ pub enum PlanBuildError {
     Plan(PlanError),
 }
 
+/// 页表规划的输入。
+///
+/// 用具名结构而不是继续堆位置参数：已经 7 个参数，再加一个会让每个调用点都变成
+/// 一串无法自解释的 `true` / `0x20_0000`。
+pub struct PlanRequest<'a> {
+    /// 内核装载的物理基址（`large != 0` 时必须按 `large` 对齐）。
+    pub kernel_phys: u64,
+    /// 内核链接期虚拟基址。
+    pub kernel_virt: u64,
+    /// 内核区间长度（会被向上取整到 `large` 的整数倍）。
+    pub kernel_len: u64,
+    /// HHDM 覆盖的物理区间。
+    pub hhdm: &'a [UsableRange],
+    /// 恒等映射覆盖的物理区间。
+    pub identity: &'a [UsableRange],
+    /// 大页粒度；`0` 表示不用大页。
+    pub large: u64,
+}
+
 /// 组装交接所需的页表规划：内核高区 + HHDM + 恒等。
 ///
 /// 恒等映射**必须保留**：切换页表时当前正在执行的代码与栈必须仍然被映射
@@ -1506,15 +1525,15 @@ pub enum PlanBuildError {
 /// 无需去读 RIP/RSP（那需要汇编）。`identity` 由调用方给出（取自固件内存映射的可用区间）。
 ///
 /// 内核按**一段**给出（三段取并集）：段间空隙也会被映射，这是有意的简化。
-pub fn build_plan(
-    kernel_phys: u64,
-    kernel_virt: u64,
-    kernel_len: u64,
-    hhdm: &[UsableRange],
-    identity: &[UsableRange],
-    out: &mut [Mapping],
-    large: u64,
-) -> Result<usize, PlanBuildError> {
+pub fn build_plan(request: &PlanRequest<'_>, out: &mut [Mapping]) -> Result<usize, PlanBuildError> {
+    let PlanRequest {
+        kernel_phys,
+        kernel_virt,
+        kernel_len,
+        hhdm,
+        identity,
+        large,
+    } = *request;
     if large != 0 && kernel_phys % large != 0 {
         return Err(PlanBuildError::KernelBaseUnaligned);
     }
@@ -1533,19 +1552,41 @@ pub fn build_plan(
     let kernel_count = mm::plan::plan_kernel_high(kernel_phys, kernel_virt, kernel_len, &mut out[total..], large)
         .map_err(PlanBuildError::Plan)?;
     total += kernel_count;
-    total += mm::plan::plan_hhdm(hhdm, HHDM_OFFSET, &mut out[total..], large)
+    // 记下 HHDM 的条数：权限按「内核 / HHDM / 恒等」三段分别给，所以需要边界。
+    let hhdm_count = mm::plan::plan_hhdm(hhdm, HHDM_OFFSET, &mut out[total..], large)
         .map_err(PlanBuildError::Plan)?;
+    total += hhdm_count;
     total += mm::plan::plan_identity(identity, &mut out[total..], large)
         .map_err(PlanBuildError::Plan)?;
     // 规划器只产出 `present()` —— 在 x86-64 上那等于 **NX 置位**：内核入口所在的代码段
     // 不可执行，一跳过去就指令取指故障（真实运行表现为机器复位）。这里按用途补权限：
     // 内核段 R/W/X（它要执行代码、写数据）；HHDM 与恒等 R/W（引导器与内核都要读写）。
+    // 内核段：R/W/X —— 它要执行代码、也要写数据。
+    //
+    // **注意**：内核目前是**一整段**（三段取并集）给同一个权限，没有按 ELF 段权限
+    // 细分。真正的 W^X 需要按段映射（代码段 R/X、数据段 R/W），那是下一步；
+    // 这里不假装已经做到。
     let kernel_flags = PageFlags::present()
         .with(PageFlags::writable())
         .with(PageFlags::executable());
-    // **不设 NX**：置 NX 需要 `EFER.NXE=1`，而固件未必开启 —— 未开启时带 bit 63 的表项
-    // 是保留位违规，换表即 #GP → 三重故障（真机上正是如此）。恒等/HHDM 可执行无害。
-    let data_flags = PageFlags::present()
+    // 恒等 / 低 4 GiB：**必须可执行**，这不是偷懒。
+    //
+    // 跳板自己就从低内存取指：`mov cr0` 打开分页后，它还要再执行几条指令
+    // （`retf` 回到 64 位、跳内核入口）。把这里设成不可执行，跳板会在换表后
+    // **立刻**取指故障 —— 表现为无输出复位。
+    let identity_flags = PageFlags::present()
+        .with(PageFlags::writable())
+        .with(PageFlags::executable());
+    // HHDM：**数据通道** —— 但**必须保持可执行**，这是实测结论而不是偷懒。
+    //
+    // 曾尝试在 `nx_available` 为真时给 HHDM 置 NX（W^X：直接映射不可执行，
+    // 挡住 ret2dir 一类手法）。跳板确实在 `CR0.PG` 生效**之前**写 `EFER.NXE`
+    // （见 `spinup` 汇编），所以 NX 位本身合法 —— 但真机结果是**复位循环**
+    // （串口 75501 字节，OVMF 引导信息反复出现），即换表后立刻取指故障。
+    // **结论：有东西经 HHDM 取指。** 具体是谁尚未定位（可能是内核早期入口走
+    // 物理别名），在定位之前不能置 NX。这条否定结果**实测支撑**了
+    // 「数据映射一律可执行」这一策略 —— 它看起来像保守，实际是必需。
+    let hhdm_flags = PageFlags::present()
         .with(PageFlags::writable())
         .with(PageFlags::executable());
     // **`base_revision == 0` 的 Limine 规则**（对照 brxLimine `build_pagemap`，
@@ -1567,13 +1608,20 @@ pub fn build_plan(
                 virt: arch::addr::VirtAddr::new(0),
                 phys: arch::addr::PhysAddr::new(0),
                 len: 0x1_0000_0000u64,
-                flags: data_flags,
+                flags: identity_flags,
             };
             total += 1;
         }
     }
+    // 三段各自给权限：`[0, kernel)` / `[kernel, kernel+hhdm)` / 其余（恒等 + 低 4 GiB）。
     for (index, mapping) in out[..total].iter_mut().enumerate() {
-        mapping.flags = if index < kernel_count { kernel_flags } else { data_flags };
+        mapping.flags = if index < kernel_count {
+            kernel_flags
+        } else if index < kernel_count + hhdm_count {
+            hhdm_flags
+        } else {
+            identity_flags
+        };
     }
     Ok(total)
 }
@@ -1721,13 +1769,15 @@ pub unsafe fn bring_up(
     // 少映射是致命的。
     align_ranges_down(&mut c.usable[..usable_count], LARGE_PAGE).map_err(BringUpError::Plan)?;
     let plan_count = build_plan(
-        c.destination,
-        kernel_virt,
-        kernel_len,
-        &c.usable[..usable_count],
-        &c.usable[..usable_count],
+        &PlanRequest {
+            kernel_phys: c.destination,
+            kernel_virt,
+            kernel_len,
+            hhdm: &c.usable[..usable_count],
+            identity: &c.usable[..usable_count],
+            large: LARGE_PAGE,
+        },
         c.plan,
-        LARGE_PAGE,
     )
     .map_err(BringUpError::Plan)?;
     crate::PlatformImpl::write_byte(b'6');
@@ -1965,6 +2015,9 @@ pub unsafe fn bring_up(
     // **探测而非假设**（E4）：`nx_available` 决定 32 位跳板是否给 `EFER` 置 `NXE`。
     // 在没有 NX 的 CPU 上，那是保留位写入 → `#GP`。QEMU 默认 CPU 有 NX，所以
     // 硬编码 1 一直「恰好成立」—— 这正是硬编码假设的典型形态（S04）。
+    // **探测而非假设**（E4）：`nx_available` 决定 32 位跳板是否给 `EFER` 置 `NXE`。
+    // 在没有 NX 的 CPU 上，那是保留位写入 → `#GP`。QEMU 默认 CPU 有 NX，所以
+    // 硬编码 1 一直「恰好成立」—— 这正是硬编码假设的典型形态（S04）。
     let nx_available = if current::features::nx_available() { 1 } else { 0 };
     let spinup_args = current::spinup::SpinupArgs {
         // **0 = 4 级分页，且这是正确的、不需要探测**：跳板在 `spinup_go32` 里先
@@ -2054,7 +2107,7 @@ pub const LARGE_PAGE: u64 = 2 * 1024 * 1024;
 
 #[cfg(test)]
 mod build_plan_tests {
-    use super::{HHDM_OFFSET, PlanBuildError, build_plan};
+    use super::{HHDM_OFFSET, PlanBuildError, PlanRequest, build_plan};
     use arch::addr::PhysAddr;
     use mm::plan::Mapping;
     use mm::takeover::{MustStay, check_coverage};
@@ -2066,6 +2119,19 @@ mod build_plan_tests {
         UsableRange { base: PhysAddr::new(base), length }
     }
 
+    /// 测试用请求：默认 `nx_available = true`。默认值只在这里写一次（S15），
+    /// 专门测「NX 不可用」的用例自己改这个字段。
+    fn request<'a>(
+        kernel_phys: u64,
+        kernel_virt: u64,
+        kernel_len: u64,
+        hhdm: &'a [UsableRange],
+        identity: &'a [UsableRange],
+        large: u64,
+    ) -> PlanRequest<'a> {
+        PlanRequest { kernel_phys, kernel_virt, kernel_len, hhdm, identity, large }
+    }
+
     #[test]
     fn the_plan_covers_the_kernel_hhdm_and_identity_and_passes_the_pre_jump_check() {
         // 真实内核三段的并集：[0xffffffff80000000, 0xffffffff806fa000 + 0x2bea88) = 0x9b8a88。
@@ -2075,8 +2141,11 @@ mod build_plan_tests {
         let hhdm = [range(0, 0x80_0000)];
         let identity = [range(0, 0x80_0000)];
         let mut plan = [Mapping::EMPTY; 256];
-        let count = build_plan(kernel_phys, kernel_virt, kernel_len, &hhdm, &identity, &mut plan, LARGE)
-            .expect("规划应成功");
+        let count = build_plan(
+            &request(kernel_phys, kernel_virt, kernel_len, &hhdm, &identity, LARGE),
+            &mut plan,
+        )
+        .expect("规划应成功");
         assert!(count >= 3, "至少要有内核/HHDM/恒等三类映射，实得 {count}");
         let must_stay = [
             MustStay { start: kernel_virt, len: kernel_len },
@@ -2097,13 +2166,8 @@ mod build_plan_tests {
     fn an_unaligned_kernel_base_is_rejected_instead_of_silently_under_mapping() {
         let mut plan = [Mapping::EMPTY; 64];
         let result = build_plan(
-            0x10_0000,
-            0xffff_ffff_8000_0000,
-            LARGE,
-            &[],
-            &[],
+            &request(0x10_0000, 0xffff_ffff_8000_0000, LARGE, &[], &[], LARGE),
             &mut plan,
-            LARGE,
         );
         assert_eq!(
             result,
@@ -2122,13 +2186,8 @@ mod build_plan_tests {
         let identity = [];
         let mut plan = [Mapping::EMPTY; 64];
         let count = build_plan(
-            0x20_0000,
-            0xffff_ffff_8000_0000,
-            LARGE,
-            &hhdm,
-            &identity,
+            &request(0x20_0000, 0xffff_ffff_8000_0000, LARGE, &hhdm, &identity, LARGE),
             &mut plan,
-            LARGE,
         )
         .expect("规划应成功");
         let low = plan[..count]
@@ -2141,13 +2200,42 @@ mod build_plan_tests {
         assert_eq!(low.len % (2 * 1024 * 1024), 0, "长度必须是 2 MiB 的倍数");
     }
 
+    /// **实测约束**：数据映射（HHDM / 恒等 / 低 4 GiB）必须**可执行**。
+    ///
+    /// 曾尝试在 NX 可用时给 HHDM 置 NX（W^X：直接映射不可执行，挡住 ret2dir 一类
+    /// 手法）。跳板确实在 `CR0.PG` 生效**之前**写 `EFER.NXE`（见 `spinup` 汇编），
+    /// 所以 NX 位本身合法 —— 但真机结果是**复位循环**（串口 75501 字节，OVMF 引导
+    /// 信息反复出现），即换表后立刻取指故障。**说明有东西经 HHDM 取指**（具体是谁
+    /// 尚未定位）。在定位之前，「数据映射一律可执行」是必需，不是保守。
+    ///
+    /// 这条测试是那个**否定结果**的回归护栏：谁再把数据映射改成 NX，它会先红。
+    #[test]
+    fn data_mappings_must_stay_executable() {
+        let hhdm = [range(0x1000_0000, LARGE)];
+        let mut plan = [Mapping::EMPTY; 64];
+        let count = build_plan(
+            &request(0x20_0000, 0xffff_ffff_8000_0000, LARGE, &hhdm, &[], LARGE),
+            &mut plan,
+        )
+        .expect("规划应成功");
+        for mapping in plan[..count].iter() {
+            assert!(
+                mapping.flags.is_executable(),
+                "所有映射都必须可执行（实测：数据映射置 NX 会导致复位循环）: virt={:#x}",
+                mapping.virt.as_u64(),
+            );
+        }
+    }
+
     #[test]
     fn the_hhdm_mapping_lands_at_the_declared_offset() {
         let hhdm = [range(0x1000_0000, LARGE)];
         let mut plan = [Mapping::EMPTY; 64];
-        let count =
-            build_plan(0x20_0000, 0xffff_ffff_8000_0000, LARGE, &hhdm, &[], &mut plan, LARGE)
-                .expect("规划应成功");
+        let count = build_plan(
+            &request(0x20_0000, 0xffff_ffff_8000_0000, LARGE, &hhdm, &[], LARGE),
+            &mut plan,
+        )
+        .expect("规划应成功");
         let found = plan[..count]
             .iter()
             .any(|m| m.virt.as_u64() == HHDM_OFFSET + 0x1000_0000);
