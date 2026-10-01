@@ -22,7 +22,8 @@ use current::X86PageTable;
 use current::spinup;
 use firmware::block::DeviceIndex;
 use firmware_current::current::{
-    ALLOCATE_ANY_PAGES, AllocatePages, BootServicesTable, EFI_LOADER_DATA, EfiFrameAllocator,
+    ALLOCATE_ANY_PAGES, AllocatePages, BootServicesTable, EFI_LOADER_CODE, EFI_LOADER_DATA,
+    EfiFrameAllocator,
     ExitBootServices, Handle, SUCCESS, SystemTable, UefiBlockDevices, UefiBootServices, UefiGraphics,
     acpi_rsdp, graphics_output_mode,
     UefiMemoryMapSource, boot_services_of,
@@ -41,12 +42,28 @@ const HEAD_BUFFER: usize = 64 * 1024;
 ///
 /// 调用方保证 `allocate_pages` 有效，且这块内存不被别处使用。
 unsafe fn alloc_buffer(allocate_pages: AllocatePages, len: usize) -> Option<&'static mut [u8]> {
+    // SAFETY: 由调用方保证（见函数文档）。
+    unsafe { alloc_buffer_typed(allocate_pages, len, EFI_LOADER_DATA) }
+}
+
+/// 同 [`alloc_buffer`]，但指定 EFI 内存类型。
+///
+/// 跳板必须用 `EfiLoaderCode`：`EfiLoaderData` 在 OVMF 下可能被标成不可执行。
+///
+/// # Safety
+///
+/// 同 [`alloc_buffer`]。
+unsafe fn alloc_buffer_typed(
+    allocate_pages: AllocatePages,
+    len: usize,
+    mem_type: u32,
+) -> Option<&'static mut [u8]> {
     const PAGE: usize = 4096;
     let pages = len.div_ceil(PAGE);
     let mut address: u64 = 0;
     // SAFETY: 由调用方保证（见函数文档）。
     let status = unsafe {
-        (allocate_pages)(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &mut address)
+        (allocate_pages)(ALLOCATE_ANY_PAGES, mem_type, pages, &mut address)
     };
     if status != SUCCESS {
         return None;
@@ -749,12 +766,8 @@ mod before_entry_tests {
 pub struct Handoff<'a, 'b> {
     /// 内核映像（**可写**：要把响应指针写进请求头）。
     pub image: &'a mut [u8],
-    /// spinup trampoline 的低地址入口（Exit 后跳这里）。
-    pub spinup_go32: usize,
-    /// 低地址栈顶。
-    pub spinup_stack_top: usize,
-    /// 低地址参数区指针。
-    pub spinup_args: usize,
+    /// spinup 跳板的低地址缓冲布局（Exit 后从 common64 跳进去）。
+    pub spinup: spinup::LowBuffer,
     /// 扫描请求时只看这些**文件区间**（已装载段）；空表示扫全映像。
     pub ranges: &'a [(usize, usize)],
     /// 扫描用的命中缓冲。
@@ -849,7 +862,7 @@ where
     for byte in b"[liftoff] G-\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
-    unsafe { spinup::spinup_go(h.spinup_go32, h.spinup_stack_top, h.spinup_args, h.spinup_go32) }
+    unsafe { spinup::spinup_go(h.spinup) }
 }
 
 #[cfg(test)]
@@ -970,9 +983,11 @@ mod enter_kernel_tests {
         let mut slot = None;
         let h = Handoff {
             image: &mut image,
-            spinup_go32: 0,
-            spinup_stack_top: 0,
-            spinup_args: 0,
+            spinup: current::spinup::LowBuffer {
+                go32: 0,
+                spinup32: 0,
+                args: 0,
+            },
             ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
@@ -1010,9 +1025,11 @@ mod enter_kernel_tests {
         let mut slot = None;
         let h = Handoff {
             image: &mut image,
-            spinup_go32: 0,
-            spinup_stack_top: 0,
-            spinup_args: 0,
+            spinup: current::spinup::LowBuffer {
+                go32: 0,
+                spinup32: 0,
+                args: 0,
+            },
             ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
@@ -1147,9 +1164,11 @@ mod enter_kernel_success_tests {
         let entry = 0xffff_ffff_8000_0100u64;
         let h = Handoff {
             image: &mut image,
-            spinup_go32: 0,
-            spinup_stack_top: 0,
-            spinup_args: 0,
+            spinup: current::spinup::LowBuffer {
+                go32: 0,
+                spinup32: 0,
+                args: 0,
+            },
             ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
@@ -1404,6 +1423,11 @@ where
 /// 基址 `0xffff_ffff_8000_0000` 不重叠。**报给内核的 `hhdm_response.offset` 必须与此常量
 /// 一致** —— 报错就是内核按错偏移解地址，必崩。
 pub const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
+
+/// 内核主栈顶：`.kernel_main_stack` 位于 `0xffff_ffff_808a_e000`、大小 `0x10_1000`。
+///
+/// 由真实内核的节表量出（见 `docs/TODO/liftoff.md` 的实测记录）。
+pub const KERNEL_STACK_TOP: u64 = 0xffff_ffff_809a_e000;
 
 /// 规划组装失败原因。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1768,10 +1792,14 @@ pub unsafe fn bring_up(
     c.responses.set_executable_address(c.destination, kernel_virt);
     fill_executable_file(c.responses, c.destination, len as u64)
         .map_err(BringUpError::Responses)?;
-    // Exit 前分配**低地址缓冲**（< 4 GiB）：spinup 汇编体/GDT/参数/低栈。
+    // Exit 前分配**低地址缓冲**（< 4 GiB）：32 位跳板两段 + 参数帧 + 低地址栈。
+    // 必须用 `EfiLoaderCode`：这段内存要被**取指**，`EfiLoaderData` 在 OVMF 下
+    // 可能被标成不可执行。
     let spinup_buf_len = 64 * 1024;
     // SAFETY: bring_up 是 unsafe fn，boot services 指针有效。
-    let Some(low_buffer) = (unsafe { alloc_buffer(table.allocate_pages, spinup_buf_len) }) else {
+    let Some(low_buffer) = (unsafe {
+        alloc_buffer_typed(table.allocate_pages, spinup_buf_len, EFI_LOADER_CODE)
+    }) else {
         return Err(BringUpError::RootFrame);
     };
     let spinup_args = current::spinup::SpinupArgs {
@@ -1779,24 +1807,24 @@ pub unsafe fn bring_up(
         pagemap_top: root.start_address().expect("根帧必有地址").as_u64() as u32,
         entry_lo: (info.entry & 0xFFFF_FFFF) as u32,
         entry_hi: (info.entry >> 32) as u32,
-        stack_lo: (0xff_ff_ff_80_80ae_d000u64 & 0xFFFF_FFFF) as u32,
-        stack_hi: (0xff_ff_ff_80_80ae_d000u64 >> 32) as u32,
+        // 内核声明的主栈：.kernel_main_stack 在 0xffffffff808ae000，大小 0x101000，
+        // 所以栈顶 = 0xffffffff809ae000（**不是**之前手写的近似值）。
+        stack_lo: (KERNEL_STACK_TOP & 0xFFFF_FFFF) as u32,
+        stack_hi: (KERNEL_STACK_TOP >> 32) as u32,
         gdt: 0,
         nx_available: 1,
         dmo_lo: (HHDM_OFFSET & 0xFFFF_FFFF) as u32,
         dmo_hi: (HHDM_OFFSET >> 32) as u32,
         base_revision: 1,
     };
-    let Some((spinup_go32, spinup_stack_top, spinup_args_ptr)) = (unsafe {
+    let Some(spinup_low) = (unsafe {
         current::spinup::stage_low_buffer(low_buffer.as_mut_ptr(), spinup_buf_len, &spinup_args)
     }) else {
         return Err(BringUpError::RootFrame);
     };
     let h = Handoff {
         image: &mut c.kernel_out[..len],
-        spinup_go32: spinup_go32,
-        spinup_stack_top: spinup_stack_top,
-        spinup_args: spinup_args_ptr,
+        spinup: spinup_low,
         ranges: &ranges[..range_count],
         hits: c.hits,
         responses: c.responses,

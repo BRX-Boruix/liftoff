@@ -20,7 +20,7 @@ pub mod current {
     pub use efi::boot_services_table::ExitBootServices;
     pub use efi::types::{BUFFER_TOO_SMALL, DEVICE_ERROR, Handle, SUCCESS, Status};
     pub use efi::boot_services_table::AllocatePages;
-    pub use efi::boot_services_table::{ALLOCATE_ANY_PAGES, EFI_LOADER_DATA};
+    pub use efi::boot_services_table::{ALLOCATE_ANY_PAGES, EFI_LOADER_CODE, EFI_LOADER_DATA};
     pub use efi::boot_services_table::EfiFrameAllocator;
     pub use efi::uefi_boot_services::UefiBootServices;
     pub use efi::boot_services_table::BootServicesTable;

@@ -1,34 +1,46 @@
-//! spinup trampoline（L5）。
+//! spinup 跳板：ExitBootServices 之后把机器状态重置成内核期望的样子，再进入内核。
 //!
-//! **为什么需要**：UEFI 环境里直接 jmp 进内核会死 —— 固件留下的分页模式、
-//! 段描述符、GDT/IDT、EFER 都是固件的，而内核假设的是 Limine 协议定义的干净状态
-//! （真机实测：Exit 成功、激活成功、跳转后即复位循环）。旧实现（brxLimine）的
-//! 路径是：把 32 位重置代码**复制到低地址**（Exit 后 64 位 EIP 不可靠），降级到
-//! 32 位（关分页）、按协议重设全部机器状态、再重进 64 位并 iretq 进内核。
+//! 结构对照 brxLimine（common/lib/spinup.asm_uefi_x86_64 + common/protos/limine_32.asm_x86）：
 //!
-//! 参考实现：brxLimine common/lib/spinup.asm_uefi_x86_64、
-//! common/protos/limine_32.asm_x86、common/lib/misc.c:37-105、sys/gdt.s2.c。
+//! 1. spinup_common64（64 位，留在映像原地址执行，不搬运）：
+//!    cli -> lgdt（自建 GDT）-> lidt（空 IDT）-> retfq 重载 CS=0x28
+//!    -> 数据段 =0x30 -> 切到低地址栈 -> retfq 到 32 位低地址 spinup_go32。
+//! 2. spinup_go32（32 位，搬到低地址）：段=0x20 -> lldt 0 -> 关分页（CR0=0x11）
+//!    -> EFER=0 -> CR4=0 -> CR3=0 -> 清 TSS busy 位并 ltr 0x38 -> call 到
+//!    spinup_spinup32。
+//! 3. spinup_spinup32（32 位起，搬到低地址）：PAT -> 可选 LA57 -> CR0.WP
+//!    -> CR3=内核页表 -> PAE -> EFER.LME(+NX) -> CR0.PG -> 回到 64 位 -> 段=0x30
+//!    -> 重载 GDT -> 跳到高半区 -> 按 base_revision 卸掉低半区 -> 构造 iretq 帧
+//!    （入口、内核栈、全 GPR 清零）-> 进内核。
+//!
+//! 只搬 32 位部分：32 位 EIP 到不了 4 GiB 以上，所以 spinup_go32 /
+//! spinup_spinup32 必须有一份低地址拷贝；64 位的 spinup_common64 留在映像里，
+//! 用链接期符号直接 jmp（避免任何运行期重定位）。
 
-/// 组装 GDT：与 brxLimine gdt.s2.c 的 8 个描述符逐字段一致（小端 8 字节）。
-/// 布局：0 空、1 32 位代码(0x18)、2 32 位数据(0x20)、3 64 位代码(0x28)、
-/// 4 64 位数据(0x30)、5 64 位代码(gran=1)、6 64 位数据、7 TSS 低、8 TSS 高。
-pub fn build_gdt() -> [u64; 9] {
-    // gran 是旧实现里的「granularity」字段：**完整的第 6 字节**（G/D/L 标志 +
-    // limit 高 4 位）—— 不要自己拆 limit，直接照抄旧实现的字节值。
-    let desc = |limit: u32, base: u32, access: u8, gran: u8| -> u64 {
-        let limit_low = (limit & 0xFFFF) as u64;
-        let limit_hi = ((limit >> 16) & 0xF) as u64;
-        let base_low = (base & 0xFFFF) as u64;
-        let base_mid = ((base >> 16) & 0xFF) as u64;
-        let base_hi = ((base >> 24) & 0xFF) as u64;
-        limit_low
-            | (base_low << 16)
-            | (base_mid << 32)
-            | ((access as u64) << 40)
-            | (limit_hi << 48)
-            | ((gran as u64) << 52)
-            | (base_hi << 56)
-    };
+/// 段描述符编码（对照 brxLimine common/sys/gdt.s2.c）。
+///
+/// gran 是**完整第 6 字节**：[7]=G [6]=D/B [5]=L [4]=AVL [3:0]=limit 高位。
+///
+/// 因此它整体落在位 48..55（正好一个字节）；`limit` 的高 4 位被忽略，
+/// limit 的高位以 `gran` 的低 4 位为准（与 brxLimine 的宏一致）。
+pub const fn desc(limit: u32, base: u32, access: u8, gran: u8) -> u64 {
+    let limit_low = (limit & 0xFFFF) as u64;
+    let base_low = (base & 0xFFFF) as u64;
+    let base_mid = ((base >> 16) & 0xFF) as u64;
+    let base_hi = ((base >> 24) & 0xFF) as u64;
+    limit_low
+        | (base_low << 16)
+        | (base_mid << 32)
+        | ((access as u64) << 40)
+        | ((gran as u64) << 48)
+        | (base_hi << 56)
+}
+
+/// 9 项 GDT：0=null、1=32 位代码、2=32 位数据、3=32 位代码(G)、4=32 位数据(G)、
+/// 5=64 位代码(L)、6=64 位数据、7=TSS 低、8=TSS 高。
+///
+/// 选择子：0x08 / 0x10 / 0x18 / 0x20 / 0x28 / 0x30 / 0x38。
+pub const fn build_gdt() -> [u64; 9] {
     [
         0,
         desc(0xFFFF, 0, 0b1001_1011, 0b0000_0000),
@@ -42,77 +54,109 @@ pub fn build_gdt() -> [u64; 9] {
     ]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::build_gdt;
+/// GDT 的静态实例：汇编里的 GDTR 用 .quad SPINUP_GDT 指向它。
+#[repr(C, align(8))]
+pub struct SpinupGdt(pub [u64; 9]);
 
-    #[test]
-    fn gdt_entries_match_the_reference_layout() {
-        let gdt = build_gdt();
-        assert_eq!(gdt[0], 0, "描述符 0 必须为空");
-        // 32 位代码 (0x18)：access=10011011b=0x9B, gran 字节=0
-        assert_eq!(gdt[1] >> 40 & 0xFF, 0x9B);
-        // 32 位数据 (0x20)：access=10010011b=0x93
-        assert_eq!(gdt[2] >> 40 & 0xFF, 0x93);
-        // 64 位代码 (0x28)：access=0x9B，gran 字节 = 0b1100_1111（G=1、D=0、L=1、limit_hi=1111）
-        assert_eq!(gdt[3] >> 40 & 0xFF, 0x9B);
-        assert_eq!(gdt[3] >> 52 & 0xFF, 0b1100_1111);
-        // 64 位数据 (0x30)：access=0x93
-        assert_eq!(gdt[4] >> 40 & 0xFF, 0x93);
-        // TSS（0x38）：access=0x89
-        assert_eq!(gdt[7] >> 40 & 0xFF, 0x89);
-    }
+/// 自建 GDT（选择子 0x08 到 0x38）。
+#[unsafe(no_mangle)]
+pub static SPINUP_GDT: SpinupGdt = SpinupGdt(build_gdt());
+
+/// 32 位 trampoline 的参数帧：11 个 dword，arg0 在最低地址。
+///
+/// 汇编侧在 32 位模式下用 [esp+4+4i] 读 arg_i，64 位模式下用 [rsp+4+4i]；
+/// 其中 entry/stack/dmo 按 qword 读，所以 lo/hi 必须相邻且 lo 在前。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpinupArgs {
+    /// 是否启用 5 级分页（我们不用，0）。
+    pub level5pg: u32,
+    /// 内核页表顶层物理地址（低 4 GiB 内）。
+    pub pagemap_top: u32,
+    /// 内核入口低 32 位。
+    pub entry_lo: u32,
+    /// 内核入口高 32 位。
+    pub entry_hi: u32,
+    /// 内核栈顶低 32 位。
+    pub stack_lo: u32,
+    /// 内核栈顶高 32 位。
+    pub stack_hi: u32,
+    /// GDTR 指针（由 stage_low_buffer 填，调用方不必知道）。
+    pub gdt: u32,
+    /// NX 可用（1）。
+    pub nx_available: u32,
+    /// direct map offset 低 32 位。
+    pub dmo_lo: u32,
+    /// direct map offset 高 32 位。
+    pub dmo_hi: u32,
+    /// base revision（大于等于 1 表示卸掉低半区）。
+    pub base_revision: u32,
 }
 
-// 三段式 trampoline 的汇编体。**复制到低地址执行**（Exit 后 64 位 EIP 不可靠）。
-// 参数布局（32 位压栈，[esp] 起，对照 common_spinup 的 push32 序）：
-//   [esp+0]  level5pg        [esp+4]  pagemap_top_lo   [esp+8]  pagemap_top_hi
-//   [esp+12] entry_lo        [esp+16] entry_hi        [esp+20] stack_lo
-//   [esp+24] stack_hi        [esp+28] gdt_lo          [esp+32] gdt_hi
-//   [esp+36] nx_available    [esp+40] dmo_lo          [esp+44] dmo_hi
-//   [esp+48] unmap_lower
+/// 低地址缓冲的布局结果（全部是低地址）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LowBuffer {
+    /// 32 位 spinup_go32 拷贝的入口。
+    pub go32: usize,
+    /// 32 位 spinup_spinup32 拷贝的入口。
+    pub spinup32: usize,
+    /// 参数帧地址（11 个 dword）。
+    pub args: usize,
+}
+
+/// 4 GiB 上限：32 位 EIP 的硬约束。
+pub const LOW_LIMIT: usize = 0x1_0000_0000;
+
+/// 低地址缓冲的偏移布局（纯计算，宿主可测）。
+///
+/// 布局：[go32][spinup32][args 44B][stack 4096B]，各段 16 字节对齐。
+/// 返回 (go32_off, spinup32_off, args_off, total)。
+pub const fn layout(go32_len: usize, spinup32_len: usize) -> (usize, usize, usize, usize) {
+    const fn align16(v: usize) -> usize {
+        (v + 15) & !15
+    }
+    let go32_off = 0usize;
+    let spinup32_off = align16(go32_off + go32_len);
+    let args_off = align16(spinup32_off + spinup32_len);
+    let total = args_off + 44 + 4096;
+    (go32_off, spinup32_off, args_off, total)
+}
+
 #[cfg(target_os = "uefi")]
 core::arch::global_asm!(
     ".section .text.spinup",
+    ".global spinup_common64",
     ".global spinup_go32",
     ".global spinup_go32_end",
-    ".global limine_spinup_32",
-    ".global limine_spinup_32_end",
-    ".global spinup_gdt_ptr",
-    ".global spinup_idt_ptr",
-    ".global spinup_text_start",
-    ".global spinup_text_end",
-    "spinup_text_start:",
+    ".global spinup_spinup32",
+    ".global spinup_spinup32_end",
+    ".global spinup_gdtr",
+    ".global spinup_idtr",
+    // ---- 64 位入口：留在映像内原地址执行 ----
+    ".code64",
     "spinup_common64:",
-    // 64 位入口（Exit 后从 enter_kernel 跳到这里）：加载自建 GDT/IDT，降 32 位。
-    // rdi = spinup_go32 低地址拷贝，rsi = 低地址栈顶，rdx = 32 位参数区指针。
     "    cli",
-    "    lgdt [rdx]",
-    "    mov al, 0x62",
-    "    out dx, al",
-    "    lidt [rdx + 10]",
-    "    lea rbx, [rip + .reload_cs]",
+    "    lgdt [rip + spinup_gdtr]",
+    "    lidt [rip + spinup_idtr]",
+    "    lea rbx, [rip + 1f]",
     "    push 0x28",
     "    push rbx",
-    "    mov al, 0x63",
-    "    out dx, al",
     "    retfq",
-    ".reload_cs:",
+    "1:",
     "    mov eax, 0x30",
     "    mov ds, eax",
     "    mov es, eax",
     "    mov fs, eax",
     "    mov gs, eax",
     "    mov ss, eax",
-    "    mov rsp, rsi",
+    // rdx = 参数帧低地址；rdi = spinup_go32 低地址拷贝；esi = spinup_spinup32 低地址。
+    "    mov rsp, rdx",
     "    push 0x18",
-    "    push r15",
+    "    push rdi",
     "    retfq",
-    // 32 位段：关分页、清 CR0/CR3/CR4/EFER（对照 spinup_go32）。
+    // ---- 32 位：关分页、清 TSS ----
     ".code32",
     "spinup_go32:",
-    "    mov al, 0x64",
-    "    out dx, al",
     "    mov eax, 0x20",
     "    mov ds, ax",
     "    mov es, ax",
@@ -137,11 +181,10 @@ core::arch::global_asm!(
     "    mov byte ptr [eax + 0x3d], 0x89",
     "    mov ax, 0x38",
     "    ltr ax",
-    "    mov al, 0x65",
-    "    out dx, al",
+    "    call esi",
     "spinup_go32_end:",
-    // 32 位重升：PAT、LA57、CR0.WP、CR3=新表、PAE、EFER、CR0.PG、重进 64。
-    "limine_spinup_32:",
+    // ---- 32 位：重建分页并回到 64 位 ----
+    "spinup_spinup32:",
     "    mov eax, 1",
     "    xor ecx, ecx",
     "    cpuid",
@@ -152,7 +195,7 @@ core::arch::global_asm!(
     "    mov ecx, 0x277",
     "    wrmsr",
     "2:",
-    "    cmp dword ptr [esp+0], 0",
+    "    cmp dword ptr [esp + 4], 0",
     "    je 3f",
     "    mov eax, cr4",
     "    bts eax, 12",
@@ -162,7 +205,7 @@ core::arch::global_asm!(
     "    bts eax, 16",
     "    mov cr0, eax",
     "    cld",
-    "    mov eax, [esp+4]",
+    "    mov eax, [esp + 8]",
     "    mov cr3, eax",
     "    mov eax, cr4",
     "    bts eax, 5",
@@ -170,7 +213,7 @@ core::arch::global_asm!(
     "    mov ecx, 0xc0000080",
     "    xor edx, edx",
     "    mov eax, 1 << 8",
-    "    cmp dword ptr [esp+28], 0",
+    "    cmp dword ptr [esp + 32], 0",
     "    je 4f",
     "    or eax, 1 << 11",
     "4:",
@@ -193,9 +236,9 @@ core::arch::global_asm!(
     "    mov fs, eax",
     "    mov gs, eax",
     "    mov ss, eax",
-    "    mov rax, [rsp+28]",
+    "    mov eax, [rsp + 28]",
     "    lgdt [rax]",
-    "    mov rax, [rsp+36]",
+    "    mov rax, [rsp + 36]",
     "    add rsp, rax",
     "    call 7f",
     "7:",
@@ -203,9 +246,9 @@ core::arch::global_asm!(
     "    sub r10, 7b",
     "    add qword ptr [rsp], r10",
     "    add qword ptr [rsp], rax",
-    "    retf",
+    "    ret",
     "8:",
-    "    cmp dword ptr [rsp+44], 1",
+    "    cmp dword ptr [rsp + 44], 1",
     "    jb 9f",
     "    mov rsi, cr3",
     "    lea rdi, [rsi + rax]",
@@ -214,10 +257,10 @@ core::arch::global_asm!(
     "    rep stosq",
     "    mov cr3, rsi",
     "9:",
-    "    mov rsi, [rsp+20]",
+    "    mov rsi, [rsp + 20]",
     "    sub rsi, 8",
     "    mov qword ptr [rsi], 0",
-    "    mov rax, [rsp+12]",
+    "    mov rax, [rsp + 12]",
     "    push 0x30",
     "    push rsi",
     "    push 0x2",
@@ -239,134 +282,88 @@ core::arch::global_asm!(
     "    xor r14d, r14d",
     "    xor r15d, r15d",
     "    iretq",
-    "limine_spinup_32_end:",
-    "spinup_text_end:",
-    // 自建 GDT（build_gdt() 的字节在运行时填入 spinup_gdt）+ GDTR/IDTR。
+    "spinup_spinup32_end:",
+    // ---- 数据：GDTR 指向映像内的 SPINUP_GDT；IDTR 为空表 ----
+    ".code64",
     ".align 8",
-    "spinup_gdt:",
-    "    .quad 0, 0, 0, 0, 0, 0, 0, 0, 0",
-    "spinup_gdt_ptr:",
+    "spinup_gdtr:",
     "    .word 71",
-    "    .quad spinup_gdt",
-    "spinup_idt_ptr:",
+    "    .quad SPINUP_GDT",
+    "spinup_idtr:",
     "    .word 0",
     "    .quad 0",
 );
 
-// Exit 后传给 32 位 trampoline 的参数区布局（对照 common_spinup 的 11 个压栈参数）。
-// 由 Rust 在 Exit 前填充进低地址缓冲的参数区（32 位压栈序：低地址在前 ✗ —— 实际
-// 是压栈序，即高地址是第一个参数 ✗；这里按 [esp+i*4] 索引：esp 指向最后一个压栈的）。
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SpinupArgs {
-    /// 5 级分页？（我们不启用）。
-    pub level5pg: u32,
-    /// PML4 物理地址（低 4G 内，高 32 位为 0）。
-    pub pagemap_top: u32,
-    /// 内核入口低 32 位。
-    pub entry_lo: u32,
-    /// 内核入口高 32 位。
-    pub entry_hi: u32,
-    /// 内核栈顶低 32 位。
-    pub stack_lo: u32,
-    /// 内核栈顶高 32 位。
-    pub stack_hi: u32,
-    /// 自建 GDT 指针（低 4G 内）。
-    pub gdt: u32,
-    /// NX 可用（1）。
-    pub nx_available: u32,
-    /// direct map offset 低 32 位。
-    pub dmo_lo: u32,
-    /// direct map offset 高 32 位。
-    pub dmo_hi: u32,
-    /// base revision（1 = unmap lower half）。
-    pub base_revision: u32,
-}
-
 #[cfg(target_os = "uefi")]
 unsafe extern "C" {
-    static spinup_text_start: u8;
-    static spinup_text_end: u8;
-    #[allow(unused)]
-    static spinup_gdt_ptr: u8;
-    #[allow(unused)]
-    static spinup_idt_ptr: u8;
-    #[allow(unused_imports, dead_code)]
-    static spinup_go32: u8;
-    #[allow(unused)]
     fn spinup_common64();
+    static spinup_go32: u8;
+    static spinup_go32_end: u8;
+    static spinup_spinup32: u8;
+    static spinup_spinup32_end: u8;
+    static spinup_gdtr: u8;
 }
 
-/// Exit 前调用：把汇编体、GDT、参数、低栈搬进 `buffer`（< 4 GiB）。
-/// 返回 `(go32_entry, stack_top, args_ptr)` —— 全部是低地址。
+/// Exit 前调用：把 32 位跳板的两段、参数帧、低地址栈放进 buffer（必须小于 4 GiB）。
+///
+/// 64 位的 spinup_common64 不搬 —— 它留在映像里用链接期符号直接跳。
 ///
 /// # Safety
 ///
-/// `buffer` 必须指向 `buffer_len` 的可写内存，且 Exit 后保持有效。
+/// buffer 必须指向 buffer_len 字节可写、且 Exit 后仍可读可执行的内存
+/// （调用方用 EfiLoaderCode 分配）。
 #[cfg(target_os = "uefi")]
 pub unsafe fn stage_low_buffer(
     buffer: *mut u8,
     buffer_len: usize,
     args: &SpinupArgs,
-) -> Option<(usize, usize, usize)> {
-    let text_start = &raw const spinup_text_start as usize;
-    let text_end = &raw const spinup_text_end as usize;
-    let text_len = text_end.checked_sub(text_start)?;
-    // GDTR/IDTR 数据在 text 之外（spinup_gdt_ptr / spinup_idt_ptr 的 [limit][base]）。
-    // 它们的**位置**用「符号相对 text_start 的偏移」表示 —— 拷贝时一并搬进去。
-    let gdt_ptr_off = (&raw const spinup_gdt_ptr as usize).checked_sub(text_start)?;
-    let idt_ptr_off = (&raw const spinup_idt_ptr as usize).checked_sub(text_start)?;
-    let meta_len = 128; // GDTR 10B + IDTR 10B + GDT 72B + 对齐余量
-    let total = text_len + meta_len + 52 + 4096;
+) -> Option<LowBuffer> {
+    let go32_src = &raw const spinup_go32 as usize;
+    let go32_end = &raw const spinup_go32_end as usize;
+    let sp32_src = &raw const spinup_spinup32 as usize;
+    let sp32_end = &raw const spinup_spinup32_end as usize;
+    let go32_len = go32_end.checked_sub(go32_src)?;
+    let sp32_len = sp32_end.checked_sub(sp32_src)?;
+    let (go32_off, sp32_off, args_off, total) = layout(go32_len, sp32_len);
     if buffer_len < total {
         return None;
     }
-    unsafe {
-        // 1) 拷贝 text（含 spinup_common64 / go32 / limine_spinup_32）
-        core::ptr::copy_nonoverlapping(text_start as *const u8, buffer, text_len);
-        // **读回校验**：确认低地址拷贝与源一致（不一致说明缓冲异常）。
-        for offset in [0usize, text_len / 2, text_len - 1] {
-            let src = *((text_start + offset) as *const u8);
-            let dst = *(buffer.add(offset));
-            if src != dst {
-                return None;
-            }
-        }
-        // GDT/args 全放参数区之后 ✗ —— 统一布局：text | args | GDTR | IDTR | GDT | stack
-        let args_at = buffer as usize + text_len;
-        let gdtr_at = args_at + 52;
-        let idtr_at = gdtr_at + 10;
-        let gdt_at = idtr_at + 10;
-        for (index, word) in build_gdt().iter().enumerate() {
-            core::ptr::write_unaligned((gdt_at + index * 8) as *mut u64, *word);
-        }
-        // GDTR：limit = 71，base = gdt_at
-        core::ptr::write_unaligned(gdtr_at as *mut u16, 71u16);
-        core::ptr::write_unaligned((gdtr_at + 2) as *mut u64, gdt_at as u64);
-        // IDTR：limit = 0，base = 0（空 IDT）
-        core::ptr::write_unaligned(idtr_at as *mut u16, 0u16);
-        core::ptr::write_unaligned((idtr_at + 2) as *mut u64, 0u64);
-        // 3) **修正拷贝里的 GDTR**：base 指向低地址 GDT（limit 已在原数据里 ✓）
-        let gdt_ptr_site = buffer as usize + gdt_ptr_off;
-        core::ptr::write_unaligned((gdt_ptr_site + 2) as *mut u64, gdt_at as u64);
-        // 4) **修正拷贝里的 IDTR**：base 指向低地址的一段全零区（参数块尾部）
-        let idt_ptr_site = buffer as usize + idt_ptr_off;
-        core::ptr::write_unaligned((idt_ptr_site + 2) as *mut u64, (buffer as usize + text_len + 72) as u64);
-        // 5) 参数块放 GDT 之后
-        let args_at = gdt_at + 72;
-        let words = [
-            args.level5pg, args.pagemap_top, args.entry_lo, args.entry_hi,
-            args.stack_lo, args.stack_hi, gdt_at as u32, args.nx_available,
-            args.dmo_lo, args.dmo_hi, args.base_revision, 0, 0,
-        ];
-        for (index, word) in words.iter().enumerate() {
-            core::ptr::write_unaligned((args_at + index * 4) as *mut u32, *word);
-        }
-        // 6) 低地址栈：参数块之后 4 KiB
-        let stack_top = args_at + 52 + 4096;
-        return Some((buffer as usize, stack_top, args_at));
+    let base = buffer as usize;
+    // 32 位 EIP 到不了 4 GiB 以上。
+    if base.checked_add(total)? > LOW_LIMIT {
+        return None;
     }
-
+    // 参数帧里的 GDTR 指针必须指向映像内的 spinup_gdtr。
+    let gdtr = &raw const spinup_gdtr as usize;
+    if gdtr > u32::MAX as usize {
+        return None;
+    }
+    let words = [
+        args.level5pg,
+        args.pagemap_top,
+        args.entry_lo,
+        args.entry_hi,
+        args.stack_lo,
+        args.stack_hi,
+        gdtr as u32,
+        args.nx_available,
+        args.dmo_lo,
+        args.dmo_hi,
+        args.base_revision,
+    ];
+    // SAFETY: 调用方保证 buffer 可写；total 已校验不超过 buffer_len。
+    unsafe {
+        core::ptr::copy_nonoverlapping(go32_src as *const u8, buffer.add(go32_off), go32_len);
+        core::ptr::copy_nonoverlapping(sp32_src as *const u8, buffer.add(sp32_off), sp32_len);
+        for (index, word) in words.iter().enumerate() {
+            core::ptr::write_unaligned(buffer.add(args_off + index * 4) as *mut u32, *word);
+        }
+    }
+    Some(LowBuffer {
+        go32: base + go32_off,
+        spinup32: base + sp32_off,
+        args: base + args_off,
+    })
 }
 
 #[cfg(not(target_os = "uefi"))]
@@ -374,40 +371,162 @@ pub unsafe fn stage_low_buffer(
     _buffer: *mut u8,
     _buffer_len: usize,
     _args: &SpinupArgs,
-) -> Option<(usize, usize, usize)> {
-    None // 宿主无 trampoline；等价性由真机验证
+) -> Option<LowBuffer> {
+    None // 宿主没有裸机跳板；等价性由真机验证。
 }
 
-/// Exit 后调用：跳进低地址 trampoline（不返回）。
+/// Exit 成功后调用：进跳板，不返回。
 ///
 /// # Safety
 ///
-/// 只能 Exit 成功后调用一次；三个指针必须来自 [`stage_low_buffer`]。
+/// 只能调用一次；low 必须来自 stage_low_buffer。
 #[cfg(target_os = "uefi")]
-pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize, enter_addr: usize) -> ! {
-    // **Exit 前关中断**：真机 #GP 定位在固件 VirtioRngDxe 的回调里 —— Exit 期间
-    // 固件定时器事件仍可能触发，若 CR3 已是新表，回调代码不可达 → #GP。
-    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
-    // SAFETY: 调用方保证三指针来自 stage_low_buffer 且 Exit 已成功；
-    // jmp 目标是本模块汇编导出的 64 位入口（不返回）。
+pub unsafe fn spinup_go(low: LowBuffer) -> ! {
+    // SAFETY: 三个值分别进 rdi/rsi/rdx（显式寄存器，不会与跳转目标混淆）；
+    // 跳转目标是本 crate 汇编导出的链接期符号。
     unsafe {
         core::arch::asm!(
-            "cli",
-            "mov rdi, {go32}",
-            "mov rsi, {stack}",
-            "mov rdx, {args}",
             "jmp {enter}",
-            go32 = in(reg) go32,
-            stack = in(reg) stack_top,
-            args = in(reg) args,
-            enter = in(reg) enter_addr,
+            in("rdi") low.go32,
+            in("rsi") low.spinup32,
+            in("rdx") low.args,
+            enter = sym spinup_common64,
             options(noreturn),
         )
     }
 }
 
 #[cfg(not(target_os = "uefi"))]
-pub unsafe fn spinup_go(_go32: usize, _stack_top: usize, _args: usize, _enter: usize) -> ! {
-    // 宿主测试二进制无法链接裸 32 位 trampoline —— 该调用只发生在真机。
+pub unsafe fn spinup_go(_low: LowBuffer) -> ! {
     unreachable!("spinup_go 只在 UEFI 目标上有意义")
+}
+#[cfg(test)]
+mod gdt_tests {
+    use super::{build_gdt, desc};
+
+    /// 取第 index 个描述符的第 byte 个字节。
+    fn byte_of(entry: u64, byte: u32) -> u8 {
+        ((entry >> (byte * 8)) & 0xFF) as u8
+    }
+
+    /// gran 字节的位含义：[7]=G [6]=D/B [5]=L。
+    fn flags(entry: u64) -> (bool, bool, bool) {
+        let gran = byte_of(entry, 6);
+        (gran & 0x80 != 0, gran & 0x40 != 0, gran & 0x20 != 0)
+    }
+
+    #[test]
+    fn descriptor_fields_land_in_the_right_bytes() {
+        let entry = desc(0xFFFF, 0, 0b1001_1011, 0b1100_1111);
+        assert_eq!(byte_of(entry, 0), 0xFF, "limit 低字节");
+        assert_eq!(byte_of(entry, 1), 0xFF, "limit 低字节");
+        assert_eq!(byte_of(entry, 5), 0b1001_1011, "access 在第 5 字节");
+        assert_eq!(byte_of(entry, 6), 0b1100_1111, "gran 在第 6 字节");
+    }
+
+    #[test]
+    fn null_descriptors_are_zero() {
+        assert_eq!(build_gdt()[0], 0);
+        assert_eq!(build_gdt()[8], 0, "TSS 高位描述符为 0");
+    }
+
+    #[test]
+    fn selector_0x18_is_a_32_bit_code_segment() {
+        let (g, d, l) = flags(build_gdt()[3]);
+        assert!(g, "G=1（4 KiB 粒度）");
+        assert!(d, "D=1（32 位）");
+        assert!(!l, "L=0（不是 64 位）");
+        assert_eq!(byte_of(build_gdt()[3], 5), 0b1001_1011, "代码段 access");
+    }
+
+    #[test]
+    fn selector_0x28_is_a_64_bit_code_segment() {
+        let (_, d, l) = flags(build_gdt()[5]);
+        assert!(l, "L=1（64 位）");
+        assert!(!d, "D 必须为 0（64 位代码段）");
+        assert_eq!(byte_of(build_gdt()[5], 5), 0b1001_1011, "代码段 access");
+    }
+
+    #[test]
+    fn selector_0x20_is_a_32_bit_data_segment() {
+        let (g, d, l) = flags(build_gdt()[4]);
+        assert!(g && d && !l, "32 位数据段");
+        assert_eq!(byte_of(build_gdt()[4], 5), 0b1001_0011, "数据段 access");
+    }
+
+    #[test]
+    fn selector_0x30_is_a_64_bit_data_segment() {
+        assert_eq!(byte_of(build_gdt()[6], 5), 0b1001_0011, "数据段 access");
+    }
+
+    #[test]
+    fn selector_0x38_is_a_tss() {
+        assert_eq!(byte_of(build_gdt()[7], 5), 0x89, "TSS access（available）");
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{layout, LOW_LIMIT};
+
+    #[test]
+    fn segments_are_16_byte_aligned_and_ordered() {
+        let (go32, sp32, args, total) = layout(0x137, 0x2A1);
+        assert_eq!(go32, 0, "go32 在最前");
+        assert_eq!(sp32 % 16, 0, "spinup32 必须 16 字节对齐");
+        assert!(sp32 >= 0x137, "spinup32 不覆盖 go32");
+        assert_eq!(args % 16, 0, "参数帧必须 16 字节对齐");
+        assert!(args >= sp32 + 0x2A1, "参数帧不覆盖 spinup32");
+        assert_eq!(total, args + 44 + 4096, "total 含 44 字节参数帧与 4 KiB 栈");
+    }
+
+    #[test]
+    fn total_covers_everything_even_for_zero_lengths() {
+        let (_, _, args, total) = layout(0, 0);
+        assert_eq!(args, 0);
+        assert_eq!(total, 44 + 4096);
+    }
+
+    #[test]
+    fn low_limit_is_four_gib() {
+        assert_eq!(LOW_LIMIT, 4 * 1024 * 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::SpinupArgs;
+    use core::mem::size_of;
+
+    #[test]
+    fn arg_frame_is_eleven_dwords() {
+        assert_eq!(size_of::<SpinupArgs>(), 44, "11 个 dword = 44 字节");
+    }
+
+    #[test]
+    fn entry_stack_and_dmo_are_adjacent_lo_hi_pairs() {
+        // 汇编按 qword 读 [rsp+12]/[rsp+20]/[rsp+36]，因此 lo/hi 必须相邻且 lo 在前。
+        let args = SpinupArgs {
+            level5pg: 0,
+            pagemap_top: 0,
+            entry_lo: 0x1111_1111,
+            entry_hi: 0x2222_2222,
+            stack_lo: 0x3333_3333,
+            stack_hi: 0x4444_4444,
+            gdt: 0,
+            nx_available: 0,
+            dmo_lo: 0x5555_5555,
+            dmo_hi: 0x6666_6666,
+            base_revision: 0,
+        };
+        let raw = &args as *const SpinupArgs as *const u32;
+        // SAFETY: 结构体是 repr(C)、11 个 u32；按 11 个 u32 读是合法的。
+        let words: [u32; 11] = unsafe { core::ptr::read(raw as *const [u32; 11]) };
+        assert_eq!(words[2], args.entry_lo);
+        assert_eq!(words[3], args.entry_hi);
+        assert_eq!(words[4], args.stack_lo);
+        assert_eq!(words[5], args.stack_hi);
+        assert_eq!(words[8], args.dmo_lo);
+        assert_eq!(words[9], args.dmo_hi);
+    }
 }

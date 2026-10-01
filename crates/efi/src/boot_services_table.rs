@@ -17,6 +17,7 @@ pub type ExitBootServices = unsafe extern "efiapi" fn(image_handle: Handle, map_
 /// `AllocatePages` 的类型参数（UEFI 规范）：任意地址分配。
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
 /// 内存类型：引导器数据。
+pub const EFI_LOADER_CODE: u32 = 1;
 pub const EFI_LOADER_DATA: u32 = 2;
 
 /// `AllocatePages` 的签名。
