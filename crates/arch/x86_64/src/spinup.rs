@@ -102,7 +102,8 @@ core::arch::global_asm!(
     "    mov ss, eax",
     "    mov rsp, rsi",
     "    push 0x18",
-    "    call rdx",
+    "    push r15",
+    "    retfq",
     // 32 位段：关分页、清 CR0/CR3/CR4/EFER（对照 spinup_go32）。
     ".code32",
     "spinup_go32:",
@@ -123,7 +124,6 @@ core::arch::global_asm!(
     "    xor eax, eax",
     "    mov cr4, eax",
     "    mov cr3, eax",
-    "    ret",
     "spinup_go32_end:",
     // 32 位重升：PAT、LA57、CR0.WP、CR3=新表、PAE、EFER、CR0.PG、重进 64。
     "limine_spinup_32:",
