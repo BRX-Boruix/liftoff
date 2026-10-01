@@ -6,7 +6,7 @@
 use core::ffi::c_void;
 use crate::responses::Responses;
 use limine::fill::fill_response;
-use limine::scan::{RequestHit, ScanError, scan_requests};
+use limine::scan::{RequestHit, ScanError};
 
 /// 扫描结果摘要（便于测试断言与诊断）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,6 +28,7 @@ pub fn prepare_responses<F>(
 where
     F: FnMut(&RequestHit) -> Option<*mut c_void>,
 {
+    // 这一路（闭包版）不做区间裁剪：它用于宿主与测试，扫全映像即可。
     let count = limine::scan::scan_chunked(image, 4 << 20, hits)?;
     let mut filled = 0;
     for hit in hits.iter().take(count) {
@@ -45,10 +46,17 @@ where
 /// （故 `filled <= hits` 恒成立 —— **不虚报**填充数）。
 pub fn fill_responses(
     image: &mut [u8],
+    ranges: &[(usize, usize)],
     hits: &mut [RequestHit],
     responses: &mut Responses,
 ) -> Result<ScanReport, ScanError> {
-    let count = scan_requests(image, hits)?;
+    // 有区间就只扫已装载段（固件里内存访问极慢，扫全映像不可行）；
+    // 没有区间时退回全量分块扫描，作为安全默认。
+    let count = if ranges.is_empty() {
+        limine::scan::scan_chunked(image, 4 << 20, hits)?
+    } else {
+        limine::scan::scan_ranges(image, ranges, 4 << 20, hits)?
+    };
     let mut filled = 0;
     for index in 0..count {
         let hit = hits[index];
@@ -155,7 +163,7 @@ mod fill_responses_tests {
         let expected = responses.pointer_for(&HHDM_REQUEST_ID).expect("有响应");
         let mut hits = [RequestHit::EMPTY; 4];
         let report: ScanReport =
-            fill_responses(&mut image, &mut hits, &mut responses).expect("填充成功");
+            fill_responses(&mut image, &[], &mut hits, &mut responses).expect("填充成功");
         assert_eq!(report.hits, 1);
         assert_eq!(report.filled, 1);
         // 请求头里 response 在 +40；把那里读出来应与容器给出的地址一致。
@@ -171,7 +179,7 @@ mod fill_responses_tests {
         let mut image = image_with(&[[0xAAAA_BBBB_CCCC_DDDD, 1, 2, 3]]);
         let mut responses = Responses::new();
         let mut hits = [RequestHit::EMPTY; 4];
-        let report = fill_responses(&mut image, &mut hits, &mut responses).expect("填充成功");
+        let report = fill_responses(&mut image, &[], &mut hits, &mut responses).expect("填充成功");
         assert_eq!(report.hits, 0, "未知 ID 不算命中（扫描表里没有它）");
         assert_eq!(report.filled, 0);
     }
@@ -186,7 +194,7 @@ mod fill_responses_tests {
             kind: limine::memmap::USABLE,
         }]);
         let mut hits = [RequestHit::EMPTY; 4];
-        let report = fill_responses(&mut image, &mut hits, &mut responses).expect("填充成功");
+        let report = fill_responses(&mut image, &[], &mut hits, &mut responses).expect("填充成功");
         assert_eq!(report.hits, 2);
         assert_eq!(report.filled, 2);
     }
@@ -198,7 +206,7 @@ mod fill_responses_tests {
         let mut responses = Responses::new();
         let mut hits = [RequestHit::EMPTY; 4];
         assert_eq!(
-            fill_responses(&mut image, &mut hits, &mut responses),
+            fill_responses(&mut image, &[], &mut hits, &mut responses),
             Ok(crate::protocol::ScanReport { hits: 0, filled: 0 })
         );
     }

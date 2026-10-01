@@ -700,6 +700,8 @@ mod before_entry_tests {
 pub struct Handoff<'a, 'b> {
     /// 内核映像（**可写**：要把响应指针写进请求头）。
     pub image: &'a mut [u8],
+    /// 扫描请求时只看这些**文件区间**（已装载段）；空表示扫全映像。
+    pub ranges: &'a [(usize, usize)],
     /// 扫描用的命中缓冲。
     pub hits: &'a mut [RequestHit],
     /// 我们准备的响应结构。
@@ -745,7 +747,7 @@ pub unsafe fn enter_kernel<F>(h: Handoff<'_, '_>, enter: F) -> Result<usize, Han
 where
     F: FnOnce(u64) -> !,
 {
-    let report = crate::protocol::fill_responses(h.image, h.hits, h.responses)
+    let report = crate::protocol::fill_responses(h.image, h.ranges, h.hits, h.responses)
         .map_err(HandoffError::Fill)?;
     let entry =
         check_before_entry(h.entry, h.plan, h.must_stay).map_err(HandoffError::BeforeEntry)?;
@@ -858,6 +860,7 @@ mod enter_kernel_tests {
         let mut slot = None;
         let h = Handoff {
             image: &mut image,
+            ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
             plan: &plan,
@@ -893,6 +896,7 @@ mod enter_kernel_tests {
         let mut slot = None;
         let h = Handoff {
             image: &mut image,
+            ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
             plan: &plan,
@@ -1020,6 +1024,7 @@ mod enter_kernel_success_tests {
         let entry = 0xffff_ffff_8000_0100u64;
         let h = Handoff {
             image: &mut image,
+            ranges: &[],
             hits: &mut hits,
             responses: &mut responses,
             plan: &plan,
@@ -1810,8 +1815,33 @@ pub unsafe fn bring_up(
     c.responses.set_executable_address(c.destination, kernel_virt);
     fill_executable_file(c.responses, c.destination, len as u64)
         .map_err(BringUpError::Responses)?;
+    // 只扫**已装载段**的文件区间：固件里内存访问极慢，扫全映像不可行。
+    static mut RANGES: [(usize, usize); 16] = [(0, 0); 16];
+    let mut range_count = 0usize;
+    // SAFETY: 引导阶段单线程；本数组在 `enter_kernel` 之前一直有效。
+    let ranges = unsafe { &mut *core::ptr::addr_of_mut!(RANGES) };
+    for segment in &c.segments[..info.segment_count] {
+        if range_count == ranges.len() {
+            break;
+        }
+        let Ok(start) = usize::try_from(segment.p_offset) else {
+            continue;
+        };
+        let Ok(size) = usize::try_from(segment.p_filesz) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(size) else {
+            continue;
+        };
+        if end > len {
+            continue;
+        }
+        ranges[range_count] = (start, end);
+        range_count += 1;
+    }
     let h = Handoff {
         image: &mut c.kernel_out[..len],
+        ranges: &ranges[..range_count],
         hits: c.hits,
         responses: c.responses,
         plan: &c.plan[..plan_count],
