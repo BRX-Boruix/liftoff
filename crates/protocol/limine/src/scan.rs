@@ -205,3 +205,105 @@ mod tests {
         assert_eq!(scan(&image, &mut hits), Err(ScanError::NoStartMarker));
     }
 }
+
+/// 扫描请求：**先按起止标记**；映像里没有标记时，退回**按请求 ID 前缀**定位。
+///
+/// **偏离说明**：协议规定用起止标记圈定区域。这里回退的依据是协议自身的另一条不变量 ——
+/// **每个请求 ID 都以相同的两个魔数开头**。实测真实内核里 START/END 标记出现 0 次
+/// （链接器把它们丢了）而请求本身都在，导致按标记扫描**一个都找不到**、响应全部落空。
+/// 标记存在时**优先用标记**，以保证「标记外的不算」这一语义不被削弱。
+pub fn scan_requests(image: &[u8], hits: &mut [RequestHit]) -> Result<usize, ScanError> {
+    match scan(image, hits) {
+        Ok(count) => Ok(count),
+        Err(ScanError::NoStartMarker) | Err(ScanError::UnclosedRegion) => {
+            scan_by_prefix(image, hits)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// 按请求 ID 前缀扫描（无标记时的回退）。
+fn scan_by_prefix(image: &[u8], hits: &mut [RequestHit]) -> Result<usize, ScanError> {
+    let mut count = 0usize;
+    let mut at = 0usize;
+    while at + 32 <= image.len() {
+        let mut found = None;
+        for (id, size) in KNOWN_REQUESTS {
+            if matches(image, at, id) {
+                found = Some((id, size));
+                break;
+            }
+        }
+        if let Some((id, size)) = found {
+            if count == hits.len() {
+                return Err(ScanError::TooManyRequests);
+            }
+            hits[count] = RequestHit { id: **id, offset: at, size: *size };
+            count += 1;
+            // 命中后按该类型已知尺寸前进（与按标记扫描同一套规则）。
+            at += size;
+            continue;
+        }
+        // 未命中按 8 字节对齐步进（请求必须落在 8 字节边界上）。
+        at += 8;
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod scan_requests_tests {
+    use super::{HHDM_REQUEST_ID, RequestHit, scan_requests};
+    use crate::base::COMMON_MAGIC;
+
+    /// 把 4 个 ID 词写进映像（按 8 字节对齐）。
+    fn put_id(image: &mut [u8], at: usize, id: &[u64; 4]) {
+        for (index, word) in id.iter().enumerate() {
+            let off = at + index * 8;
+            image[off..off + 8].copy_from_slice(&word.to_ne_bytes());
+        }
+    }
+
+    #[test]
+    fn a_kernel_without_markers_is_still_scanned_by_id_prefix() {
+        // 真实内核里 START/END 标记被链接器丢掉了（实测 0 次），但请求本身在。
+        // 每个请求 ID 都以相同的两个魔数开头 —— 这是协议自身的不变量，可作为回退依据。
+        let mut image = std::vec![0u8; 256];
+        let at = 64usize;
+        put_id(&mut image, at, &HHDM_REQUEST_ID);
+        let mut hits = [RequestHit::EMPTY; 8];
+        let count = scan_requests(&image, &mut hits).expect("无标记也必须能扫");
+        assert_eq!(count, 1);
+        assert_eq!(hits[0].id, HHDM_REQUEST_ID);
+        assert_eq!(hits[0].offset, at);
+    }
+
+    #[test]
+    fn a_bare_common_magic_is_not_a_request() {
+        // 只有前两个魔数、后两个词不是已知 ID —— **不得**产生命中（否则会误填随机数据）。
+        let mut image = std::vec![0u8; 256];
+        put_id(&mut image, 64, &[COMMON_MAGIC[0], COMMON_MAGIC[1], 1, 2]);
+        let mut hits = [RequestHit::EMPTY; 8];
+        let count = scan_requests(&image, &mut hits).expect("扫描应成功");
+        assert_eq!(count, 0, "只有魔数前缀不算请求");
+    }
+
+    #[test]
+    fn markers_still_take_precedence_when_present() {
+        // 有标记时走原路径：标记外的同名 ID **不应**被算进来。
+        let mut image = std::vec![0u8; 512];
+        // 标记外放一个 HHDM 请求（偏移 16），标记内不放。
+        put_id(&mut image, 16, &HHDM_REQUEST_ID);
+        let mut at = 128usize;
+        for word in super::START_MARKER {
+            image[at..at + 8].copy_from_slice(&word.to_ne_bytes());
+            at += 8;
+        }
+        for word in super::END_MARKER {
+            image[at..at + 8].copy_from_slice(&word.to_ne_bytes());
+            at += 8;
+        }
+        let mut hits = [RequestHit::EMPTY; 8];
+        let count = scan_requests(&image, &mut hits).expect("扫描应成功");
+        assert_eq!(count, 0, "有标记时以标记为准，标记外的不算");
+    }
+}

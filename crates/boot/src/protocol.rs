@@ -6,7 +6,7 @@
 use core::ffi::c_void;
 use crate::responses::Responses;
 use limine::fill::fill_response;
-use limine::scan::{RequestHit, ScanError, scan};
+use limine::scan::{RequestHit, ScanError, scan_requests};
 
 /// 扫描结果摘要（便于测试断言与诊断）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,7 +28,7 @@ pub fn prepare_responses<F>(
 where
     F: FnMut(&RequestHit) -> Option<*mut c_void>,
 {
-    let count = scan(image, hits)?;
+    let count = scan_requests(image, hits)?;
     let mut filled = 0;
     for hit in hits.iter().take(count) {
         if let Some(response) = response_for(hit) {
@@ -48,7 +48,7 @@ pub fn fill_responses(
     hits: &mut [RequestHit],
     responses: &mut Responses,
 ) -> Result<ScanReport, ScanError> {
-    let count = scan(image, hits)?;
+    let count = scan_requests(image, hits)?;
     let mut filled = 0;
     for index in 0..count {
         let hit = hits[index];
@@ -65,7 +65,7 @@ mod tests {
     use super::prepare_responses;
     use core::ffi::c_void;
     use limine::base::HHDM_REQUEST_ID;
-    use limine::scan::{RequestHit, ScanError, END_MARKER, START_MARKER};
+    use limine::scan::{RequestHit, END_MARKER, START_MARKER};
     use std::vec::Vec;
 
     fn push_words(image: &mut Vec<u8>, words: &[u64]) {
@@ -108,12 +108,15 @@ mod tests {
     }
 
     #[test]
-    fn an_image_without_markers_is_rejected() {
+    fn an_image_without_markers_is_scanned_by_id_prefix_instead_of_rejected() {
+        // **行为变更（有意）**：真实内核里 START/END 标记被链接器丢掉了，而请求本身都在。
+        // 若坚持「无标记即报错」，响应会全部落空（真机上就是如此）。
+        // 现在无标记时按请求 ID 前缀扫描 —— 全零映像自然得到 0 命中。
         let mut image = std::vec![0u8; 64];
         let mut hits = [RequestHit::EMPTY; 4];
         assert_eq!(
             prepare_responses(&mut image, &mut hits, |_| None),
-            Err(ScanError::NoStartMarker)
+            Ok(crate::protocol::ScanReport { hits: 0, filled: 0 })
         );
     }
 }
@@ -124,7 +127,7 @@ mod fill_responses_tests {
     use crate::responses::Responses;
     use limine::base::HHDM_REQUEST_ID;
     use limine::memmap::MEMMAP_REQUEST_ID;
-    use limine::scan::{RequestHit, ScanError, END_MARKER, START_MARKER};
+    use limine::scan::{RequestHit, END_MARKER, START_MARKER};
 
     fn push_words(image: &mut std::vec::Vec<u8>, words: &[u64]) {
         for word in words {
@@ -189,13 +192,14 @@ mod fill_responses_tests {
     }
 
     #[test]
-    fn an_image_without_markers_is_rejected() {
+    fn an_image_without_markers_is_scanned_by_id_prefix_instead_of_rejected() {
+        // 同 `prepare_responses`：无标记改为按 ID 前缀扫描（真实内核丢了标记）。
         let mut image = std::vec![0u8; 64];
         let mut responses = Responses::new();
         let mut hits = [RequestHit::EMPTY; 4];
         assert_eq!(
             fill_responses(&mut image, &mut hits, &mut responses),
-            Err(ScanError::NoStartMarker)
+            Ok(crate::protocol::ScanReport { hits: 0, filled: 0 })
         );
     }
 }
