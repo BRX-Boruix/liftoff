@@ -832,6 +832,8 @@ where
     for byte in b"[liftoff] post-act\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
+    // 交接的最后一步（实现中）：将改跳低地址 trampoline
+    // （重设机器状态 → 进内核），trampoline 将在 Exit 前搬好。
     enter(entry);
 }
 
