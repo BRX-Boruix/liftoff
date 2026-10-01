@@ -1677,8 +1677,28 @@ pub unsafe fn bring_up(
         .map_err(BringUpError::MemoryMapLoad)?;
     // 用**恒等映射**那套（除 Bad 外全部）：引导器自己的代码与栈在 loader/boot-services
     // 区域，只覆盖可分配区间会让切换页表后取指失败（真机上就是无输出复位）。
-    let usable_count =
+    let mut usable_count =
         mm::usable::identity_ranges(map, c.usable).map_err(BringUpError::MemoryMapRanges)?;
+    // **把帧缓冲的物理区间也交给规划器**（HHDM 与恒等映射共用这份区间）。
+    //
+    // 帧缓冲是 MMIO：既不在固件内存映射的可用区间里，很可能根本不在固件内存映射里
+    // —— 于是 HHDM 不覆盖它。对照 brxLimine：它把帧缓冲**显式**加进内存映射
+    // （`MEMMAP_FRAMEBUFFER`），而 `base_revision == 0` 时 `build_pagemap` 会把
+    // **所有**条目都映射到 HHDM。
+    //
+    // 真机实测的后果：内核终端写 `0xffff800080000000` 即 #PF（错误码 `0x2`）。
+    if let Some(framebuffer) = &c.framebuffer {
+        if usable_count < c.usable.len() {
+            let length = (framebuffer.pitch as u64).saturating_mul(framebuffer.height as u64);
+            if length > 0 {
+                c.usable[usable_count] = mm::usable::UsableRange {
+                    base: framebuffer.base,
+                    length,
+                };
+                usable_count += 1;
+            }
+        }
+    }
     crate::PlatformImpl::write_byte(b'5');
     // 5) 页表规划：内核高区 + HHDM + 恒等。
     let kernel_virt = c.segments[..info.segment_count]
