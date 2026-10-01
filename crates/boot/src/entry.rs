@@ -99,10 +99,12 @@ pub fn start_with<P: Platform>(
     // 小缓冲与响应容器：静态，避免栈溢出。
     // HHDM 与恒等映射是**按 2 MiB 页逐条产出**的：1 GiB 内存就要各约 512 条，
     // 再加内核高区，256 条远远不够（上一轮就是在这里报 BufferTooSmall）。
-    static mut PLAN: [Mapping; 4096] = [Mapping::EMPTY; 4096];
+    // 恒等映射现在覆盖**除 Bad 外所有内存类型**（含 MMIO/保留区），映射条数远多于
+    // 只看可分配区间时 —— 4096 条不够（真实运行报 stage: plan）。
+    static mut PLAN: [Mapping; 16384] = [Mapping::EMPTY; 16384];
     static mut SEGMENTS: [ProgramHeader; 16] = [ProgramHeader::EMPTY; 16];
-    static mut USABLE: [UsableRange; 512] =
-        [UsableRange { base: PhysAddr::new(0), length: 0 }; 512];
+    static mut USABLE: [UsableRange; 1024] =
+        [UsableRange { base: PhysAddr::new(0), length: 0 }; 1024];
     static mut HITS: [RequestHit; 64] = [RequestHit::EMPTY; 64];
     static mut MUST_STAY: [MustStay; 32] = [MustStay { start: 0, len: 0 }; 32];
     static mut RESPONSES: Responses = Responses::new();
