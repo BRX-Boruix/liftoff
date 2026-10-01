@@ -296,7 +296,11 @@ pub unsafe fn handoff(
         // **Exit 前关中断**：Exit 之后固件的定时器事件（如 VirtioRng 的异步回调）
         // 若再触发，其代码在新页表下不可达 → #GP → 复位（真机 #GP 落在 VirtioRngDxe
         // 的 RSP/RIP 已实测）。关中断让回调不再发生。
-        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+        //
+        // 经 `Platform` 而不是裸 `cli`（C2）：入口层不得直连硬件（ADR-007/ADR-050），
+        // 而且这本来就是**已有的能力**，自己再写一份就是重复造轮子（S28）。
+        // 返回的旧状态有意丢弃 —— 这里要的就是「关掉且不再打开」。
+        let _ = crate::PlatformImpl::disable_interrupts();
         // SAFETY: 由调用方保证（见函数文档与 `exit_prepared` 的 SAFETY 契约）。
         let exit_result = unsafe { exit_prepared(exit, image_handle, map_key) };
         // 到这里 = Exit 调用**返回了**（成功或失败都算）。打印 R 作为「活着的」证据。
@@ -307,10 +311,11 @@ pub unsafe fn handoff(
             Ok(()) => {
                 // Exit 成功：**关中断**（旧实现 misc.c:429 同款）—— 引导服务失效后
                 // 固件的定时器中断不会再进来，这是跳转前的必要状态。
-                #[cfg(target_os = "uefi")]
-                unsafe {
-                    core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
-                }
+                //
+                // 同样经 `Platform`（C2）。这里不再需要 `#[cfg(target_os = "uefi")]`
+                // 门控：抽象层在宿主上走 mock，不会执行特权指令 —— 上一处裸 `cli`
+                // 恰恰**漏了**门控，正是「直连硬件」带来的不一致。
+                let _ = crate::PlatformImpl::disable_interrupts();
                 // 活着的证据：cli 之后还能执行（栈与代码都可达）。
                 #[cfg(target_os = "uefi")]
                 crate::PlatformImpl::write_byte(b'K');
@@ -373,6 +378,11 @@ mod tests {
 
     impl Platform for Recorder {
         fn init() {}
+
+        fn bsp_lapic_id() -> u32 {
+            // 测试替身没有 APIC；返回 0 是「无此信息」的如实表达，不伪造一个像样的 ID。
+            0
+        }
 
         fn name() -> &'static str {
             "recorder"
@@ -1963,7 +1973,8 @@ pub unsafe fn bring_up(
     // 任何 CPU —— 真机实测它随后卡死在紧循环里。BSP 的 LAPIC 标识从 CPUID.1:EBX[31:24]。
     {
         #[cfg(target_arch = "x86_64")]
-        let bsp_lapic_id = core::arch::x86_64::__cpuid(1).ebx >> 24;
+        // 经抽象层取（C2）：直接 `cpuid` 会让 `boot` 变成 x86 专用（ADR-007/ADR-050）。
+        let bsp_lapic_id = crate::PlatformImpl::bsp_lapic_id();
         #[cfg(not(target_arch = "x86_64"))]
         let bsp_lapic_id = 0u32;
         c.responses.set_smp(bsp_lapic_id);

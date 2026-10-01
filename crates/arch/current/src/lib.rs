@@ -92,6 +92,12 @@ pub mod mock {
             // 宿主测试不产生输出；需要断言输出时再引入记录缓冲（届时另加测试）。
         }
 
+        fn bsp_lapic_id() -> u32 {
+            // 宿主没有 APIC；**这一层由真机覆盖**（与读 CR4 同样的边界处理）。
+            // 返回 0 是「无此信息」的如实表达，不是伪造一个看起来合理的 ID。
+            0
+        }
+
         fn disable_interrupts() -> InterruptState {
             InterruptState::from_enabled(INTERRUPTS_ENABLED.swap(false, Ordering::SeqCst))
         }

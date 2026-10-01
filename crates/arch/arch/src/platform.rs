@@ -47,6 +47,14 @@ pub trait Platform {
     /// 输出一个字节（引导阶段的诊断通道）。
     fn write_byte(byte: u8);
 
+    /// 启动处理器（BSP）的本地 APIC 标识。
+    ///
+    /// 用于填充 Limine 的 SMP 响应（`bsp_lapic_id`）。**必须经抽象层**：
+    /// 入口层直接 `cpuid` 会让 `boot` 变成 x86 专用（ADR-007/ADR-050）。
+    ///
+    /// 单核启动时这就是唯一的 CPU；不启动任何 AP 时它是 SMP 响应里唯一一项。
+    fn bsp_lapic_id() -> u32;
+
     /// 关中断并返回此前状态。
     fn disable_interrupts() -> InterruptState;
 

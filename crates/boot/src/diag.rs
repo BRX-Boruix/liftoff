@@ -33,6 +33,11 @@ mod tests {
     impl Platform for Recorder {
         fn init() {}
 
+        fn bsp_lapic_id() -> u32 {
+            // 测试替身没有 APIC；返回 0 是「无此信息」的如实表达，不伪造一个像样的 ID。
+            0
+        }
+
         fn name() -> &'static str {
             "recorder"
         }
