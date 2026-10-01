@@ -116,12 +116,22 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
     }
 
     unsafe fn activate(&self) {
-        let Some(phys) = self.root.start_address() else {
-            return;
-        };
-        // SAFETY: 由调用方保证新页表仍映射当前正在执行的代码与栈（见 trait 的 SAFETY 契约）。
-        unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) phys.as_u64(), options(nostack));
+        // 宿主测试目标上**不执行** `mov cr3`（特权指令，用户态直接
+        // STATUS_PRIVILEGED_INSTRUCTION 崩溃）：宿主只验证映射构建逻辑，
+        // 真正的激活在 UEFI 目标上发生 —— 这正是「宿主假固件 / 真机真固件」边界。
+        #[cfg(target_os = "uefi")]
+        {
+            let Some(phys) = self.root.start_address() else {
+                return;
+            };
+            // SAFETY: 由调用方保证新页表仍映射当前正在执行的代码与栈（见 trait 的 SAFETY 契约）。
+            unsafe {
+                core::arch::asm!("mov cr3, {}", in(reg) phys.as_u64(), options(nostack));
+            }
+        }
+        #[cfg(not(target_os = "uefi"))]
+        {
+            let _ = &self.root;
         }
     }
 }

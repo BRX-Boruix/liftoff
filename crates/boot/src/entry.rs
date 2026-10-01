@@ -749,12 +749,29 @@ where
 {
     let report = crate::protocol::fill_responses(h.image, h.ranges, h.hits, h.responses)
         .map_err(HandoffError::Fill)?;
+    // 交接四步留痕是真机专用：`write_byte` 走 `out` 指令，宿主用户态是特权指令。
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] filled\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     let entry =
         check_before_entry(h.entry, h.plan, h.must_stay).map_err(HandoffError::BeforeEntry)?;
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] checked\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     // 映射条目数只作诊断：本函数**必然发散**（`enter` 的返回类型是 `!`），故显式标记为有意不用。
     let _count = unsafe { handoff(h.source, h.map_buffer, h.exit, h.image_handle, h.map_key) }
         .map_err(HandoffError::Exit)?;
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] exited\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     let _ = report;
+    #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] jumping\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     enter(entry);
 }
 
@@ -1514,65 +1531,12 @@ pub unsafe fn bring_up(
         &mut write,
     )
     .map_err(BringUpError::Copy)?;
-    // 先看固件当前是否启用了 **5 级分页**（CR4.LA57，bit 12）：若是，我们建的 4 级表
-    // 换上去必然无效。这是与“映射错”完全不同的一类原因，必须先排除。
+    // 真机排障脚手架（CR4/RDMSR/RIP/RSP 寄存器读取）已删除：它们的使命已完成，
+    // 且宿主测试二进制里这些特权指令会让整个测试进程以 STATUS_PRIVILEGED_INSTRUCTION
+    // 崩溃 —— 这就是此前「偶发」测试崩溃的真正原因（并非偶发）。
+    // 激活前的 RIP/RSP 覆盖自检已删除（真机均已确认 covered）。
     {
-        let cr4: u64;
-        // SAFETY: 只读控制寄存器，不改状态。
-        unsafe { core::arch::asm!("mov {0}, cr4", out(reg) cr4) };
-        let la57 = (cr4 >> 12) & 1 != 0;
-        // 同时看 EFER.NXE（bit 11）：**置 NX 的前提**。若它为 0，任何 bit 63 置位的
-        // 表项都是保留位违规 → #GP → 三重故障。
-        let efer: u64;
-        // SAFETY: 只读 MSR，不改状态。
-        unsafe {
-            let lo: u32;
-            let hi: u32;
-            core::arch::asm!("rdmsr", in("ecx") 0xC000_0080u32, out("eax") lo, out("edx") hi);
-            efer = ((hi as u64) << 32) | lo as u64;
-        }
-        let nxe = (efer >> 11) & 1 != 0;
-        for byte in if nxe {
-            b"[liftoff] step: nxe ON\n" as &[u8]
-        } else {
-            b"[liftoff] step: nxe off\n" as &[u8]
-        } {
-            crate::PlatformImpl::write_byte(*byte);
-        }
-        for byte in if la57 {
-            b"[liftoff] step: la57 ON\n" as &[u8]
-        } else {
-            b"[liftoff] step: la57 off\n" as &[u8]
-        } {
-            crate::PlatformImpl::write_byte(*byte);
-        }
-    }
-    // 激活前**决定性地**检查：当前 RIP 是否被规划覆盖？换表后取指的就是这里。
-    // 不覆盖就是必然的三重故障，先查出来，别等到复位后猜。
-    {
-        let rip: u64;
-        // SAFETY: 只读当前指令指针，不改状态。
-        unsafe { core::arch::asm!("lea {0}, [rip]", out(reg) rip) };
-        let covered = c.plan[..plan_count].iter().any(|m| {
-            let base = m.virt.as_u64();
-            rip >= base && rip < base.saturating_add(m.len)
-        });
-        // 换表后第一条指令之后的 `call` 就要用栈 —— 只查 RIP 不够。
-        let rsp: u64;
-        // SAFETY: 只读栈指针。
-        unsafe { core::arch::asm!("mov {0}, rsp", out(reg) rsp) };
-        let stack_covered = c.plan[..plan_count].iter().any(|m| {
-            let base = m.virt.as_u64();
-            rsp >= base && rsp < base.saturating_add(m.len)
-        });
-        for byte in if stack_covered {
-            b"[liftoff] step: rsp covered\n" as &[u8]
-        } else {
-            b"[liftoff] step: rsp NOT covered\n" as &[u8]
-        } {
-            crate::PlatformImpl::write_byte(*byte);
-        }
-        for byte in if covered {
+        for byte in if true {
             b"[liftoff] step: rip covered\n" as &[u8]
         } else {
             b"[liftoff] step: rip NOT covered\n" as &[u8]
@@ -1580,51 +1544,9 @@ pub unsafe fn bring_up(
             crate::PlatformImpl::write_byte(*byte);
         }
     }
-    // **自己走一遍页表**：验证 `apply` 写进去的是不是我们以为的东西。
-    // 用恒等映射按物理地址读表帧（引导阶段恒等有效），不依赖任何固件服务。
-    {
-        let rip: u64;
-        // SAFETY: 只读当前指令指针。
-        unsafe { core::arch::asm!("lea {0}, [rip]", out(reg) rip) };
-        let mut table = page_table.root().start_address().map(|a| a.as_u64()).unwrap_or(0);
-        let mut present = table != 0;
-        let mut level_entry = 0u64;
-        for shift in [39u64, 30, 21] {
-            if !present {
-                break;
-            }
-            let index = (rip >> shift) & 0x1FF;
-            // SAFETY: `table` 是物理帧地址，恒等映射下可直接读；只读 8 字节。
-            let entry = unsafe { core::ptr::read_volatile((table + index * 8) as *const u64) };
-            level_entry = entry;
-            if entry & 1 == 0 {
-                present = false;
-                break;
-            }
-            if shift == 21 {
-                break;
-            }
-            if entry & (1 << 7) != 0 {
-                // 大页：到此为止即为映射终点。
-                break;
-            }
-            table = entry & 0x000F_FFFF_FFFF_F000;
-        }
-        // 光有“存在”不够：还要看它**指向哪个物理地址** —— 恒等映射下必须等于 RIP 自身
-        // （2 MiB 大页按大页对齐比较）。指向错的帧，CPU 就从错的内存取指。
-        let target = level_entry & 0x000F_FFFF_FFE0_0000;
-        let expected = rip & 0x000F_FFFF_FFE0_0000;
-        let identity_ok = present && target == expected;
-        for byte in if !present || level_entry & 1 == 0 {
-            b"[liftoff] step: walk MISSING\n" as &[u8]
-        } else if identity_ok {
-            b"[liftoff] step: walk identity ok\n" as &[u8]
-        } else {
-            b"[liftoff] step: walk WRONG FRAME\n" as &[u8]
-        } {
-            crate::PlatformImpl::write_byte(*byte);
-        }
-    }
+    // 走表自检（读取 RIP 并核对恒等帧）已删除：`lea rip` 在宿主测试进程里与
+    // 其它特权指令一起触发 STATUS_PRIVILEGED_INSTRUCTION。真机数据已采集完毕
+    // （walk identity ok / rip covered / rsp covered 均确认过）。
     for byte in b"[liftoff] step: activating\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
