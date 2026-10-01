@@ -273,7 +273,6 @@ pub unsafe fn handoff(
             return Err(Error::InvalidState);
         }
         #[cfg(target_os = "uefi")]
-        #[cfg(target_os = "uefi")]
     for byte in b"[liftoff] h: exit\n" as &[u8] {
             crate::PlatformImpl::write_byte(*byte);
         }
