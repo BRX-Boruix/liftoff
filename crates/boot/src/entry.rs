@@ -1225,6 +1225,8 @@ pub enum KernelPlanError {
     NotMapped,
     /// 把规划写入页表失败。
     MapFailed,
+    /// 一条重定位的目标地址不在规划覆盖范围内（**不跳过**）。
+    RelocationNotMapped,
 }
 
 /// 解析内核映像，得出入口与装载段。
@@ -1363,6 +1365,59 @@ mod kernel_plan_tests {
 /// `memory` 是目标物理内存视图（长度即可寻址的物理字节数），故宿主上可用假内存验证。
 ///
 /// 边界：映射区间与物理地址都用 checked 运算；写入目标必须在 `memory` 内。
+/// 把 `ET_DYN` 内核的 `R_X86_64_RELATIVE` 重定位写进**已装载**的内存。
+///
+/// `loader` 只负责**解析**（纯字节，见 `loader::elf::relative_relocations`），
+/// 写入属 `boot` 职责：按 `plan` 的 virt→phys 映射把每个目标虚拟地址换算成物理
+/// 地址，再写 8 字节小端。
+///
+/// `slide` = 实际装载地址 − 链接期虚拟地址；我们按链接地址装载，所以是 0。
+///
+/// 返回应用了多少条。**任何一条目标地址（含 8 字节）不被任何映射覆盖都报错**，
+/// 不静默跳过。
+///
+/// # 为什么必须有这一步
+///
+/// 真实内核是 `ET_DYN`，其 `_start` 用 `mov 0xffffffff809b0550,%rcx; mov %rcx,%rsp`
+/// 载入自己的栈指针；该槽位在文件里是 0，只有应用 `R_X86_64_RELATIVE`
+/// （`r_addend = -0x7f651000` → `0xffffffff809af000`）之后才正确。不应用它，
+/// `RSP` 就是 0，内核入口第一条 `call` 就会写 `-8` 而 #PF（已由单步实测）。
+pub fn apply_kernel_relocations<W>(
+    image: &[u8],
+    plan: &[Mapping],
+    slide: u64,
+    write_phys: W,
+) -> Result<usize, KernelPlanError>
+where
+    W: FnMut(u64, &[u8]) -> Result<(), ElfError>,
+{
+    // 非 PIE 内核（`ET_EXEC`）的地址已经是最终地址，**不需要**也不该做重定位。
+    let header = loader::elf::parse_elf_header(image).map_err(KernelPlanError::Elf)?;
+    if header.e_type != loader::elf::ET_DYN {
+        return Ok(0);
+    }
+    let mut write_phys = write_phys;
+    let relocations =
+        loader::elf::relative_relocations(image, slide).map_err(KernelPlanError::Elf)?;
+    let mut applied = 0usize;
+    for relocation in relocations {
+        let end = relocation.address.saturating_add(8);
+        let Some(mapping) = plan.iter().find(|m| {
+            let base = m.virt.as_u64();
+            relocation.address >= base && end <= base.saturating_add(m.len)
+        }) else {
+            return Err(KernelPlanError::RelocationNotMapped);
+        };
+        let phys = mapping
+            .phys
+            .as_u64()
+            .saturating_add(relocation.address - mapping.virt.as_u64());
+        write_phys(phys, &relocation.value.to_le_bytes()).map_err(KernelPlanError::Elf)?;
+        applied += 1;
+    }
+    Ok(applied)
+}
+
 pub fn copy_kernel_segments<W>(
     image: &[u8],
     segments: &[ProgramHeader],
@@ -1665,6 +1720,18 @@ pub unsafe fn bring_up(
         &mut write,
     )
     .map_err(BringUpError::Copy)?;
+    // **应用 ELF 重定位**（`ET_DYN` 内核必需）：拷完段之后立刻做，因为内核的数据段
+    // 里存的是需要重定位修正的槽位。我们按**链接地址**装载，所以 `slide = 0`。
+    // 不做的后果已实测：内核 `_start` 读自己的栈指针读到 0，`RSP = 0`，入口第一条
+    // `call` 写 `-8` 而 #PF（单步证据见 docs/TODO/liftoff.md）。
+    let applied = apply_kernel_relocations(
+        &c.kernel_out[..len],
+        &c.plan[..plan_count],
+        0,
+        &mut write,
+    )
+    .map_err(BringUpError::Copy)?;
+    let _ = applied;
     // 真机排障脚手架（CR4/RDMSR/RIP/RSP 寄存器读取）已删除：它们的使命已完成，
     // 且宿主测试二进制里这些特权指令会让整个测试进程以 STATUS_PRIVILEGED_INSTRUCTION
     // 崩溃 —— 这就是此前「偶发」测试崩溃的真正原因（并非偶发）。
