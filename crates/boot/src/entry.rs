@@ -1546,6 +1546,29 @@ pub fn build_plan(
     let data_flags = PageFlags::present()
         .with(PageFlags::writable())
         .with(PageFlags::executable());
+    // **`base_revision == 0` 的 Limine 规则**（对照 brxLimine `build_pagemap`，
+    // `limine.c:200-203`）：把低 4 GiB **恒等**映射。
+    //
+    // 内核按这个语义直接访问低 4 GiB 的 MMIO —— 帧缓冲就在 `0x80000000`。我们的
+    // 恒等映射只覆盖固件内存映射描述过的区间，**不含 PCI MMIO 窗口**。真机实测的
+    // 后果：内核终端初始化成功（`fb=0x80000000 1280x800 bpp=32`）后写帧缓冲即
+    // #PF（`CR2=0x80000000`、错误码 `0x2`）。
+    //
+    // **大页对齐**：规划器只产出 `large`（2 MiB）粒度，起点必须对齐、长度必须是整数倍
+    // （否则 `apply` 报 `MisalignedVirt`/`MisalignedLength` —— 第一次尝试从 `0x1000` 起
+    // 就是这么失败的）。Limine 用 4 KiB 页从 `0x1000` 起；我们只能从 `0` 起，代价是
+    // 多映射了**页零**这 4 KiB。**这是与 Limine 的唯一已知偏差**，已记录在台账。
+    {
+        if total < out.len() {
+            out[total] = Mapping {
+                virt: arch::addr::VirtAddr::new(0),
+                phys: arch::addr::PhysAddr::new(0),
+                len: 0x1_0000_0000u64,
+                flags: data_flags,
+            };
+            total += 1;
+        }
+    }
     for (index, mapping) in out[..total].iter_mut().enumerate() {
         mapping.flags = if index < kernel_count { kernel_flags } else { data_flags };
     }
