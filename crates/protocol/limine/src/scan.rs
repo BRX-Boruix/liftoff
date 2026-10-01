@@ -227,6 +227,13 @@ fn scan_by_prefix(image: &[u8], hits: &mut [RequestHit]) -> Result<usize, ScanEr
     let mut count = 0usize;
     let mut at = 0usize;
     while at + 32 <= image.len() {
+        // 先比**第一个词**（协议不变量：每个请求 ID 都以同一个魔数开头）。
+        // 不做这一步就要对每个位置都比 4 个词 × 11 个 ID —— 在 24.6 MB 的映像上
+        // 那是上亿次读取，真机上表现为长时间无输出（实测卡在 `before scan`）。
+        if read_u64(image, at) != Some(crate::base::COMMON_MAGIC[0]) {
+            at += 8;
+            continue;
+        }
         let mut found = None;
         for (id, size) in KNOWN_REQUESTS {
             if matches(image, at, id) {
@@ -241,11 +248,15 @@ fn scan_by_prefix(image: &[u8], hits: &mut [RequestHit]) -> Result<usize, ScanEr
             hits[count] = RequestHit { id: **id, offset: at, size: *size };
             count += 1;
             // 命中后按该类型已知尺寸前进（与按标记扫描同一套规则）。
-            at += size;
-            continue;
+            // **必须保证推进**：尺寸为 0（或小于一个 ID）时若原地不动就是死循环 ——
+            // 真机上正是卡在这里（`before scan` 之后再也没有输出）。
+            let step = if *size >= 8 { *size } else { 8 };
+            at += step;
+        } else {
+            // **只有未命中**才按 8 字节对齐步进（请求必须落在 8 字节边界上）。
+            // 之前这一句在 `if` 之外，命中后会**双重推进**，把紧随其后的请求跳过。
+            at += 8;
         }
-        // 未命中按 8 字节对齐步进（请求必须落在 8 字节边界上）。
-        at += 8;
     }
     Ok(count)
 }

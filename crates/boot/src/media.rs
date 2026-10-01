@@ -428,12 +428,30 @@ pub fn read_kernel_image<D: BlockDeviceSource>(
     if out.len() < len {
         return Err(IsoError::BufferTooSmall);
     }
+    // **成批读**：整块部分一次读很多块（12,011 次调用 → 约 375 次），尾部单独处理。
+    // 直接读进 `out`，不需要额外的大 scratch。
+    const BATCH: u32 = 32; // 32 × 2048 = 64 KiB 一次
     let file_blocks = len.div_ceil(size);
-    for index in 0..file_blocks {
-        read_iso_block(source, volume, block_size, kernel.extent_lba + index as u32, &mut block)?;
+    let mut index = 0usize;
+    while index < file_blocks {
         let at = index * size;
-        let take = core::cmp::min(size, len - at);
+        let remaining = len - at;
+        if remaining >= size * BATCH as usize {
+            read_iso_blocks(
+                source,
+                volume,
+                block_size,
+                kernel.extent_lba + index as u32,
+                BATCH,
+                &mut out[at..at + size * BATCH as usize],
+            )?;
+            index += BATCH as usize;
+            continue;
+        }
+        read_iso_block(source, volume, block_size, kernel.extent_lba + index as u32, &mut block)?;
+        let take = core::cmp::min(size, remaining);
         out[at..at + take].copy_from_slice(&block[..take]);
+        index += 1;
     }
     Ok(len)
 }
@@ -645,5 +663,114 @@ mod load_kernel_from_device_tests {
         let mut out = std::vec![0u8; 4096];
         let result = load_kernel_from_device(&mut disk, DeviceIndex(0), &mut head, &mut out);
         assert!(matches!(result, Err(MediaError::Iso(_))), "非 ISO 必须如实报错");
+    }
+}
+
+/// 一次读入**多个** ISO 逻辑块（每块 `block_size` 字节）。
+///
+/// **为什么需要**：`read_iso_block` 一次只读一块 —— 读 24.6 MB 的内核要 12,011 次固件调用，
+/// 真机实测约 **141 秒**。这里把 `count` 个逻辑块合并成**一次**设备读。
+///
+/// 边界与 `read_iso_block` 一致：块大小为 0 / 非扇区整数倍 / 缓冲不足 / 越界，
+/// 都在**碰设备之前**拒绝。
+pub fn read_iso_blocks<D: BlockDeviceSource>(
+    source: &mut D,
+    volume: &Volume,
+    block_size: u16,
+    first_block: u32,
+    count: u32,
+    buffer: &mut [u8],
+) -> Result<(), IsoError> {
+    let size = block_size as u32;
+    if size == 0 || count == 0 {
+        return Err(IsoError::BadBlockSize);
+    }
+    let sector = volume.sector_size;
+    if sector == 0 || size % sector != 0 {
+        return Err(IsoError::BadBlockSize);
+    }
+    let total = (size as usize)
+        .checked_mul(count as usize)
+        .ok_or(IsoError::ShortImage)?;
+    if buffer.len() < total {
+        return Err(IsoError::BufferTooSmall);
+    }
+    let per_block = size / sector;
+    let offset = (first_block as u64)
+        .checked_mul(per_block as u64)
+        .ok_or(IsoError::ShortImage)?;
+    let sectors = per_block.checked_mul(count).ok_or(IsoError::ShortImage)?;
+    volume
+        .read(source, offset, sectors, &mut buffer[..total])
+        .map_err(|_| IsoError::ShortImage)
+}
+
+#[cfg(test)]
+mod read_iso_blocks_tests {
+    use super::read_iso_blocks;
+    use driver::volume::Volume;
+    use firmware::block::{BlockDeviceInfo, BlockDeviceSource, DeviceIndex};
+    use firmware::error::Error;
+    use std::vec::Vec;
+
+    struct FakeDisk {
+        bytes: Vec<u8>,
+        reads: usize,
+    }
+
+    impl BlockDeviceSource for FakeDisk {
+        fn device_count(&self) -> usize {
+            1
+        }
+        fn device_info(&self, _index: DeviceIndex) -> Result<BlockDeviceInfo, Error> {
+            Ok(BlockDeviceInfo {
+                block_size: 512,
+                block_count: (self.bytes.len() / 512) as u64,
+                read_only: true,
+            })
+        }
+        fn read_blocks(
+            &mut self,
+            _index: DeviceIndex,
+            lba: u64,
+            count: u32,
+            buffer: &mut [u8],
+        ) -> Result<(), Error> {
+            self.reads += 1;
+            let at = (lba as usize).checked_mul(512).ok_or(Error::InvalidArgument)?;
+            let len = (count as usize) * 512;
+            let src = self.bytes.get(at..at + len).ok_or(Error::InvalidArgument)?;
+            buffer
+                .get_mut(..len)
+                .ok_or(Error::InvalidArgument)?
+                .copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reading_many_blocks_in_one_call_matches_the_bytes_and_uses_one_device_read() {
+        // 每块 2048 字节、设备扇区 512 → 每逻辑块 4 扇区。
+        let mut bytes = std::vec![0u8; 512 * 64];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let mut disk = FakeDisk { bytes, reads: 0 };
+        let volume = Volume::new(DeviceIndex(0), 0, 64, 512).expect("卷可建");
+        let mut out = std::vec![0u8; 8 * 2048];
+        read_iso_blocks(&mut disk, &volume, 2048, 2, 8, &mut out).expect("应能读");
+        assert_eq!(disk.reads, 1, "8 个逻辑块应只触发**一次**设备读");
+        // 与源字节逐字节比对（逻辑块 2 起）。
+        let at = 2 * 2048;
+        assert_eq!(&out[..64], &disk.bytes[at..at + 64]);
+    }
+
+    #[test]
+    fn a_buffer_that_cannot_hold_the_request_is_rejected() {
+        let mut disk = FakeDisk { bytes: std::vec![0u8; 512 * 64], reads: 0 };
+        let volume = Volume::new(DeviceIndex(0), 0, 64, 512).expect("卷可建");
+        let mut out = std::vec![0u8; 2048];
+        assert!(read_iso_blocks(&mut disk, &volume, 2048, 0, 2, &mut out).is_err());
+        assert_eq!(disk.reads, 0, "缓冲不足时不得触碰设备");
     }
 }

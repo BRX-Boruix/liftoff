@@ -1415,11 +1415,13 @@ pub unsafe fn bring_up(
     c: BringUp<'_, '_>,
     enter: impl FnOnce(u64) -> !,
 ) -> Result<(), BringUpError> {
+    crate::PlatformImpl::write_byte(b'1');
     // 1) 发现块设备（存储由类型自己持有，入口不需要认识 BlockIo）。
     // SAFETY: 由调用方保证引导阶段单线程、只调一次。
     let mut devices =
         unsafe { UefiBlockDevices::from_boot_services(table.locate_handle, table.handle_protocol) }
             .map_err(BringUpError::Discover)?;
+    crate::PlatformImpl::write_byte(b'2');
     // 2) 从介质读出内核映像。
     let len = crate::media::load_kernel_from_device(
         &mut devices,
@@ -1428,10 +1430,12 @@ pub unsafe fn bring_up(
         c.kernel_out,
     )
     .map_err(BringUpError::Media)?;
+    crate::PlatformImpl::write_byte(b'3');
     // 3) 规划内核装载（入口、段、必须保持映射的区间）。
     let info = plan_kernel(&c.kernel_out[..len], c.segments).map_err(BringUpError::Kernel)?;
     let stays = must_stay_from_segments(&c.segments[..info.segment_count], c.must_stay)
         .map_err(BringUpError::Kernel)?;
+    crate::PlatformImpl::write_byte(b'4');
     // 4) 可用物理区间（HHDM 与恒等映射都从这里来）。
     let map = c
         .memory_map
@@ -1441,6 +1445,7 @@ pub unsafe fn bring_up(
     // 区域，只覆盖可分配区间会让切换页表后取指失败（真机上就是无输出复位）。
     let usable_count =
         mm::usable::identity_ranges(map, c.usable).map_err(BringUpError::MemoryMapRanges)?;
+    crate::PlatformImpl::write_byte(b'5');
     // 5) 页表规划：内核高区 + HHDM + 恒等。
     let kernel_virt = c.segments[..info.segment_count]
         .iter()
@@ -1468,6 +1473,7 @@ pub unsafe fn bring_up(
         LARGE_PAGE,
     )
     .map_err(BringUpError::Plan)?;
+    crate::PlatformImpl::write_byte(b'6');
     // 6) 页表：根帧 + HHDM 直接映射 + 固件帧来源。
     let mut frames = EfiFrameAllocator::new(table.allocate_pages);
     let root = frames.allocate_zeroed().ok_or(BringUpError::RootFrame)?;
@@ -1651,10 +1657,63 @@ pub unsafe fn bring_up(
         }
     }
     let _ = stays;
+    // 决定性检查：**激活之后**，那块固件页缓冲还读得到吗？
+    // 自检只读过内核的虚拟映射，从没读过这块缓冲 —— 若它不在恒等映射里，
+    // 第一次读它就故障，且与“扫描很慢”表现完全相同。
+    {
+        // 逐个偏移探测：整段缓冲是否真的都可读？（只验开头是不够的）
+        for offset in [0usize, 1 << 20, 4 << 20, 8 << 20, 16 << 20, 24 << 20] {
+            let _probe = c.kernel_out[offset];
+            for byte in b"[liftoff] step: buf ok\n" as &[u8] {
+                crate::PlatformImpl::write_byte(*byte);
+            }
+        }
+    }
+    for byte in b"[liftoff] step: before scan\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     // **直接问内核要什么**：扫描它声明的请求并逐条打印（不读内核代码也能知道）。
     // 这比猜“它可能缺什么”可靠得多。
     {
         let mut hits = [RequestHit::EMPTY; 64];
+        // 先扫一个**极小切片**：若这也卡，问题在函数本身；若秒回，问题在切片大小。
+        match limine::scan::scan_requests(&c.kernel_out[..4096], &mut hits) {
+            Err(_) => {
+                for byte in b"[liftoff] tiny ERR\n" as &[u8] {
+                    crate::PlatformImpl::write_byte(*byte);
+                }
+            }
+            Ok(_) => {
+                for byte in b"[liftoff] tiny OK\n" as &[u8] {
+                    crate::PlatformImpl::write_byte(*byte);
+                }
+            }
+        }
+        // **先打出 `len` 的数量级**（每 4 MB 一个点，最多 48 个）：
+        // `len` 是唯一没在真机上验证过、又决定循环边界的量 —— 宿主测试里它是对的，
+        // 但真机上若是个垃圾值，4 MB 分块循环就会一直扫到没有映射的地方。
+        {
+            for byte in b"[liftoff] len=" as &[u8] {
+                crate::PlatformImpl::write_byte(*byte);
+            }
+            let mut digits = [0u8; 20];
+            let mut count = 0usize;
+            let mut value = len;
+            if value == 0 {
+                digits[0] = b'0';
+                count = 1;
+            }
+            while value > 0 && count < digits.len() {
+                digits[count] = b'0' + (value % 10) as u8;
+                value /= 10;
+                count += 1;
+            }
+            while count > 0 {
+                count -= 1;
+                crate::PlatformImpl::write_byte(digits[count]);
+            }
+            crate::PlatformImpl::write_byte(b'\n');
+        }
         match limine::scan::scan_requests(&c.kernel_out[..len], &mut hits) {
             Err(_) => {
                 for byte in b"[liftoff] scan ERR\n" as &[u8] {
