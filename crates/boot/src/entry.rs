@@ -1554,10 +1554,11 @@ pub fn build_plan(
     // 后果：内核终端初始化成功（`fb=0x80000000 1280x800 bpp=32`）后写帧缓冲即
     // #PF（`CR2=0x80000000`、错误码 `0x2`）。
     //
-    // **大页对齐**：规划器只产出 `large`（2 MiB）粒度，起点必须对齐、长度必须是整数倍
-    // （否则 `apply` 报 `MisalignedVirt`/`MisalignedLength` —— 第一次尝试从 `0x1000` 起
-    // 就是这么失败的）。Limine 用 4 KiB 页从 `0x1000` 起；我们只能从 `0` 起，代价是
-    // 多映射了**页零**这 4 KiB。**这是与 Limine 的唯一已知偏差**，已记录在台账。
+    // **大页对齐**：低 4 GiB 恒等映射必须走 2 MiB 大页 —— 若用 4 KiB 粒度，
+    // 4 GiB / 2 MiB = 2048 张页表，真机帧预算根本供不起（实测：apply 直接
+    // OutOfMemory，`entry failed`）。所以仍从 `0` 起，**多映射页零**是与 Limine
+    // 的已知偏差；消掉它需要「先大页覆盖 2 MiB 对齐主体 + 4 KiB 精修头部」的
+    // 混合方案，那会显著复杂化 apply 的失败语义，暂不做（记入台账）。
     {
         if total < out.len() {
             out[total] = Mapping {
@@ -2101,6 +2102,35 @@ mod build_plan_tests {
     }
 
     #[test]
+    fn the_low_4gib_identity_mapping_uses_a_large_page_from_zero() {
+        // 这不是「照抄 Limine」，而是**实测后的工程决策**：Limine 用 4 KiB 页从
+        // 0x1000 起，但那需要 4 GiB / 2 MiB = 2048 张页表，真机帧预算供不起
+        // （实测 apply 直接 OutOfMemory，`entry failed`）。所以用 2 MiB 大页从
+        // 0 起映射到 4 GiB —— 代价是多映射页零这 4 KiB，是与 Limine 的已知偏差。
+        let hhdm = [range(0x1000_0000, LARGE)];
+        let identity = [];
+        let mut plan = [Mapping::EMPTY; 64];
+        let count = build_plan(
+            0x20_0000,
+            0xffff_ffff_8000_0000,
+            LARGE,
+            &hhdm,
+            &identity,
+            &mut plan,
+            LARGE,
+        )
+        .expect("规划应成功");
+        let low = plan[..count]
+            .iter()
+            .find(|m| m.virt.as_u64() < 0x1_0000_0000)
+            .expect("低 4 GiB 恒等映射必须在");
+        assert_eq!(low.virt.as_u64(), 0, "必须从 0 起（大页对齐要求）");
+        assert_eq!(low.len, 0x1_0000_0000, "必须覆盖整个低 4 GiB（含 MMIO）");
+        // 必须是大页：2 MiB 对齐的长度倍数，供 map_range 走大页路径。
+        assert_eq!(low.len % (2 * 1024 * 1024), 0, "长度必须是 2 MiB 的倍数");
+    }
+
+    #[test]
     fn the_hhdm_mapping_lands_at_the_declared_offset() {
         let hhdm = [range(0x1000_0000, LARGE)];
         let mut plan = [Mapping::EMPTY; 64];
@@ -2292,6 +2322,18 @@ mod load_and_activate_tests {
     struct RecordingTable;
     impl PageTable for RecordingTable {
         fn map_range(
+            &mut self,
+            _virt: VirtAddr,
+            _phys: PhysAddr,
+            _len: u64,
+            _flags: PageFlags,
+        ) -> Result<(), MapError> {
+            MAP_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        // apply 按对齐路由：非 2 MiB 对齐的映射走这里。计数合并进 MAP_CALLS，
+        // 因为测试关心的是「几条映射被落地」，而不是走了哪条粒度路径。
+        fn map_range_pages(
             &mut self,
             _virt: VirtAddr,
             _phys: PhysAddr,

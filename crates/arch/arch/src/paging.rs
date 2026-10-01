@@ -167,6 +167,24 @@ pub trait PageTable {
         flags: PageFlags,
     ) -> Result<(), MapError>;
 
+    /// 以 **4 KiB** 粒度建立 `[virt, virt+len)` → `[phys, phys+len)` 的映射。
+    ///
+    /// 用于**不满足大页对齐**的区间 —— 例如 Limine 语义下从 `0x1000` 起的低 4 GiB
+    /// 恒等映射。`apply` 按 Mapping 的对齐关系自动在 `map_range`（2 MiB）与
+    /// 本方法（4 KiB）之间选择，调用方不必关心。
+    ///
+    /// 默认返回 `UnsupportedGranularity`：实现方按自身能力决定是否支持；
+    /// 不支持时 `apply` 会如实上报，而不是悄悄丢掉这段映射。
+    fn map_range_pages(
+        &mut self,
+        _virt: VirtAddr,
+        _phys: PhysAddr,
+        _len: u64,
+        _flags: PageFlags,
+    ) -> Result<(), MapError> {
+        Err(MapError::UnsupportedGranularity)
+    }
+
     /// 激活本页表：此后 CPU 用其解析地址。
     ///
     /// # Safety
