@@ -28,6 +28,37 @@ impl UsableRange {
     }
 }
 
+/// 提取**恒等映射需要覆盖**的区间（除 `Bad` 外的所有内存类型）。
+///
+/// 与 [`usable_ranges`] 的关键区别：后者只给**可分配**的区间（`Usable` 与
+/// `BootloaderReclaimable`），而**引导器自己的代码与栈**位于固件的 loader / boot-services
+/// 区域 —— 若恒等映射只覆盖可分配区间，切换页表后**当前正在执行的代码立刻失去映射**，
+/// 表现为无任何输出即三重故障（真实运行已复现）。
+///
+/// 这里把 `Bad` 之外的都算上：映射保留内存/MMIO 是幂等的恒等映射，无害；
+/// 漏掉正在执行的代码则是致命的。
+pub fn identity_ranges(map: MemoryMap<'_>, out: &mut [UsableRange]) -> Result<usize, Error> {
+    let mut count = 0;
+    for entry in map.iter() {
+        if matches!(entry.kind, MemoryKind::BadMemory) {
+            continue;
+        }
+        if entry.length == 0 {
+            continue;
+        }
+        let range = UsableRange { base: entry.base, length: entry.length };
+        if range.end().is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        if count == out.len() {
+            return Err(Error::BufferTooSmall);
+        }
+        out[count] = range;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// 提取可分配区间，写入 `out`，返回区间数。
 pub fn usable_ranges(map: MemoryMap<'_>, out: &mut [UsableRange]) -> Result<usize, Error> {
     let mut count = 0;

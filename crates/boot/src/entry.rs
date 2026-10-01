@@ -1418,8 +1418,10 @@ pub unsafe fn bring_up(
         .memory_map
         .memory_map(c.map_buffer)
         .map_err(BringUpError::MemoryMapLoad)?;
+    // 用**恒等映射**那套（除 Bad 外全部）：引导器自己的代码与栈在 loader/boot-services
+    // 区域，只覆盖可分配区间会让切换页表后取指失败（真机上就是无输出复位）。
     let usable_count =
-        mm::usable::usable_ranges(map, c.usable).map_err(BringUpError::MemoryMapRanges)?;
+        mm::usable::identity_ranges(map, c.usable).map_err(BringUpError::MemoryMapRanges)?;
     // 5) 页表规划：内核高区 + HHDM + 恒等。
     let kernel_virt = c.segments[..info.segment_count]
         .iter()
