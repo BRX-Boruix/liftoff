@@ -1662,6 +1662,30 @@ pub unsafe fn bring_up(
         }
     }
     let _ = stays;
+    // 只扫**已装载段**的文件区间：固件里内存访问极慢，扫全映像不可行。
+    static mut RANGES: [(usize, usize); 16] = [(0, 0); 16];
+    let mut range_count = 0usize;
+    // SAFETY: 引导阶段单线程；本数组在 `enter_kernel` 之前一直有效。
+    let ranges = unsafe { &mut *core::ptr::addr_of_mut!(RANGES) };
+    for segment in &c.segments[..info.segment_count] {
+        if range_count == ranges.len() {
+            break;
+        }
+        let Ok(start) = usize::try_from(segment.p_offset) else {
+            continue;
+        };
+        let Ok(size) = usize::try_from(segment.p_filesz) else {
+            continue;
+        };
+        let Some(end) = start.checked_add(size) else {
+            continue;
+        };
+        if end > len {
+            continue;
+        }
+        ranges[range_count] = (start, end);
+        range_count += 1;
+    }
     // 决定性检查：**激活之后**，那块固件页缓冲还读得到吗？
     // 自检只读过内核的虚拟映射，从没读过这块缓冲 —— 若它不在恒等映射里，
     // 第一次读它就故障，且与“扫描很慢”表现完全相同。
@@ -1707,38 +1731,25 @@ pub unsafe fn bring_up(
             }
             crate::PlatformImpl::write_byte(b'>');
         }
-        // **规模-时间判据**：同一次运行里扫 64 KB / 256 KB / 1 MB，各打一个标记。
-        // 出现到哪一个，就说明扫描在固件里的实际速度量级；只出现第一个，
-        // 说明卡点在 64 KB 与 256 KB 之间的某个具体位置（那就继续二分到字节）。
-        {
-            let mut part = [RequestHit::EMPTY; 64];
-            let _ = limine::scan::scan_requests(&c.kernel_out[..64 << 10], &mut part);
-            crate::PlatformImpl::write_byte(b'A');
-            let _ = limine::scan::scan_requests(&c.kernel_out[..256 << 10], &mut part);
-            crate::PlatformImpl::write_byte(b'B');
-            let _ = limine::scan::scan_requests(&c.kernel_out[..1024 << 10], &mut part);
-            crate::PlatformImpl::write_byte(b'C');
-            crate::PlatformImpl::write_byte(b'\n');
-        }
-        // 分块扫描并**每 4 MB 打一个点**：点持续出现＝只是慢；点停住＝某段卡住。
+        // 规模-时间判据已完成使命（1 MB 能过、4 MB 卡住的量级已确认），删除。
+        // 分块扫描改用**与真实路径相同**的已装载段区间：此前这里扫的是全部 24.6 MB，
+        // 它才是把整次运行拖过 400 秒的元凶 —— 真实路径早已只扫约 10 MB。
+        // 逐条打印扫描结果：**与真实路径同一把扫子**（只扫已装载段区间），
+        // 每 1 MB 打一个点作为进度留痕 —— 点停住＝某段卡住；点走完＝逐条列出请求。
         let mut total = 0usize;
         {
-            let mut start = 0usize;
-            while start < len {
-                let end = core::cmp::min(start + (4 << 20), len);
-                let mut part = [RequestHit::EMPTY; 64];
-                if let Ok(n) = limine::scan::scan_requests(&c.kernel_out[start..end], &mut part) {
-                    for hit in &part[..n] {
-                        if total < hits.len() {
-                            hits[total] = *hit;
-                            total += 1;
-                        }
+            let mut part = [RequestHit::EMPTY; 64];
+            if let Ok(n) = limine::scan::scan_ranges(&c.kernel_out, ranges, 4 << 20, &mut part) {
+                for hit in &part[..n] {
+                    if total < hits.len() {
+                        hits[total] = *hit;
+                        total += 1;
                     }
                 }
-                crate::PlatformImpl::write_byte(b'.');
-                start = end;
             }
-            crate::PlatformImpl::write_byte(b'\n');
+        }
+        for byte in b"[liftoff] scan done\n" as &[u8] {
+            crate::PlatformImpl::write_byte(*byte);
         }
         match Ok::<usize, limine::scan::ScanError>(total) {
             Err(_) => {
@@ -1803,30 +1814,6 @@ pub unsafe fn bring_up(
     c.responses.set_executable_address(c.destination, kernel_virt);
     fill_executable_file(c.responses, c.destination, len as u64)
         .map_err(BringUpError::Responses)?;
-    // 只扫**已装载段**的文件区间：固件里内存访问极慢，扫全映像不可行。
-    static mut RANGES: [(usize, usize); 16] = [(0, 0); 16];
-    let mut range_count = 0usize;
-    // SAFETY: 引导阶段单线程；本数组在 `enter_kernel` 之前一直有效。
-    let ranges = unsafe { &mut *core::ptr::addr_of_mut!(RANGES) };
-    for segment in &c.segments[..info.segment_count] {
-        if range_count == ranges.len() {
-            break;
-        }
-        let Ok(start) = usize::try_from(segment.p_offset) else {
-            continue;
-        };
-        let Ok(size) = usize::try_from(segment.p_filesz) else {
-            continue;
-        };
-        let Some(end) = start.checked_add(size) else {
-            continue;
-        };
-        if end > len {
-            continue;
-        }
-        ranges[range_count] = (start, end);
-        range_count += 1;
-    }
     let h = Handoff {
         image: &mut c.kernel_out[..len],
         ranges: &ranges[..range_count],
