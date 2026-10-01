@@ -1,9 +1,9 @@
-//! `arch::paging::PageTable` 的 x86_64 实现：4 级页表 + 2 MiB 大页。
+//! `arch::paging::PageTable` 的 x86_64 实现：4 级页表 + 2 MiB 大页 + 4 KiB 小页。
 //!
 //! 页表经直接映射（HHDM）访问：`DirectMap` 由调用方注入，因此宿主测试可以用内存缓冲
 //! 构造"假 HHDM"，真实地走 PML4 -> PDPT -> PD 并断言页表项。
 
-use arch::addr::{Alignment, PhysAddr, PhysFrame, VirtAddr};
+use arch::addr::{Alignment, PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr};
 use arch::hhdm::DirectMap;
 use arch::paging::{FrameAllocator, MapError, PageFlags, PageTable, pages_for, validate_range};
 
@@ -79,6 +79,50 @@ impl<A: FrameAllocator> X86PageTable<A> {
         let base = fresh.start_address().ok_or(MapError::Overflow)?.as_u64();
         self.write_entry(frame, index, base | PTE_PRESENT | PTE_WRITABLE)?;
         Ok(fresh)
+    }
+
+    /// 4 KiB 粒度映射。
+    ///
+    /// 与 `map_range`（2 MiB 大页）并列存在而不是替换它：大页是引导期的主要路径
+    /// （表项少、TLB 压力小），4 KiB 用于**不满足大页对齐**的区间 —— 例如 Limine
+    /// 语义下从 `0x1000` 起的低 4 GiB 恒等映射。此前缺这一能力，调用方被迫从
+    /// `0` 起映射，把**页零**也映射了进去（与 Limine 的唯一已知偏差）。
+    ///
+    /// 页表逐 2 MiB 一张挂在 PD 上（PS=0），PTE 逐 4 KiB 填。权限位与 `map_range`
+    /// 完全一致（present / writable / NX），不引入新的语义。
+    pub fn map_range_pages(
+        &mut self,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        len: u64,
+        flags: PageFlags,
+    ) -> Result<(), MapError> {
+        // 与 map_range 相同的参数校验，但按 4 KiB 对齐判定。
+        validate_range(virt, phys, len, Alignment::PAGE)?;
+        let mut pte_flags = PTE_PRESENT;
+        if flags.is_writable() {
+            pte_flags |= PTE_WRITABLE;
+        }
+        if !flags.is_executable() {
+            pte_flags |= PTE_NX;
+        }
+        let mut remaining = len;
+        let mut v = virt.as_u64();
+        let mut p = phys.as_u64();
+        while remaining > 0 {
+            // 三级下钻：PML4 -> PDPT -> PD ->（本函数创建）PT。
+            // 每张 4 KiB 页表覆盖 2 MiB，挂在 PD 上（PD 项 PS=0）。
+            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF)?;
+            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF)?;
+            let pt = self.table_or_create(pd, (v >> 21) & 0x1FF)?;
+            let pt_index = (v >> 12) & 0x1FF;
+            let pte = (p & FRAME_ADDR_MASK) | pte_flags;
+            self.write_entry(pt, pt_index, pte)?;
+            v += PAGE_SIZE;
+            p += PAGE_SIZE;
+            remaining -= PAGE_SIZE;
+        }
+        Ok(())
     }
 }
 
@@ -244,6 +288,79 @@ mod tests {
         assert_eq!(
             pt.map_range(VirtAddr::new(0x1001), PhysAddr::new(0x2000_0000), 0x1000, PageFlags::present()),
             Err(MapError::MisalignedVirt)
+        );
+    }
+
+    #[test]
+    fn maps_four_kib_pages_with_pte_when_not_large_aligned() {
+        // C1/DEBT-5：4 KiB 粒度。0x1000 起始（页零之后）正是 Limine 低 4 GiB
+        // 映射的形态，也是当前实现做不到、只能从 0 起的缺口。
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        pt.map_range_pages(
+            VirtAddr::new(0x1000),
+            PhysAddr::new(0x1000),
+            4 * LARGE_PAGE_SIZE,
+            PageFlags::present(),
+        )
+        .expect("4 KiB 映射成功");
+        // 从 0x1000 起映射 8 MiB，到 0x801000 止：跨入第 5 个 2 MiB 区间（v>>21 = 0..4），
+        // 所以是根表 1 + PDPT 1 + PD 1 + **5 张 PT** = 8 帧。末页跨区间正是这个测试要抓的。
+        assert_eq!(pt.allocator.allocated(), 8, "应分配 8 帧：根表 + PDPT + PD + 5 张 PT");
+        // 第一张 4 KiB 页表应挂在 PD 的第 0 项，且**不**带 PS 位（PS=0 即 4 KiB 页）。
+        let pd = pd_entry(&pt, VirtAddr::new(0x1000));
+        assert_eq!(pd & 1, 1, "PD 项应存在（指向页表）");
+        assert_eq!(pd & (1 << 7), 0, "PD 项不应带 PS 位（它指向 4 KiB 页表）");
+        // PTE 应落在页表帧的第 1 项（virt 0x1000 -> PT index 1）。
+        let pt_frame = PhysFrame::containing(PhysAddr::new(pd & 0x000F_FFFF_FFFF_F000));
+        let pte = read_entry(&pt, pt_frame, 1);
+        assert_eq!(pte & 1, 1, "PTE 应存在");
+        assert_eq!(
+            pte & 0x000F_FFFF_FFFF_F000,
+            0x1000,
+            "PTE 基址应为物理地址 0x1000",
+        );
+        assert_eq!(pte >> 63, 1, "未请求可执行时应置 NX");
+    }
+
+    #[test]
+    fn four_kib_pages_cover_a_full_large_page_region() {
+        // 跨 2 MiB 边界：4 KiB 页表必须逐 2 MiB 一张地建立。
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        pt.map_range_pages(
+            VirtAddr::new(0x1000),
+            PhysAddr::new(0x1000),
+            4 * LARGE_PAGE_SIZE,
+            PageFlags::present(),
+        )
+        .expect("跨边界 4 KiB 映射成功");
+        for index in 0..4 {
+            let v = VirtAddr::new(0x1000 + index * LARGE_PAGE_SIZE);
+            let pd = pd_entry(&pt, v);
+            assert_eq!(pd & 1, 1, "PD 项 {} 应存在", index);
+            assert_eq!(pd & (1 << 7), 0, "PD 项 {} 不应带 PS 位", index);
+        }
+    }
+
+    #[test]
+    fn rejects_misaligned_four_kib_ranges_like_large_pages_do() {
+        let (mut alloc, dm) = harness(16);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        assert_eq!(
+            pt.map_range_pages(VirtAddr::new(0x1001), PhysAddr::new(0), 0x1000, PageFlags::present()),
+            Err(MapError::MisalignedVirt),
+        );
+        assert_eq!(
+            pt.map_range_pages(VirtAddr::new(0), PhysAddr::new(0x1001), 0x1000, PageFlags::present()),
+            Err(MapError::MisalignedPhys),
+        );
+        assert_eq!(
+            pt.map_range_pages(VirtAddr::new(0), PhysAddr::new(0), 0, PageFlags::present()),
+            Err(MapError::Empty),
         );
     }
 
