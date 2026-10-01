@@ -22,7 +22,7 @@ use current::X86PageTable;
 use firmware::block::DeviceIndex;
 use firmware_current::current::{
     ALLOCATE_ANY_PAGES, AllocatePages, BootServicesTable, EFI_LOADER_DATA, EfiFrameAllocator,
-    ExitBootServices, Handle, SUCCESS, SystemTable, UefiBlockDevices, UefiBootServices,
+    ExitBootServices, Handle, SUCCESS, SystemTable, UefiBlockDevices, UefiBootServices, acpi_rsdp,
     UefiMemoryMapSource, boot_services_of,
 };
 
@@ -136,6 +136,7 @@ pub fn start_with<P: Platform>(
             responses: &mut *core::ptr::addr_of_mut!(RESPONSES),
             map_key: &mut *core::ptr::addr_of_mut!(MAP_KEY),
             destination: destination_phys,
+            rsdp: acpi_rsdp(&*system_table),
         };
         // SAFETY: 由 `check_before_entry` 与页表规划共同保证（见 `bring_up` 文档）。
         bring_up(&*boot_services, image_handle, c, |entry| <P as Platform>::jump_to(entry))
@@ -1358,6 +1359,8 @@ pub struct BringUp<'a, 'b> {
     pub map_key: &'a mut Option<usize>,
     /// 内核段拷入的**物理目标基址**（须按大页对齐，由调用方选定）。
     pub destination: u64,
+    /// ACPI 的 RSDP（从固件配置表取；没有就是 `None`，不编造）。
+    pub rsdp: Option<*mut core::ffi::c_void>,
 }
 
 /// 交接失败原因（保留环节）。
@@ -1643,6 +1646,10 @@ pub unsafe fn bring_up(
     // HHDM 偏移是**必须**的：内核靠它把物理地址翻成虚拟地址。不填（或填 0）它会算错地址，
     // 真实运行里表现为跳转后立刻复位 —— 这很可能就是复位的原因。
     c.responses.set_hhdm_offset(HHDM_OFFSET);
+    // RSDP 只在**真的从配置表找到**时才填；没有就留空 —— 给假指针比不给更糟。
+    if let Some(rsdp) = c.rsdp {
+        c.responses.set_rsdp(rsdp);
+    }
     // 可执行地址与可执行文件：两者的值我们**自己就知道**（装载决策），不需要问固件。
     c.responses.set_executable_address(c.destination, kernel_virt);
     fill_executable_file(c.responses, c.destination, len as u64)
