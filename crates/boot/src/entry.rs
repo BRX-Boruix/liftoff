@@ -1714,6 +1714,19 @@ pub unsafe fn bring_up(
             }
             crate::PlatformImpl::write_byte(b'\n');
         }
+        // **规模-时间判据**：同一次运行里扫 64 KB / 256 KB / 1 MB，各打一个标记。
+        // 出现到哪一个，就说明扫描在固件里的实际速度量级；只出现第一个，
+        // 说明卡点在 64 KB 与 256 KB 之间的某个具体位置（那就继续二分到字节）。
+        {
+            let mut part = [RequestHit::EMPTY; 64];
+            let _ = limine::scan::scan_requests(&c.kernel_out[..64 << 10], &mut part);
+            crate::PlatformImpl::write_byte(b'A');
+            let _ = limine::scan::scan_requests(&c.kernel_out[..256 << 10], &mut part);
+            crate::PlatformImpl::write_byte(b'B');
+            let _ = limine::scan::scan_requests(&c.kernel_out[..1024 << 10], &mut part);
+            crate::PlatformImpl::write_byte(b'C');
+            crate::PlatformImpl::write_byte(b'\n');
+        }
         // 分块扫描并**每 4 MB 打一个点**：点持续出现＝只是慢；点停住＝某段卡住。
         let mut total = 0usize;
         {
