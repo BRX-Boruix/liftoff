@@ -135,7 +135,7 @@ core::arch::global_asm!(
     "    mov ecx, 0x277",
     "    wrmsr",
     "2:",
-    "    cmp dword ptr [esp+4], 0",
+    "    cmp dword ptr [esp+0], 0",
     "    je 3f",
     "    mov eax, cr4",
     "    bts eax, 12",
@@ -145,7 +145,7 @@ core::arch::global_asm!(
     "    bts eax, 16",
     "    mov cr0, eax",
     "    cld",
-    "    mov eax, [esp+8]",
+    "    mov eax, [esp+4]",
     "    mov cr3, eax",
     "    mov eax, cr4",
     "    bts eax, 5",
@@ -153,7 +153,7 @@ core::arch::global_asm!(
     "    mov ecx, 0xc0000080",
     "    xor edx, edx",
     "    mov eax, 1 << 8",
-    "    cmp dword ptr [esp+32], 0",
+    "    cmp dword ptr [esp+28], 0",
     "    je 4f",
     "    or eax, 1 << 11",
     "4:",
@@ -176,9 +176,9 @@ core::arch::global_asm!(
     "    mov fs, eax",
     "    mov gs, eax",
     "    mov ss, eax",
-    "    mov rax, [rsp+32]",
+    "    mov rax, [rsp+28]",
     "    lgdt [rax]",
-    "    mov rax, [rsp+40]",
+    "    mov rax, [rsp+36]",
     "    add rsp, rax",
     "    call 7f",
     "7:",
@@ -188,7 +188,7 @@ core::arch::global_asm!(
     "    add qword ptr [rsp], rax",
     "    retf",
     "8:",
-    "    cmp dword ptr [rsp+48], 1",
+    "    cmp dword ptr [rsp+44], 1",
     "    jb 9f",
     "    mov rsi, cr3",
     "    lea rdi, [rsi + rax]",
@@ -197,10 +197,10 @@ core::arch::global_asm!(
     "    rep stosq",
     "    mov cr3, rsi",
     "9:",
-    "    mov rsi, [rsp+24]",
+    "    mov rsi, [rsp+20]",
     "    sub rsi, 8",
     "    mov qword ptr [rsi], 0",
-    "    mov rax, [rsp+16]",
+    "    mov rax, [rsp+12]",
     "    push 0x30",
     "    push rsi",
     "    push 0x2",
@@ -243,10 +243,8 @@ core::arch::global_asm!(
 pub struct SpinupArgs {
     /// 5 级分页？（我们不启用）。
     pub level5pg: u32,
-    /// PML4 物理地址低 32 位。
-    pub pagemap_top_lo: u32,
-    /// PML4 物理地址高 32 位（应为 0，表在低 4G 内）。
-    pub pagemap_top_hi: u32,
+    /// PML4 物理地址（低 4G 内，高 32 位为 0）。
+    pub pagemap_top: u32,
     /// 内核入口低 32 位。
     pub entry_lo: u32,
     /// 内核入口高 32 位。
@@ -255,10 +253,8 @@ pub struct SpinupArgs {
     pub stack_lo: u32,
     /// 内核栈顶高 32 位。
     pub stack_hi: u32,
-    /// 自建 GDT 指针低 32 位（指向低地址缓冲里的 GDT）。
-    pub gdt_lo: u32,
-    /// GDT 指针高 32 位（0）。
-    pub gdt_hi: u32,
+    /// 自建 GDT 指针（低 4G 内）。
+    pub gdt: u32,
     /// NX 可用（1）。
     pub nx_available: u32,
     /// direct map offset 低 32 位。
