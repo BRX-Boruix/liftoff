@@ -124,7 +124,9 @@ pub const fn layout(go32_len: usize, spinup32_len: usize) -> (usize, usize, usiz
 
 #[cfg(target_os = "uefi")]
 core::arch::global_asm!(
-    ".section .text.spinup",
+    // 必须落在标准 .text 段：自定义段名会被 PE 工具截断并标成 DATA，
+    // 固件可能因此把它映射成不可执行，跳进去就故障。
+    ".section .text",
     ".global spinup_common64",
     ".global spinup_go32",
     ".global spinup_go32_end",
