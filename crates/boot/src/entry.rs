@@ -287,6 +287,9 @@ pub unsafe fn handoff(
                 unsafe {
                     core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
                 }
+                // 活着的证据：cli 之后还能执行（栈与代码都可达）。
+                #[cfg(target_os = "uefi")]
+                crate::PlatformImpl::write_byte(b'K');
                 return Ok(count);
             }
             Err(err) => {
