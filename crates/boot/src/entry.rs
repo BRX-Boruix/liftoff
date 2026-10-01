@@ -847,6 +847,9 @@ where
     // 交接的最后一步：跳进低地址 trampoline —— 重设机器状态（降 32 位关分页
     // → 按 Limine 语义重建分页 → 重进 64 位 → iretq 全 GPR 清零）→ 进内核。
     // SAFETY: trampoline 在 Exit 前已搬进低地址缓冲；Exit 成功后只有寄存器操作安全。
+    for byte in b"[liftoff] G-\n" as &[u8] {
+        crate::PlatformImpl::write_byte(*byte);
+    }
     unsafe { spinup::spinup_go(h.spinup_go32, h.spinup_stack_top, h.spinup_args, h.spinup_go32) }
 }
 
