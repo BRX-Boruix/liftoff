@@ -4,7 +4,6 @@
 //! 平台与固件实现的**选择**来自门面（`crate::PlatformImpl`、`firmware_current::current`），
 //! 本模块不自己挑实现。
 
-use arch::paging::PageTable;
 use loader::elf::{ElfError, ProgramHeader, load_segments, parse_elf_header, parse_load_segments};
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
@@ -18,7 +17,7 @@ use mm::takeover::{MustStay, TakeoverError};
 use firmware::error::Error;
 use arch::addr::PhysAddr;
 use arch::hhdm::DirectMap;
-use arch::paging::{FrameAllocator, PageFlags};
+use arch::paging::{FrameAllocator, PageFlags, PageTable};
 use current::X86PageTable;
 use firmware::block::DeviceIndex;
 use firmware_current::current::{
@@ -756,7 +755,11 @@ pub enum HandoffError {
 /// # Safety
 ///
 /// 由 `enter` 的实现与调用方共同保证：跳转后不再调用任何固件服务，且目标已映射。
-pub unsafe fn enter_kernel<F>(h: Handoff<'_, '_>, enter: F) -> Result<usize, HandoffError>
+pub unsafe fn enter_kernel<F, P: PageTable>(
+    h: Handoff<'_, '_>,
+    page_table: &mut P,
+    enter: F,
+) -> Result<usize, HandoffError>
 where
     F: FnOnce(u64) -> !,
 {
@@ -789,13 +792,31 @@ where
             HandoffError::Exit(err)
         })?;
     let _ = report;
-    // **Exit 成功之后到 `enter(entry)` 之间必须没有任何其他操作**：引导服务已失效，
-    // 固件随时可能回收我们仍在借用的资源 —— 真机数据显示 Exit 后从未回到我们代码。
+    // **Exit 成功之后立刻激活并跳转**：引导服务已失效，只有纯寄存器操作是安全的。
+    // 真机数据显示「先激活再 Exit」会让固件在 Exit 内部挂死 —— 所以激活必须放这里。
+    // SAFETY: 页表在此前已完整构建（apply + copy 已通过），恒等映射保证本函数的代码与栈仍可达。
+    unsafe { page_table.activate() };
     enter(entry);
 }
 
 #[cfg(test)]
 mod enter_kernel_tests {
+    use super::PageTable;
+    use arch::paging::MapError;
+    /// 宿主假表：什么都不做（激活在宿主测试里永远不该真的发生）。
+    pub(super) struct StubTable;
+    impl PageTable for StubTable {
+        fn map_range(
+            &mut self,
+            _virt: VirtAddr,
+            _phys: PhysAddr,
+            _len: u64,
+            _flags: PageFlags,
+        ) -> Result<(), MapError> {
+            Ok(())
+        }
+        unsafe fn activate(&self) {}
+    }
     use super::{EntryError, Handoff, HandoffError, enter_kernel};
     use core::ffi::c_void;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -908,7 +929,8 @@ mod enter_kernel_tests {
             image_handle: core::ptr::null_mut(),
             map_key: &mut slot,
         };
-        let result = unsafe { enter_kernel(h, counting_enter) };
+        let mut stub_table = StubTable;
+        let result = unsafe { enter_kernel(h, &mut stub_table, counting_enter) };
         assert_eq!(
             result,
             Err(HandoffError::BeforeEntry(EntryError::NotCovered {
@@ -944,7 +966,8 @@ mod enter_kernel_tests {
             image_handle: core::ptr::null_mut(),
             map_key: &mut slot,
         };
-        let result = unsafe { enter_kernel(h, counting_enter) };
+        let mut stub_table = StubTable;
+        let result = unsafe { enter_kernel(h, &mut stub_table, counting_enter) };
         assert_eq!(
             result,
             Err(HandoffError::BeforeEntry(EntryError::NoEntry)),
@@ -956,6 +979,7 @@ mod enter_kernel_tests {
 
 #[cfg(test)]
 mod enter_kernel_success_tests {
+    use super::enter_kernel_tests::StubTable;
     use super::{Handoff, enter_kernel};
     use crate::responses::Responses;
     use core::ffi::c_void;
@@ -1073,7 +1097,8 @@ mod enter_kernel_success_tests {
             map_key: &mut slot,
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            enter_kernel(h, recording_enter)
+            let mut stub_table = StubTable;
+            enter_kernel(h, &mut stub_table, recording_enter)
         }));
         assert!(outcome.is_err(), "编排必然以跳转结束（测试替身用 panic 截住）");
         assert_eq!(ENTER_ENTRY.load(Ordering::SeqCst), entry as usize, "必须跳到内核入口");
@@ -1718,7 +1743,10 @@ pub unsafe fn bring_up(
         map_key: c.map_key,
     };
     // SAFETY: 由调用方保证（见函数文档）。
-    unsafe { enter_kernel(h, enter) }.map_err(BringUpError::Handoff)?;
+    // **激活移到 Exit 之后**：真机数据显示，先激活再调 ExitBootServices 时，
+    // 固件在 Exit 内部访问其数据结构会挂死（h: exit 后从不返回，且无 REFUSED/INVALID）。
+    // 顺序改为：Exit（引导服务失效前最后一次固件交互）→ 切 CR3 → 立即跳转。
+    unsafe { enter_kernel(h, &mut page_table, enter) }.map_err(BringUpError::Handoff)?;
     Ok(())
 }
 
