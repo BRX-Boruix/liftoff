@@ -46,6 +46,170 @@ pub enum ElfError {
     NoLoadSegments,
     /// 调用方给的输出缓冲太小。
     BufferTooSmall,
+    /// `ET_DYN` 但没有 `PT_DYNAMIC` 段（无法做重定位）。
+    NoDynamicSegment,
+    /// 重定位表本身不合法，或含有我们不支持的类型。
+    ///
+    /// 当前只支持「整张表都是 `R_X86_64_RELATIVE`」这一种情形（由 `DT_RELACOUNT`
+    /// 声明）—— **不静默跳过**任何条目。
+    BadRelocationTable,
+}
+
+/// `PT_DYNAMIC`。
+pub const PT_DYNAMIC: u32 = 2;
+/// 动态表终止项。
+pub const DT_NULL: u64 = 0;
+/// `DT_RELA` / `DT_RELASZ` / `DT_RELAENT` / `DT_RELACOUNT`。
+pub const DT_RELA: u64 = 7;
+pub const DT_RELASZ: u64 = 8;
+pub const DT_RELAENT: u64 = 9;
+pub const DT_RELACOUNT: u64 = 0x6fff_fff9;
+/// `R_X86_64_RELATIVE`：`*(r_offset + slide) = slide + r_addend`。
+pub const R_X86_64_RELATIVE: u32 = 8;
+
+/// 一条要写进内核内存的重定位（地址与值都已含 `slide`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Relocation {
+    /// 目标虚拟地址。
+    pub address: u64,
+    /// 应写入的 8 字节值。
+    pub value: u64,
+}
+
+/// `R_X86_64_RELATIVE` 重定位的惰性迭代器（不分配内存）。
+#[derive(Clone, Copy, Debug)]
+pub struct RelativeRelocations<'a> {
+    image: &'a [u8],
+    table: usize,
+    remaining: usize,
+    entry: usize,
+    slide: u64,
+}
+
+impl Iterator for RelativeRelocations<'_> {
+    type Item = Relocation;
+
+    fn next(&mut self) -> Option<Relocation> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let at = self.table;
+        self.table += self.entry;
+        let r_offset = le_u64(self.image, at)?;
+        let r_addend = le_u64(self.image, at + 16)? as i64;
+        Some(Relocation {
+            address: r_offset.wrapping_add(self.slide),
+            value: (r_addend as u64).wrapping_add(self.slide),
+        })
+    }
+}
+
+fn le_u64(raw: &[u8], at: usize) -> Option<u64> {
+    let bytes = raw.get(at..at.checked_add(8)?)?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(bytes);
+    Some(u64::from_le_bytes(buf))
+}
+
+fn le_u32(raw: &[u8], at: usize) -> Option<u32> {
+    let bytes = raw.get(at..at.checked_add(4)?)?;
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(bytes);
+    Some(u32::from_le_bytes(buf))
+}
+
+/// 把虚拟地址翻译成文件偏移（只用 `PT_LOAD` 段）。
+fn vaddr_to_file_offset(image: &[u8], hdr: &ElfHeader, vaddr: u64) -> Option<usize> {
+    for index in 0..hdr.e_phnum as usize {
+        let at = hdr.e_phoff as usize + index * hdr.e_phentsize as usize;
+        if le_u32(image, at)? != 1 {
+            continue; // 只看 PT_LOAD
+        }
+        let p_offset = le_u64(image, at + 8)?;
+        let p_vaddr = le_u64(image, at + 16)?;
+        let p_filesz = le_u64(image, at + 32)?;
+        let end = p_vaddr.checked_add(p_filesz)?;
+        if vaddr >= p_vaddr && vaddr < end {
+            let delta = vaddr - p_vaddr;
+            let file = p_offset.checked_add(delta)?;
+            return usize::try_from(file).ok();
+        }
+    }
+    None
+}
+
+/// 解析 `ET_DYN` 映像的 `R_X86_64_RELATIVE` 重定位表。
+///
+/// `slide` = 实际装载地址 − 链接期虚拟地址（按链接地址装载时为 0）。
+///
+/// # 为什么必须做
+///
+/// PIE 内核的数据段里存的是**链接期地址**，而 `.rela.dyn` 保存的是「应该写什么」。
+/// 不应用重定位，那些槽位就保持文件里的 0 —— 实测后果：内核 `_start` 从
+/// `0xffffffff809b0550` 读自己的栈指针，读到 0，`mov %rcx,%rsp` 后立刻压栈崩溃。
+pub fn relative_relocations(image: &[u8], slide: u64) -> Result<RelativeRelocations<'_>, ElfError> {
+    let hdr = parse_elf_header(image)?;
+    if hdr.e_type != ET_DYN {
+        return Err(ElfError::UnsupportedType);
+    }
+    // 找 PT_DYNAMIC。
+    let mut dynamic: Option<(usize, usize)> = None;
+    for index in 0..hdr.e_phnum as usize {
+        let at = hdr.e_phoff as usize + index * hdr.e_phentsize as usize;
+        if le_u32(image, at).ok_or(ElfError::BadProgramHeader)? != PT_DYNAMIC {
+            continue;
+        }
+        let p_offset = le_u64(image, at + 8).ok_or(ElfError::BadProgramHeader)?;
+        let p_filesz = le_u64(image, at + 32).ok_or(ElfError::BadProgramHeader)?;
+        dynamic = Some((
+            usize::try_from(p_offset).map_err(|_| ElfError::BadProgramHeader)?,
+            usize::try_from(p_filesz).map_err(|_| ElfError::BadProgramHeader)?,
+        ));
+        break;
+    }
+    let (dyn_at, dyn_len) = dynamic.ok_or(ElfError::NoDynamicSegment)?;
+    // 遍历动态表，收集需要的 DT_*。
+    let mut rela_vaddr: Option<u64> = None;
+    let mut rela_size: u64 = 0;
+    let mut rela_ent: u64 = 24;
+    let mut rela_count: Option<u64> = None;
+    let entries = dyn_len / 16;
+    for index in 0..entries {
+        let at = dyn_at + index * 16;
+        let tag = le_u64(image, at).ok_or(ElfError::BadRelocationTable)?;
+        let val = le_u64(image, at + 8).ok_or(ElfError::BadRelocationTable)?;
+        match tag {
+            DT_NULL => break,
+            DT_RELA => rela_vaddr = Some(val),
+            DT_RELASZ => rela_size = val,
+            DT_RELAENT => rela_ent = val,
+            DT_RELACOUNT => rela_count = Some(val),
+            _ => {}
+        }
+    }
+    let rela_vaddr = rela_vaddr.ok_or(ElfError::BadRelocationTable)?;
+    if rela_ent != 24 || rela_size == 0 || rela_size % rela_ent != 0 {
+        return Err(ElfError::BadRelocationTable);
+    }
+    let count = rela_size / rela_ent;
+    // 只支持「整张表都是 RELATIVE」：由 DT_RELACOUNT 明确声明。
+    if rela_count != Some(count) {
+        return Err(ElfError::BadRelocationTable);
+    }
+    let table = vaddr_to_file_offset(image, &hdr, rela_vaddr).ok_or(ElfError::BadRelocationTable)?;
+    let end = table.checked_add(usize::try_from(rela_size).map_err(|_| ElfError::BadRelocationTable)?)
+        .ok_or(ElfError::BadRelocationTable)?;
+    if end > image.len() {
+        return Err(ElfError::BadRelocationTable);
+    }
+    Ok(RelativeRelocations {
+        image,
+        table,
+        remaining: usize::try_from(count).map_err(|_| ElfError::BadRelocationTable)?,
+        entry: 24,
+        slide,
+    })
 }
 
 /// ELF64 头的关键字段。
@@ -712,5 +876,68 @@ mod section_range_tests {
         // 只断言「不存在的节名 → None」。空名字的匹配对象（节 0 与名表自身的空名）
         // 在协议里没有意义，不在此规定行为。
         assert_eq!(section_file_range(&image, ".rodata"), None);
+    }
+}
+#[cfg(test)]
+mod relocation_tests {
+    extern crate std;
+
+    use super::{relative_relocations, Relocation};
+    use std::vec::Vec;
+
+    /// 真实内核在 ISO 里的位置（extent LBA 33、24,619,400 字节）。
+    const KERNEL_LBA: usize = 33;
+    const BLOCK: usize = 2048;
+    const KERNEL_BYTES: usize = 24_619_400;
+
+    fn real_kernel() -> Vec<u8> {
+        // 用**我们实际装载的那份内核**（ISO 里的 `/boot/kernel`），不是内核仓库的构建产物。
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
+        let iso = std::fs::read(path).expect("读 boruix.iso（真实产物）");
+        let start = KERNEL_LBA * BLOCK;
+        iso[start..start + KERNEL_BYTES].to_vec()
+    }
+
+    /// 真实内核是 `ET_DYN`，`DT_RELACOUNT` 声明整张 `.rela.dyn` 都是
+    /// `R_X86_64_RELATIVE` —— 条数与大小必须严格对上，不能靠猜。
+    #[test]
+    fn real_kernel_rela_table_is_entirely_relative() {
+        let image = real_kernel();
+        let all: Vec<Relocation> = relative_relocations(&image, 0)
+            .expect("解析真实内核的重定位表")
+            .collect();
+        assert_eq!(all.len(), 17_706, "DT_RELACOUNT = 0x452a");
+    }
+
+    /// **这条重定位就是内核启动失败的直接原因**：内核 `_start` 从
+    /// `0xffffffff809b0550` 读自己的栈指针，文件里是 0，只有应用重定位
+    /// 才会变成 `0xffffffff809af000`。
+    #[test]
+    fn real_kernel_relocates_the_stack_pointer_global() {
+        let image = real_kernel();
+        let hit = relative_relocations(&image, 0)
+            .expect("解析真实内核的重定位表")
+            .find(|r| r.address == 0xffff_ffff_809b_0550)
+            .expect("必须存在 0xffffffff809b0550 的重定位");
+        assert_eq!(hit.value, 0xffff_ffff_809a_f000, "r_addend = -0x7f651000");
+    }
+
+    /// `slide` 必须同时加到目标地址与写入值上。
+    #[test]
+    fn slide_is_applied_to_both_address_and_value() {
+        let image = real_kernel();
+        let hit = relative_relocations(&image, 0x1000)
+            .expect("解析真实内核的重定位表")
+            .find(|r| r.address == 0xffff_ffff_809b_1550)
+            .expect("带 slide 时目标地址也要平移");
+        assert_eq!(hit.value, 0xffff_ffff_809a_f000 + 0x1000);
+    }
+
+    /// 非 `ET_DYN` 映像不该走重定位路径。
+    #[test]
+    fn rejects_non_dyn_images() {
+        let mut image = real_kernel();
+        image[16] = 2; // e_type = ET_EXEC
+        assert!(relative_relocations(&image, 0).is_err());
     }
 }
