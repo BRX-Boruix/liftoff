@@ -776,15 +776,9 @@ where
     // 映射条目数只作诊断：本函数**必然发散**（`enter` 的返回类型是 `!`），故显式标记为有意不用。
     let _count = unsafe { handoff(h.source, h.map_buffer, h.exit, h.image_handle, h.map_key) }
         .map_err(HandoffError::Exit)?;
-    #[cfg(target_os = "uefi")]
-    for byte in b"[liftoff] exited\n" as &[u8] {
-        crate::PlatformImpl::write_byte(*byte);
-    }
     let _ = report;
-    #[cfg(target_os = "uefi")]
-    for byte in b"[liftoff] jumping\n" as &[u8] {
-        crate::PlatformImpl::write_byte(*byte);
-    }
+    // **Exit 成功之后到 `enter(entry)` 之间必须没有任何其他操作**：引导服务已失效，
+    // 固件随时可能回收我们仍在借用的资源 —— 真机数据显示 Exit 后从未回到我们代码。
     enter(entry);
 }
 
