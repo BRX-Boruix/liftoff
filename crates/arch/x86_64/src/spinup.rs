@@ -267,3 +267,70 @@ pub struct SpinupArgs {
     /// base revision（1 = unmap lower half）。
     pub base_revision: u32,
 }
+
+unsafe extern "C" {
+    static spinup_text_start: u8;
+    static spinup_text_end: u8;
+    fn spinup_common64();
+}
+
+/// Exit 前调用：把汇编体、GDT、参数、低栈搬进 `buffer`（< 4 GiB）。
+/// 返回 `(go32_entry, stack_top, args_ptr)` —— 全部是低地址。
+///
+/// # Safety
+///
+/// `buffer` 必须指向 `buffer_len` 的可写内存，且 Exit 后保持有效。
+pub unsafe fn stage_low_buffer(
+    buffer: *mut u8,
+    buffer_len: usize,
+    args: &SpinupArgs,
+) -> Option<(usize, usize, usize)> {
+    let text_start = &raw const spinup_text_start as usize;
+    let text_end = &raw const spinup_text_end as usize;
+    let text_len = text_end.checked_sub(text_start)?;
+    let total = text_len + 72 + 52 + 4096;
+    if buffer_len < total {
+        return None;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(text_start as *const u8, buffer, text_len);
+        let gdt_at = buffer as usize + text_len;
+        for (index, word) in build_gdt().iter().enumerate() {
+            core::ptr::write_unaligned((gdt_at + index * 8) as *mut u64, *word);
+        }
+        let args_at = gdt_at + 72;
+        let words = [
+            args.level5pg, args.pagemap_top, args.entry_lo, args.entry_hi,
+            args.stack_lo, args.stack_hi, args.gdt, args.nx_available,
+            args.dmo_lo, args.dmo_hi, args.base_revision, 0, 0,
+        ];
+        for (index, word) in words.iter().enumerate() {
+            core::ptr::write_unaligned((args_at + index * 4) as *mut u32, *word);
+        }
+    }
+    let stack_top = buffer as usize + total;
+    Some((buffer as usize, stack_top, buffer as usize + text_len + 72))
+}
+
+/// Exit 后调用：跳进低地址 trampoline（不返回）。
+///
+/// # Safety
+///
+/// 只能 Exit 成功后调用一次；三个指针必须来自 [`stage_low_buffer`]。
+pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize) -> ! {
+    // SAFETY: 调用方保证三指针来自 stage_low_buffer 且 Exit 已成功；
+    // jmp 目标是本模块汇编导出的 64 位入口（不返回）。
+    unsafe {
+        core::arch::asm!(
+            "mov rdi, {go32}",
+            "mov rsi, {stack}",
+            "mov rdx, {args}",
+            "jmp {enter}",
+            go32 = in(reg) go32,
+            stack = in(reg) stack_top,
+            args = in(reg) args,
+            enter = sym spinup_common64,
+            options(noreturn),
+        )
+    }
+}
