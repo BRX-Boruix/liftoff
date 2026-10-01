@@ -1610,18 +1610,26 @@ pub fn build_plan(request: &PlanRequest<'_>, out: &mut [Mapping]) -> Result<usiz
     // **大页对齐**：低 4 GiB 恒等映射必须走 2 MiB 大页 —— 若用 4 KiB 粒度，
     // 4 GiB / 2 MiB = 2048 张页表，真机帧预算根本供不起（实测：apply 直接
     // OutOfMemory，`entry failed`）。所以仍从 `0` 起，**多映射页零**是与 Limine
-    // 的已知偏差；消掉它需要「先大页覆盖 2 MiB 对齐主体 + 4 KiB 精修头部」的
-    // 混合方案，那会显著复杂化 apply 的失败语义，暂不做（记入台账）。
+    // 的已知偏差。
+    //
+    // **混合粒度（头部 2 MiB 用 4 KiB、主体用大页）曾尝试过并真机失败**：它撞上
+    // 一个与特性无关的潜在缺陷 —— `plan_identity` 先在该 PD 项建了 2 MiB 大页，
+    // 而 `table_or_create` **不检查 PS 位**，于是把大页的物理地址当作页表帧地址，
+    // 往任意物理内存写 PTE → 内存损坏 → 复位循环。**要消掉页零偏差，必须先让
+    // `table_or_create` 正确处理「此处已有更大粒度的映射」（报错或拆分）。**
+    //
+    // 缓冲不足时报错而不是静默跳过：丢掉必需映射 = 换表即故障。
     {
-        if total < out.len() {
-            out[total] = Mapping {
-                virt: arch::addr::VirtAddr::new(0),
-                phys: arch::addr::PhysAddr::new(0),
-                len: 0x1_0000_0000u64,
-                flags: identity_flags,
-            };
-            total += 1;
+        if total + 1 > out.len() {
+            return Err(PlanBuildError::Plan(PlanError::BufferTooSmall));
         }
+        out[total] = Mapping {
+            virt: arch::addr::VirtAddr::new(0),
+            phys: arch::addr::PhysAddr::new(0),
+            len: 0x1_0000_0000u64,
+            flags: identity_flags,
+        };
+        total += 1;
     }
     // 三段各自给权限：`[0, kernel)` / `[kernel, kernel+hhdm)` / 其余（恒等 + 低 4 GiB）。
     for (index, mapping) in out[..total].iter_mut().enumerate() {
@@ -2189,15 +2197,19 @@ mod build_plan_tests {
 
     #[test]
     fn the_low_4gib_identity_mapping_uses_a_large_page_from_zero() {
-        // 这不是「照抄 Limine」，而是**实测后的工程决策**：Limine 用 4 KiB 页从
-        // 0x1000 起，但那需要 4 GiB / 2 MiB = 2048 张页表，真机帧预算供不起
-        // （实测 apply 直接 OutOfMemory，`entry failed`）。所以用 2 MiB 大页从
-        // 0 起映射到 4 GiB —— 代价是多映射页零这 4 KiB，是与 Limine 的已知偏差。
+        // **从 0 起是当前的必要选择，不是偷懒**：若全部用 4 KiB，4 GiB / 2 MiB
+        // = 2048 张页表，真机帧预算供不起（实测 apply OutOfMemory、`entry failed`）。
+        //
+        // 混合粒度（头部 2 MiB 用 4 KiB + 主体大页）也试过并**真机失败**：`plan_identity`
+        // 先在该 PD 项建了 2 MiB 大页，而 `table_or_create` 当时**不检查 PS 位**，
+        // 把大页的页帧基址当成页表帧地址 → 往任意物理内存写 PTE → 复位循环。
+        // **那个缺陷已修**（现在报 `AlreadyMappedLarger`，见 `paging.rs` 的护栏测试），
+        // 所以混合粒度**重新成为可行方向** —— 但它需要「拆分已存在的大页」这一步，
+        // 尚未实现。在那之前，多映射页零是与 Limine 的已知偏差。
         let hhdm = [range(0x1000_0000, LARGE)];
-        let identity = [];
         let mut plan = [Mapping::EMPTY; 64];
         let count = build_plan(
-            &request(0x20_0000, 0xffff_ffff_8000_0000, LARGE, &hhdm, &identity, LARGE),
+            &request(0x20_0000, 0xffff_ffff_8000_0000, LARGE, &hhdm, &[], LARGE),
             &mut plan,
         )
         .expect("规划应成功");
@@ -2205,10 +2217,9 @@ mod build_plan_tests {
             .iter()
             .find(|m| m.virt.as_u64() < 0x1_0000_0000)
             .expect("低 4 GiB 恒等映射必须在");
-        assert_eq!(low.virt.as_u64(), 0, "必须从 0 起（大页对齐要求）");
+        assert_eq!(low.virt.as_u64(), 0, "当前必须从 0 起（大页对齐要求）");
         assert_eq!(low.len, 0x1_0000_0000, "必须覆盖整个低 4 GiB（含 MMIO）");
-        // 必须是大页：2 MiB 对齐的长度倍数，供 map_range 走大页路径。
-        assert_eq!(low.len % (2 * 1024 * 1024), 0, "长度必须是 2 MiB 的倍数");
+        assert_eq!(low.len % LARGE, 0, "长度必须是 2 MiB 的倍数，供大页路径使用");
     }
 
     /// **实测约束**：数据映射（HHDM / 恒等 / 低 4 GiB）必须**可执行**。

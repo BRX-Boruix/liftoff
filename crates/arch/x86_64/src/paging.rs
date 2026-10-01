@@ -98,6 +98,12 @@ impl<A: FrameAllocator> X86PageTable<A> {
     fn table_or_create(&mut self, frame: PhysFrame, index: u64) -> Result<PhysFrame, MapError> {
         let entry = self.read_entry(frame, index)?;
         if entry & PTE_PRESENT != 0 {
+            // **必须检查 PS 位。** 若此处已是 2 MiB / 1 GiB 大页，项里存的是**页帧
+            // 基址**而不是页表帧地址；不检查就会把大页指向的物理内存当作页表来写 ——
+            // 往任意物理地址写 PTE，是静默的内存损坏（真机表现为复位循环，已实测）。
+            if entry & PTE_HUGE != 0 {
+                return Err(MapError::AlreadyMappedLarger);
+            }
             return Ok(PhysFrame::containing(PhysAddr::new(entry & FRAME_ADDR_MASK)));
         }
         let fresh = self.allocator.allocate_zeroed().ok_or(MapError::OutOfMemory)?;
@@ -471,6 +477,36 @@ mod tests {
         assert_eq!(phys.as_u64(), expected, "大页内偏移必须保留");
         assert!(flags.is_executable(), "请求了可执行 -> NX 未置位");
         assert!(!flags.is_writable(), "未请求可写");
+    }
+
+    #[test]
+    fn refuses_to_descend_into_an_existing_large_page() {
+        // 潜在损坏缺陷的回归护栏：先建 2 MiB 大页，再在同一 2 MiB 区间里建 4 KiB 页。
+        // 旧实现在 `table_or_create` 里只看 present 位，会把**大页的页帧基址**当成
+        // 页表帧地址，然后往那块物理内存写 PTE —— 静默损坏，真机表现为复位循环。
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        pt.map_range(
+            VirtAddr::new(0x200000),
+            PhysAddr::new(0x400000),
+            LARGE_PAGE_SIZE,
+            PageFlags::present(),
+        )
+        .expect("大页映射成功");
+        let before = pt.allocator.allocated();
+        let result = pt.map_range_pages(
+            VirtAddr::new(0x201000),
+            PhysAddr::new(0x5000),
+            PAGE_SIZE,
+            PageFlags::present(),
+        );
+        assert_eq!(result, Err(MapError::AlreadyMappedLarger), "必须拒绝下钻，而不是损坏内存");
+        assert_eq!(
+            pt.allocator.allocated(),
+            before,
+            "拒绝必须发生在**分配页表帧之前** —— 分配了就意味着已经开始写别人的内存",
+        );
     }
 
     #[test]
