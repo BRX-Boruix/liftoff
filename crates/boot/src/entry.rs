@@ -254,22 +254,49 @@ pub unsafe fn handoff(
     for byte in b"[liftoff] h: mmap\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
-    let map = source.memory_map(map_buffer)?;
-    let count = map.len();
-    #[cfg(target_os = "uefi")]
-    for byte in b"[liftoff] h: key\n" as &[u8] {
-        crate::PlatformImpl::write_byte(*byte);
+    // **重试循环**（对照 brxLimine common/lib/misc.c:380 的 128 次重试）：
+    // map_key 会因任何内存分配而失效 —— 而引导器自身在此期间做了大量分配 ——
+    // 所以第一次 Exit 几乎必然被拒；每次被拒都要**重新取映射 + 重新取键** 再试。
+    // （不带 /T 的 taskkill 曾让脚本挂死，那是宿主脚本问题，与此无关。）
+    let mut retries = 0usize;
+    loop {
+        let map = source.memory_map(map_buffer)?;
+        let count = map.len();
+        #[cfg(target_os = "uefi")]
+        for byte in b"[liftoff] h: key\n" as &[u8] {
+            crate::PlatformImpl::write_byte(*byte);
+        }
+        if !capture_map_key(source, map_key) {
+            return Err(Error::InvalidState);
+        }
+        #[cfg(target_os = "uefi")]
+        for byte in b"[liftoff] h: exit\n" as &[u8] {
+            crate::PlatformImpl::write_byte(*byte);
+        }
+        // SAFETY: 由调用方保证（见函数文档与 `exit_prepared` 的 SAFETY 契约）。
+        let exit_result = unsafe { exit_prepared(exit, image_handle, map_key) };
+        match exit_result {
+            Ok(()) => {
+                // Exit 成功：**关中断**（旧实现 misc.c:429 同款）—— 引导服务失效后
+                // 固件的定时器中断不会再进来，这是跳转前的必要状态。
+                #[cfg(target_os = "uefi")]
+                unsafe {
+                    core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+                }
+                return Ok(count);
+            }
+            Err(err) => {
+                retries += 1;
+                if retries >= 4 || err != Error::Io {
+                    return Err(err);
+                }
+                #[cfg(target_os = "uefi")]
+                for byte in b"[liftoff] h: retry\n" as &[u8] {
+                    crate::PlatformImpl::write_byte(*byte);
+                }
+            }
+        }
     }
-    if !capture_map_key(source, map_key) {
-        return Err(Error::InvalidState);
-    }
-    #[cfg(target_os = "uefi")]
-    for byte in b"[liftoff] h: exit\n" as &[u8] {
-        crate::PlatformImpl::write_byte(*byte);
-    }
-    // SAFETY: 由调用方保证（见函数文档与 `exit_prepared` 的 SAFETY 契约）。
-    unsafe { exit_prepared(exit, image_handle, map_key)? };
-    Ok(count)
 }
 
 /// 交接前取键：把内存映射来源里记录的 `map_key` 写进槽。
