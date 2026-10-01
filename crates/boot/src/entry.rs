@@ -1802,15 +1802,32 @@ pub unsafe fn bring_up(
     }) else {
         return Err(BringUpError::RootFrame);
     };
+    // **内核栈由引导器自己分配**（对照 brxLimine `limine.c:1647`：
+    // `void *stack = ext_mem_alloc(stack_size) + stack_size;`，默认 64 KiB，
+    // 内核可用 `LIMINE_STACK_SIZE_REQUEST` 要更大的）。
+    //
+    // **不能用内核自己的 `.kernel_main_stack`**：那在 `.bss` 里，而内核早期会清
+    // BSS —— 把自己的栈抹掉。实测症状：入口 +0x11 处 `RSP` 变成 0，随后压栈写到
+    // `0xfffffffffffffff8` 而 #PF。
+    //
+    // 报给内核的是**栈顶**，且是 **HHDM 地址**（对照 brxLimine
+    // `reported_addr(addr) = addr + direct_map_offset`）。
+    const KERNEL_STACK_BYTES: usize = 64 * 1024;
+    // SAFETY: bring_up 是 unsafe fn，boot services 指针有效。
+    let Some(kernel_stack) = (unsafe {
+        alloc_buffer(table.allocate_pages, KERNEL_STACK_BYTES)
+    }) else {
+        return Err(BringUpError::RootFrame);
+    };
+    let stack_phys = kernel_stack.as_ptr() as u64;
+    let kernel_stack_top = HHDM_OFFSET + stack_phys + KERNEL_STACK_BYTES as u64;
     let spinup_args = current::spinup::SpinupArgs {
         level5pg: 0,
         pagemap_top: root.start_address().expect("根帧必有地址").as_u64() as u32,
         entry_lo: (info.entry & 0xFFFF_FFFF) as u32,
         entry_hi: (info.entry >> 32) as u32,
-        // 内核声明的主栈：.kernel_main_stack 在 0xffffffff808ae000，大小 0x101000，
-        // 所以栈顶 = 0xffffffff809ae000（**不是**之前手写的近似值）。
-        stack_lo: (KERNEL_STACK_TOP & 0xFFFF_FFFF) as u32,
-        stack_hi: (KERNEL_STACK_TOP >> 32) as u32,
+        stack_lo: (kernel_stack_top & 0xFFFF_FFFF) as u32,
+        stack_hi: (kernel_stack_top >> 32) as u32,
         gdt: 0,
         nx_available: 1,
         dmo_lo: (HHDM_OFFSET & 0xFFFF_FFFF) as u32,
