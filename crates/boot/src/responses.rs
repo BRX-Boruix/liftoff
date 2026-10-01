@@ -218,6 +218,8 @@ impl Responses {
             self.framebuffer_pointers[index] = &mut self.framebuffers[index];
             index += 1;
         }
+        // **revision = 1**：brxLimine 同值（limine.c:1468）。内核据此判断响应字段可用性。
+        self.framebuffer.revision = 1;
         self.framebuffer.framebuffer_count = count as u64;
         self.framebuffer.framebuffers = self.framebuffer_pointers.as_mut_ptr();
     }
@@ -230,6 +232,9 @@ impl Responses {
             self.modules[index] = modules[index];
             index += 1;
         }
+        // **revision = 2**：brxLimine 同值（limine.c:1210）。当前内核未声明 modules
+        // 请求，但一旦声明，这就是最容易悄悄错的字段。
+        self.module.revision = 2;
         self.module.module_count = count as u64;
         self.module.modules = self.modules.as_mut_ptr();
     }
@@ -466,6 +471,60 @@ pub fn fill_framebuffer(responses: &mut Responses, info: &FramebufferInfo) -> Re
 }
 
 #[cfg(test)]
+#[cfg(test)]
+mod set_modules_tests {
+    use super::{Responses, MAX_MODULES};
+    use limine::file::File;
+    use limine::module::{MODULE_REQUEST_ID, ModuleResponse};
+    use std::vec::Vec;
+
+    /// 当前内核**没有**声明 modules 请求，但协议上它是 Limine 的一部分；保留
+    /// `set_modules` 是为协议完整性。这个测试钉住两点：revision 与数量如实回报
+    /// —— 一旦将来内核声明了它，这两条就是最容易悄悄错的。
+    #[test]
+    fn set_modules_reports_revision_two_and_honest_count() {
+        let mut responses = Responses::new();
+        // SAFETY: File 全由整数与裸指针组成（无 niched 类型），全零是合法位型；
+        // 测试不解引用它们，只比较指针值与数量。
+        let mut files: [File; 3] = [unsafe { core::mem::zeroed() }; 3];
+        let pointers: [*mut File; 3] = [
+            &mut files[0] as *mut File,
+            &mut files[1] as *mut File,
+            &mut files[2] as *mut File,
+        ];
+        responses.set_modules(&pointers);
+        let raw = responses.pointer_for(&MODULE_REQUEST_ID).expect("有响应");
+        // SAFETY: raw 指向容器内字段，类型为 ModuleResponse。
+        let module: &ModuleResponse = unsafe { &*(raw as *const ModuleResponse) };
+        // **revision = 2**：brxLimine 同值（limine.c:1210）。
+        assert_eq!(module.revision, 2, "模块响应 revision 必须与 brxLimine 一致");
+        assert_eq!(module.module_count, 3, "数量必须如实回报");
+        for index in 0..3 {
+            // SAFETY: entries[index] 指向容器内的 File。
+            let file = unsafe { *module.modules.add(index) };
+            assert_eq!(file as *mut File, pointers[index], "模块指针顺序必须保持");
+        }
+    }
+
+    #[test]
+    fn set_modules_over_capacity_is_reported_honestly() {
+        let mut responses = Responses::new();
+        // SAFETY: 同上 —— 全零 File 只用于占位比较，从不解引用。
+        let mut files: [File; MAX_MODULES + 1] = [unsafe { core::mem::zeroed() }; MAX_MODULES + 1];
+        let pointers: Vec<*mut File> = files.iter_mut().map(|f| f as *mut File).collect();
+        responses.set_modules(&pointers);
+        let raw = responses.pointer_for(&MODULE_REQUEST_ID).expect("有响应");
+        // SAFETY: raw 指向容器内字段。
+        let module: &ModuleResponse = unsafe { &*(raw as *const ModuleResponse) };
+        assert_eq!(
+            module.module_count,
+            MAX_MODULES as u64,
+            "超容量时只登记前 MAX_MODULES 个，且数量如实",
+        );
+    }
+}
+
+#[cfg(test)]
 mod fill_framebuffer_tests {
     use super::{Responses, fill_framebuffer};
     use arch::addr::PhysAddr;
@@ -499,6 +558,10 @@ mod fill_framebuffer_tests {
         let raw = responses.pointer_for(&FRAMEBUFFER_REQUEST_ID).expect("有响应");
         // SAFETY: `raw` 指向容器内字段，类型为 `FramebufferResponse`。
         let response: &FramebufferResponse = unsafe { &*(raw as *const FramebufferResponse) };
+        // **revision 必须是 1**：brxLimine 设 framebuffer_response->revision = 1
+        // （limine.c:1468）。revision 是响应的版本契约，内核据此判断哪些字段可用；
+        // 报 0 而实际填了 revision-1 才有的内容，等于对内核撒谎。
+        assert_eq!(response.revision, 1, "帧缓冲响应 revision 必须与 brxLimine 一致");
         assert_eq!(response.framebuffer_count, 1);
         // SAFETY: `framebuffers` 指向容器内指针数组，长度为 1。
         let entry = unsafe { **(response.framebuffers) };
