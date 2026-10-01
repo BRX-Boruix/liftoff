@@ -272,6 +272,8 @@ pub struct SpinupArgs {
 unsafe extern "C" {
     static spinup_text_start: u8;
     static spinup_text_end: u8;
+    static spinup_go32: u8;
+    #[allow(unused)]
     fn spinup_common64();
 }
 
@@ -288,6 +290,7 @@ pub unsafe fn stage_low_buffer(
     args: &SpinupArgs,
 ) -> Option<(usize, usize, usize)> {
     let text_start = &raw const spinup_text_start as usize;
+    let go32_sym = &raw const spinup_go32 as usize;
     let text_end = &raw const spinup_text_end as usize;
     let text_len = text_end.checked_sub(text_start)?;
     let total = text_len + 72 + 52 + 4096;
@@ -301,6 +304,8 @@ pub unsafe fn stage_low_buffer(
             core::ptr::write_unaligned((gdt_at + index * 8) as *mut u64, *word);
         }
         let args_at = gdt_at + 72;
+        let go32_low = buffer as usize + ((go32_sym) - text_start);
+        let _ = go32_low;
         let words = [
             args.level5pg, args.pagemap_top, args.entry_lo, args.entry_hi,
             args.stack_lo, args.stack_hi, args.gdt, args.nx_available,
@@ -311,7 +316,8 @@ pub unsafe fn stage_low_buffer(
         }
     }
     let stack_top = buffer as usize + total;
-    Some((buffer as usize, stack_top, buffer as usize + text_len + 72))
+    let go32_low = buffer as usize + ((&raw const spinup_go32 as usize) - text_start);
+    Some((go32_low, stack_top, buffer as usize + text_len + 72))
 }
 
 #[cfg(not(target_os = "uefi"))]
@@ -329,7 +335,7 @@ pub unsafe fn stage_low_buffer(
 ///
 /// 只能 Exit 成功后调用一次；三个指针必须来自 [`stage_low_buffer`]。
 #[cfg(target_os = "uefi")]
-pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize) -> ! {
+pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize, enter_addr: usize) -> ! {
     // SAFETY: 调用方保证三指针来自 stage_low_buffer 且 Exit 已成功；
     // jmp 目标是本模块汇编导出的 64 位入口（不返回）。
     unsafe {
@@ -341,14 +347,14 @@ pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize) -> ! {
             go32 = in(reg) go32,
             stack = in(reg) stack_top,
             args = in(reg) args,
-            enter = sym spinup_common64,
+            enter = in(reg) enter_addr,
             options(noreturn),
         )
     }
 }
 
 #[cfg(not(target_os = "uefi"))]
-pub unsafe fn spinup_go(_go32: usize, _stack_top: usize, _args: usize) -> ! {
+pub unsafe fn spinup_go(_go32: usize, _stack_top: usize, _args: usize, _enter: usize) -> ! {
     // 宿主测试二进制无法链接裸 32 位 trampoline —— 该调用只发生在真机。
     unreachable!("spinup_go 只在 UEFI 目标上有意义")
 }
