@@ -312,7 +312,7 @@ pub unsafe fn stage_low_buffer(
         let _ = go32_low;
         let words = [
             args.level5pg, args.pagemap_top, args.entry_lo, args.entry_hi,
-            args.stack_lo, args.stack_hi, args.gdt, args.nx_available,
+            args.stack_lo, args.stack_hi, gdt_at as u32, args.nx_available,
             args.dmo_lo, args.dmo_hi, args.base_revision, 0, 0,
         ];
         for (index, word) in words.iter().enumerate() {
