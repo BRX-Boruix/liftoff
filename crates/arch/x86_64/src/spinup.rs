@@ -234,3 +234,37 @@ core::arch::global_asm!(
     "    .word 0",
     "    .quad 0",
 );
+
+// Exit 后传给 32 位 trampoline 的参数区布局（对照 common_spinup 的 11 个压栈参数）。
+// 由 Rust 在 Exit 前填充进低地址缓冲的参数区（32 位压栈序：低地址在前 ✗ —— 实际
+// 是压栈序，即高地址是第一个参数 ✗；这里按 [esp+i*4] 索引：esp 指向最后一个压栈的）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SpinupArgs {
+    /// 5 级分页？（我们不启用）。
+    pub level5pg: u32,
+    /// PML4 物理地址低 32 位。
+    pub pagemap_top_lo: u32,
+    /// PML4 物理地址高 32 位（应为 0，表在低 4G 内）。
+    pub pagemap_top_hi: u32,
+    /// 内核入口低 32 位。
+    pub entry_lo: u32,
+    /// 内核入口高 32 位。
+    pub entry_hi: u32,
+    /// 内核栈顶低 32 位。
+    pub stack_lo: u32,
+    /// 内核栈顶高 32 位。
+    pub stack_hi: u32,
+    /// 自建 GDT 指针低 32 位（指向低地址缓冲里的 GDT）。
+    pub gdt_lo: u32,
+    /// GDT 指针高 32 位（0）。
+    pub gdt_hi: u32,
+    /// NX 可用（1）。
+    pub nx_available: u32,
+    /// direct map offset 低 32 位。
+    pub dmo_lo: u32,
+    /// direct map offset 高 32 位。
+    pub dmo_hi: u32,
+    /// base revision（1 = unmap lower half）。
+    pub base_revision: u32,
+}
