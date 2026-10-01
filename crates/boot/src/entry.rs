@@ -1815,7 +1815,15 @@ pub unsafe fn bring_up(
         nx_available: 1,
         dmo_lo: (HHDM_OFFSET & 0xFFFF_FFFF) as u32,
         dmo_hi: (HHDM_OFFSET >> 32) as u32,
-        base_revision: 1,
+        // **0 = 不卸低半区**。base_revision 是**内核声明的协议版本**，不是我们可以
+        // 随便挑的：`>= 1` 的语义是「请把低半区卸掉」。真实内核里一个 Limine 请求
+        // 标记都没有（已实测：COMMON_MAGIC 7 个、START/END 标记 0 个），即它没有
+        // 声明任何版本 —— 对应 base_revision = 0。
+        //
+        // 硬编码 1 的后果已实测：`rep stosq` 清掉 PML4[0..255] 之后，映像里那张
+        // GDT 不再可达，紧接着的 `iretq` 读 CS(0x28) 描述符就 #PF（CR2 = GDT+0x28），
+        // 再升级成 #DF → 三重故障。
+        base_revision: 0,
     };
     let Some(spinup_low) = (unsafe {
         current::spinup::stage_low_buffer(low_buffer.as_mut_ptr(), spinup_buf_len, &spinup_args)
