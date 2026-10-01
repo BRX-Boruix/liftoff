@@ -127,11 +127,42 @@ mod tests {
 
     #[test]
     fn uefi_types_map_to_the_abstract_kinds() {
-        assert_eq!(classify(7), Ok(MemoryKind::Usable));
+        // 用命名常量而非裸数字（S13）：这些映射是引导器安全的关键语义。
+        use super::{CONVENTIONAL, LOADER_CODE, MMIO};
+        assert_eq!(classify(CONVENTIONAL), Ok(MemoryKind::Usable));
         assert_eq!(classify(0), Ok(MemoryKind::Reserved));
         assert_eq!(classify(9), Ok(MemoryKind::AcpiReclaimable));
         assert_eq!(classify(10), Ok(MemoryKind::AcpiNvs));
+        assert_eq!(classify(LOADER_CODE), Ok(MemoryKind::BootloaderReclaimable));
         assert_eq!(classify(3), Ok(MemoryKind::BootloaderReclaimable));
+        assert_eq!(classify(MMIO), Ok(MemoryKind::Reserved));
+    }
+
+    /// D5/R4：引导器自身占用的内存（`LOADER_DATA` 等）**必须**落在
+    /// `BootloaderReclaimable`，绝不能是 `Usable`。
+    ///
+    /// 语义差异是实质性的：`Usable` 表示「内核随时可以拿走」，`BootloaderReclaimable`
+    /// 表示「引导器已用完，内核读完响应后可回收」。响应容器（`Responses`）就放在
+    /// 引导器内存里，内核通过 HHDM 指针读它 —— 若被标成 `Usable`，内核可能在读
+    /// 之前就把那块内存分掉了。
+    #[test]
+    fn bootloader_owned_memory_is_reclaimable_never_usable() {
+        use super::{BOOT_SERVICES_CODE, BOOT_SERVICES_DATA, CONVENTIONAL, LOADER_CODE, LOADER_DATA};
+        for kind in [LOADER_CODE, LOADER_DATA, BOOT_SERVICES_CODE, BOOT_SERVICES_DATA] {
+            let mapped = classify(kind).expect("应可分类");
+            assert_eq!(
+                mapped,
+                MemoryKind::BootloaderReclaimable,
+                "UEFI 类型 {kind} 是引导器自有内存，必须是 BootloaderReclaimable",
+            );
+            assert_ne!(
+                mapped,
+                MemoryKind::Usable,
+                "引导器自有内存绝不能被标成 Usable（内核会立即覆盖响应容器）",
+            );
+        }
+        // 对照：只有真正的空闲内存才是 Usable。
+        assert_eq!(classify(CONVENTIONAL), Ok(MemoryKind::Usable));
     }
 
     #[test]
