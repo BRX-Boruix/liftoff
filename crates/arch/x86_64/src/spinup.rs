@@ -336,6 +336,9 @@ pub unsafe fn stage_low_buffer(
 /// 只能 Exit 成功后调用一次；三个指针必须来自 [`stage_low_buffer`]。
 #[cfg(target_os = "uefi")]
 pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize, enter_addr: usize) -> ! {
+    // **Exit 前关中断**：真机 #GP 定位在固件 VirtioRngDxe 的回调里 —— Exit 期间
+    // 固件定时器事件仍可能触发，若 CR3 已是新表，回调代码不可达 → #GP。
+    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
     // SAFETY: 调用方保证三指针来自 stage_low_buffer 且 Exit 已成功；
     // jmp 目标是本模块汇编导出的 64 位入口（不返回）。
     unsafe {
