@@ -21,6 +21,10 @@ pub use x86_64::platform::X86_64 as PlatformImpl;
 #[cfg(feature = "impl-x86_64")]
 pub use x86_64::paging::X86PageTable;
 
+/// spinup trampoline（当前实现 = x86_64 的汇编 + 低地址缓冲封装）。
+#[cfg(feature = "impl-x86_64")]
+pub use x86_64::spinup;
+
 #[cfg(feature = "impl-mock")]
 pub mod mock {
     //! 宿主测试用实现：不触碰硬件，但状态机行为真实（不是"假数据"）。
