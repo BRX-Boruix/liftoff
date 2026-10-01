@@ -60,6 +60,18 @@ pub fn fill_responses(
     let mut filled = 0;
     for index in 0..count {
         let hit = hits[index];
+        // `limine_mp_request` 比其它请求**多一个 `flags` 字段**（偏移 48）。内核若
+        // 请求 x2APIC，引导器**必须**在响应里回显，否则内核会走 xAPIC（MMIO）路径。
+        if hit.id == limine::mp::MP_REQUEST_ID {
+            let at = hit.offset + 48;
+            if let Some(bytes) = image.get(at..at.saturating_add(8)) {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(bytes);
+                if u64::from_le_bytes(buf) & limine::mp::MP_REQUEST_X86_64_X2APIC != 0 {
+                    responses.set_smp_flags(limine::mp::MP_RESPONSE_X86_64_X2APIC);
+                }
+            }
+        }
         if let Some(pointer) = responses.pointer_for(&hit.id) {
             fill_response(image, &hit, pointer).map_err(|_| ScanError::UnclosedRegion)?;
             filled += 1;

@@ -137,6 +137,14 @@ impl Responses {
     /// （`[cpu] ... enabled`）之后卡死在紧循环里（24 秒内全部寄存器逐位不变）。
     ///
     /// 我们**不启动**任何 AP（`goto_address = None`），也不声称支持 x2APIC。
+    /// 回显 SMP 请求里的标志（`MP_REQUEST_X86_64_X2APIC` → 响应同位置位）。
+    ///
+    /// 内核若请求 x2APIC 而响应没有回显，它会去走 xAPIC（MMIO）路径 —— 那条路在
+    /// 我们交付的状态下可能失败，进而每 CPU 初始化失败并 panic。
+    pub fn set_smp_flags(&mut self, flags: u32) {
+        self.mp.flags |= flags;
+    }
+
     pub fn set_smp(&mut self, bsp_lapic_id: u32) {
         self.mp_info = MpInfo {
             processor_id: 0,
