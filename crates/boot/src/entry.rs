@@ -1882,6 +1882,15 @@ pub unsafe fn bring_up(
             None => c.responses.set_memmap(&entries[..count]),
         }
     }
+    // **SMP 响应**：至少登记 BSP 本身。此前 `cpu_count` 恒为 0，内核会认为没有
+    // 任何 CPU —— 真机实测它随后卡死在紧循环里。BSP 的 LAPIC 标识从 CPUID.1:EBX[31:24]。
+    {
+        #[cfg(target_arch = "x86_64")]
+        let bsp_lapic_id = core::arch::x86_64::__cpuid(1).ebx >> 24;
+        #[cfg(not(target_arch = "x86_64"))]
+        let bsp_lapic_id = 0u32;
+        c.responses.set_smp(bsp_lapic_id);
+    }
     c.responses.set_hhdm_offset(HHDM_OFFSET);
     // RSDP 只在**真的从配置表找到**时才填；没有就留空 —— 给假指针比不给更糟。
     if let Some(rsdp) = c.rsdp {

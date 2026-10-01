@@ -21,7 +21,7 @@ use limine::firmware_type::{FIRMWARE_TYPE_REQUEST_ID, FirmwareTypeResponse};
 use limine::framebuffer::{FRAMEBUFFER_REQUEST_ID, Framebuffer, FramebufferResponse};
 use limine::memmap::{MEMMAP_REQUEST_ID, MemmapEntry, MemmapResponse};
 use limine::module::{MODULE_REQUEST_ID, ModuleResponse};
-use limine::mp::{MP_REQUEST_ID, MpResponse};
+use limine::mp::{MP_REQUEST_ID, MpInfo, MpResponse};
 use limine::rsdp::{RSDP_REQUEST_ID, RsdpResponse};
 
 /// 零值 UUID（表示「未知」）。
@@ -57,6 +57,10 @@ pub struct Responses {
     module: ModuleResponse,
     modules: [*mut File; MAX_MODULES],
     mp: MpResponse,
+    /// BSP 的 `MpInfo`（`mp.cpus` 指向它的地址，故必须留在容器内）。
+    mp_info: MpInfo,
+    /// CPU 指针数组（`mp.cpus` 指向它）。
+    mp_cpu_ptrs: [*mut MpInfo; 1],
 }
 
 impl Responses {
@@ -116,7 +120,38 @@ impl Responses {
                 cpu_count: 0,
                 cpus: core::ptr::null_mut(),
             },
+            mp_info: MpInfo {
+                processor_id: 0,
+                lapic_id: 0,
+                reserved: 0,
+                goto_address: None,
+                extra_argument: 0,
+            },
+            mp_cpu_ptrs: [core::ptr::null_mut(); 1],
         }
+    }
+
+    /// 填充 SMP 响应：**至少**登记启动处理器（BSP）本身。
+    ///
+    /// `cpu_count = 0` 会让内核认为没有任何 CPU —— 真机实测：内核在每 CPU 初始化
+    /// （`[cpu] ... enabled`）之后卡死在紧循环里（24 秒内全部寄存器逐位不变）。
+    ///
+    /// 我们**不启动**任何 AP（`goto_address = None`），也不声称支持 x2APIC。
+    pub fn set_smp(&mut self, bsp_lapic_id: u32) {
+        self.mp_info = MpInfo {
+            processor_id: 0,
+            lapic_id: bsp_lapic_id,
+            reserved: 0,
+            goto_address: None,
+            extra_argument: 0,
+        };
+        let info: *mut MpInfo = &mut self.mp_info;
+        self.mp_cpu_ptrs = [info];
+        self.mp.revision = 0;
+        self.mp.flags = 0;
+        self.mp.bsp_lapic_id = bsp_lapic_id;
+        self.mp.cpu_count = 1;
+        self.mp.cpus = self.mp_cpu_ptrs.as_mut_ptr();
     }
 
     /// 设置 HHDM 偏移。
