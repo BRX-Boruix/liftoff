@@ -331,8 +331,8 @@ pub unsafe fn stage_low_buffer(
         );
     }
     let stack_top = buffer as usize + total;
-    let go32_low = buffer as usize + ((&raw const spinup_go32 as usize) - text_start);
-    Some((go32_low, stack_top, buffer as usize + text_len + 72))
+    let common64_low = buffer as usize; // text 起点 = spinup_common64
+    Some((common64_low, stack_top, buffer as usize + text_len + 72))
 }
 
 #[cfg(not(target_os = "uefi"))]
