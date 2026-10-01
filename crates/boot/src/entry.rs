@@ -1478,6 +1478,31 @@ pub unsafe fn bring_up(
     .map_err(BringUpError::Copy)?;
     // SAFETY: 由调用方保证（见函数文档）。
     unsafe { activate_only(&mut page_table) };
+    // 激活后**自检**：从内核的虚拟地址读回几个字节，与源映像比对。
+    // 这能把“映射错了”与“映射对了但内核自己崩”区分开，避免继续盲猜。
+    {
+        let first = &c.segments[0];
+        let offset = usize::try_from(first.p_offset).unwrap_or(0);
+        let mut ok = offset + 8 <= len;
+        if ok {
+            let probe = kernel_virt as *const u8;
+            for index in 0..8usize {
+                // SAFETY: 刚激活的页表把 kernel_virt.. 映射到目标物理内存；
+                // 若映射不对，这里会立刻暴露（而不是等到跳转后）。
+                let got = unsafe { core::ptr::read_volatile(probe.add(index)) };
+                if got != c.kernel_out[offset + index] {
+                    ok = false;
+                }
+            }
+        }
+        for byte in if ok {
+            b"[liftoff] step: kernel map ok\n" as &[u8]
+        } else {
+            b"[liftoff] step: kernel map WRONG\n" as &[u8]
+        } {
+            crate::PlatformImpl::write_byte(*byte);
+        }
+    }
     let _ = stays;
     // 8) 交接：填响应 → 检查 → 取键退出 → 跳转。
     //
