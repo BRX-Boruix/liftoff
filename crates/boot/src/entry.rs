@@ -1845,6 +1845,43 @@ pub unsafe fn bring_up(
     //
     // HHDM 偏移是**必须**的：内核靠它把物理地址翻成虚拟地址。不填（或填 0）它会算错地址，
     // 真实运行里表现为跳转后立刻复位 —— 这很可能就是复位的原因。
+    // **内存映射响应**：内核靠它决定哪些内存可用。此前这条响应**从未被填充**
+    // （`fill_memory_map`/`set_memmap` 只在测试里出现过），而内核明确请求了 `memmap`。
+    // 另外内核自己占的页必须标成 `KernelAndModules`，否则内核会把它并入空闲池并
+    // 踩掉自己的代码/数据（对照 brxLimine 的 `MEMMAP_KERNEL_AND_MODULES`）。
+    {
+        use crate::responses::{MAX_MEMMAP_ENTRIES, mark_kernel_memory};
+        let empty = limine::memmap::MemmapEntry { base: 0, length: 0, kind: 0 };
+        let mut entries = [empty; MAX_MEMMAP_ENTRIES];
+        let count = if map.len() > MAX_MEMMAP_ENTRIES {
+            MAX_MEMMAP_ENTRIES
+        } else {
+            map.len()
+        };
+        for (index, entry) in map.iter().take(count).enumerate() {
+            entries[index] = limine::memmap::MemmapEntry {
+                base: entry.base.as_u64(),
+                length: entry.length,
+                kind: entry.kind.as_protocol() as u64,
+            };
+        }
+        // 内核占用的**物理**区间（来自装载规划）。
+        let mut ranges = [(0u64, 0u64); 8];
+        let mut range_count = 0usize;
+        for mapping in c.plan[..plan_count].iter() {
+            if range_count == ranges.len() {
+                break;
+            }
+            ranges[range_count] = (mapping.phys.as_u64(), mapping.len);
+            range_count += 1;
+        }
+        let mut marked = [empty; MAX_MEMMAP_ENTRIES];
+        match mark_kernel_memory(&entries[..count], &ranges[..range_count], &mut marked) {
+            Some(marked_count) => c.responses.set_memmap(&marked[..marked_count]),
+            // 缓冲不足时保留原映射：**宁可少标，也不静默产出错误映射**。
+            None => c.responses.set_memmap(&entries[..count]),
+        }
+    }
     c.responses.set_hhdm_offset(HHDM_OFFSET);
     // RSDP 只在**真的从配置表找到**时才填；没有就留空 —— 给假指针比不给更糟。
     if let Some(rsdp) = c.rsdp {

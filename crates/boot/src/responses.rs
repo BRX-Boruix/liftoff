@@ -567,3 +567,90 @@ mod fill_executable_file_tests {
         assert_eq!(file.tftp_port, 0, "非网络引导");
     }
 }
+/// 把内核占用的物理区间在内存映射里标成 `KernelAndModules`（必要时**拆分**条目）。
+///
+/// # 为什么必须有这一步
+///
+/// 内核依据内存映射决定哪些内存可用。内核自己占的页是我们用固件 `AllocatePages`
+/// 分配的，在响应里会显示成 `BootloaderReclaimable` —— 内核会把它并入空闲池，
+/// 随后**踩掉自己的代码或数据**。对照 brxLimine：它用 `MEMMAP_KERNEL_AND_MODULES`
+/// 装载内核与模块，并在 `base_revision` 相关规则里把该类型从空闲映射里排除。
+///
+/// `ranges` 是内核占用的**物理**区间 `(base, len)`。
+///
+/// 返回写入 `out` 的条目数；**缓冲不足时返回 `None`**（调用方保留原映射，绝不
+/// 静默产出错误的映射）。
+pub fn mark_kernel_memory(
+    entries: &[limine::memmap::MemmapEntry],
+    ranges: &[(u64, u64)],
+    out: &mut [limine::memmap::MemmapEntry],
+) -> Option<usize> {
+    use firmware::memory::MemoryKind;
+    // 一个条目被至多 `ranges.len()` 个区间切分，片段数上界 = 2*len + 1。
+    const MAX_PIECES: usize = 2 * 8 + 1;
+    let mut written = 0usize;
+    for entry in entries {
+        let mut pieces = [(0u64, 0u64, false); MAX_PIECES];
+        let mut count = 0usize;
+        pieces[count] = (entry.base, entry.length, false);
+        count += 1;
+        for &(range_base, range_len) in ranges.iter().take(8) {
+            let range_end = range_base.checked_add(range_len)?;
+            let mut next = [(0u64, 0u64, false); MAX_PIECES];
+            let mut next_count = 0usize;
+            for &(base, len, inside) in pieces.iter().take(count) {
+                let end = base.checked_add(len)?;
+                if end <= range_base || base >= range_end {
+                    if next_count == MAX_PIECES {
+                        return None;
+                    }
+                    next[next_count] = (base, len, inside);
+                    next_count += 1;
+                    continue;
+                }
+                if base < range_base {
+                    if next_count == MAX_PIECES {
+                        return None;
+                    }
+                    next[next_count] = (base, range_base - base, inside);
+                    next_count += 1;
+                }
+                let low = if base > range_base { base } else { range_base };
+                let high = if end < range_end { end } else { range_end };
+                if next_count == MAX_PIECES {
+                    return None;
+                }
+                next[next_count] = (low, high - low, true);
+                next_count += 1;
+                if end > range_end {
+                    if next_count == MAX_PIECES {
+                        return None;
+                    }
+                    next[next_count] = (range_end, end - range_end, inside);
+                    next_count += 1;
+                }
+            }
+            pieces = next;
+            count = next_count;
+        }
+        for &(base, len, inside) in pieces.iter().take(count) {
+            if len == 0 {
+                continue;
+            }
+            if written == out.len() {
+                return None;
+            }
+            out[written] = limine::memmap::MemmapEntry {
+                base,
+                length: len,
+                kind: if inside {
+                    MemoryKind::KernelAndModules.as_protocol() as u64
+                } else {
+                    entry.kind
+                },
+            };
+            written += 1;
+        }
+    }
+    Some(written)
+}
