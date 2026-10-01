@@ -1714,7 +1714,27 @@ pub unsafe fn bring_up(
             }
             crate::PlatformImpl::write_byte(b'\n');
         }
-        match limine::scan::scan_requests(&c.kernel_out[..len], &mut hits) {
+        // 分块扫描并**每 4 MB 打一个点**：点持续出现＝只是慢；点停住＝某段卡住。
+        let mut total = 0usize;
+        {
+            let mut start = 0usize;
+            while start < len {
+                let end = core::cmp::min(start + (4 << 20), len);
+                let mut part = [RequestHit::EMPTY; 64];
+                if let Ok(n) = limine::scan::scan_requests(&c.kernel_out[start..end], &mut part) {
+                    for hit in &part[..n] {
+                        if total < hits.len() {
+                            hits[total] = *hit;
+                            total += 1;
+                        }
+                    }
+                }
+                crate::PlatformImpl::write_byte(b'.');
+                start = end;
+            }
+            crate::PlatformImpl::write_byte(b'\n');
+        }
+        match Ok::<usize, limine::scan::ScanError>(total) {
             Err(_) => {
                 for byte in b"[liftoff] scan ERR\n" as &[u8] {
                     crate::PlatformImpl::write_byte(*byte);

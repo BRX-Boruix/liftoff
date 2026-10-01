@@ -28,7 +28,7 @@ pub fn prepare_responses<F>(
 where
     F: FnMut(&RequestHit) -> Option<*mut c_void>,
 {
-    let count = scan_requests(image, hits)?;
+    let count = scan_chunked(image, 4 << 20, hits)?;
     let mut filled = 0;
     for hit in hits.iter().take(count) {
         if let Some(response) = response_for(hit) {
@@ -201,5 +201,94 @@ mod fill_responses_tests {
             fill_responses(&mut image, &mut hits, &mut responses),
             Ok(crate::protocol::ScanReport { hits: 0, filled: 0 })
         );
+    }
+}
+
+/// 分块扫描大映像（每块 `chunk` 字节，`chunk == 0` 表示不分块）。
+///
+/// **为什么需要**：固件里对 24.6 MB 一次性扫描**跑不完**（实测 434 秒无输出），
+/// 而同一段映像分块扫描能正常跑完（64 KB × 64 段全部通过）。宿主上全量扫描只要 0.57 秒，
+/// 所以这是**固件环境的限制**，不是算法问题 —— 但接口必须按它工作。
+///
+/// 两个正确性要点：
+/// - 请求可能**跨块边界** → 每块与下一块**重叠 32 字节**（一个请求 ID 的长度）；
+/// - 重叠会让同一请求被扫到两次 → 按 `offset` **去重**。
+pub fn scan_chunked(
+    image: &[u8],
+    chunk: usize,
+    hits: &mut [RequestHit],
+) -> Result<usize, ScanError> {
+    /// 一个请求 ID 的字节长度：重叠必须至少这么大，否则跨块请求会漏。
+    const OVERLAP: usize = 32;
+    let chunk = if chunk == 0 { image.len().max(1) } else { chunk };
+    let mut count = 0usize;
+    let mut part = [RequestHit::EMPTY; 64];
+    let mut start = 0usize;
+    while start < image.len() {
+        let end = core::cmp::min(start + chunk, image.len());
+        let found = scan_requests(&image[start..end], &mut part)?;
+        for hit in &part[..found] {
+            let absolute = RequestHit {
+                id: hit.id,
+                offset: hit.offset + start,
+                size: hit.size,
+            };
+            // 重叠区域会重复命中同一个请求 —— 按偏移去重。
+            if hits[..count].iter().any(|existing| existing.offset == absolute.offset) {
+                continue;
+            }
+            if count == hits.len() {
+                return Err(ScanError::TooManyRequests);
+            }
+            hits[count] = absolute;
+            count += 1;
+        }
+        if end == image.len() {
+            break;
+        }
+        // 回退 OVERLAP 字节以覆盖跨块请求；**必须严格推进**，否则死循环。
+        let next = end.saturating_sub(OVERLAP);
+        start = if next > start { next } else { end };
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod scan_chunked_tests {
+    use super::scan_chunked;
+    use limine::base::HHDM_REQUEST_ID;
+    use limine::scan::RequestHit;
+
+    fn put_id(image: &mut [u8], at: usize, id: &[u64; 4]) {
+        for (index, word) in id.iter().enumerate() {
+            let off = at + index * 8;
+            image[off..off + 8].copy_from_slice(&word.to_ne_bytes());
+        }
+    }
+
+    #[test]
+    fn a_request_straddling_a_chunk_boundary_is_found_exactly_once() {
+        // 真实固件里对 24.6 MB 一次性扫描跑不完，分块则正常 —— 但分块必须处理两件事：
+        // ① 请求可能**跨块边界**；② 为避免漏掉跨界请求而做的重叠会导致**重复计数**。
+        let mut image = std::vec![0u8; 8192];
+        let at = 2048 - 16; // 恰好横跨 2048 这条边界
+        put_id(&mut image, at, &HHDM_REQUEST_ID);
+        let mut hits = [RequestHit::EMPTY; 16];
+        let count = scan_chunked(&image, 2048, &mut hits).expect("分块扫描应成功");
+        assert_eq!(count, 1, "跨块请求必须找到，且**只算一次**");
+        assert_eq!(hits[0].offset, at);
+    }
+
+    #[test]
+    fn several_requests_across_chunks_are_all_found() {
+        let mut image = std::vec![0u8; 16384];
+        // 请求必须落在 **8 字节边界** 上（协议要求）—— 我第一次把一处放在 100，
+        // 那是 4 的倍数而不是 8 的倍数，扫描按 8 步进自然看不到它：是**测试错了**，不是代码错。
+        put_id(&mut image, 96, &HHDM_REQUEST_ID);
+        put_id(&mut image, 9000, &HHDM_REQUEST_ID);
+        put_id(&mut image, 15000, &HHDM_REQUEST_ID);
+        let mut hits = [RequestHit::EMPTY; 16];
+        let count = scan_chunked(&image, 4096, &mut hits).expect("分块扫描应成功");
+        assert_eq!(count, 3, "三处都必须找到，且不重复");
     }
 }
