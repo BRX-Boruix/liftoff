@@ -276,6 +276,7 @@ unsafe extern "C" {
     static spinup_gdt_ptr: u8;
     #[allow(unused)]
     static spinup_idt_ptr: u8;
+    #[allow(unused_imports, dead_code)]
     static spinup_go32: u8;
     #[allow(unused)]
     fn spinup_common64();
@@ -294,22 +295,33 @@ pub unsafe fn stage_low_buffer(
     args: &SpinupArgs,
 ) -> Option<(usize, usize, usize)> {
     let text_start = &raw const spinup_text_start as usize;
-    let go32_sym = &raw const spinup_go32 as usize;
     let text_end = &raw const spinup_text_end as usize;
     let text_len = text_end.checked_sub(text_start)?;
-    let total = text_len + 72 + 52 + 4096;
+    // GDTR/IDTR 数据在 text 之外（spinup_gdt_ptr / spinup_idt_ptr 的 [limit][base]）。
+    // 它们的**位置**用「符号相对 text_start 的偏移」表示 —— 拷贝时一并搬进去。
+    let gdt_ptr_off = (&raw const spinup_gdt_ptr as usize).checked_sub(text_start)?;
+    let idt_ptr_off = (&raw const spinup_idt_ptr as usize).checked_sub(text_start)?;
+    let meta_len = 128; // GDTR 10B + IDTR 10B + GDT 72B + 对齐余量
+    let total = text_len + meta_len + 52 + 4096;
     if buffer_len < total {
         return None;
     }
     unsafe {
+        // 1) 拷贝 text（含 spinup_common64 / go32 / limine_spinup_32）
         core::ptr::copy_nonoverlapping(text_start as *const u8, buffer, text_len);
+        // 2) GDT 数据放在 text 之后
         let gdt_at = buffer as usize + text_len;
         for (index, word) in build_gdt().iter().enumerate() {
             core::ptr::write_unaligned((gdt_at + index * 8) as *mut u64, *word);
         }
+        // 3) **修正拷贝里的 GDTR**：base 指向低地址 GDT（limit 已在原数据里 ✓）
+        let gdt_ptr_site = buffer as usize + gdt_ptr_off;
+        core::ptr::write_unaligned((gdt_ptr_site + 2) as *mut u64, gdt_at as u64);
+        // 4) **修正拷贝里的 IDTR**：base 指向低地址的一段全零区（参数块尾部）
+        let idt_ptr_site = buffer as usize + idt_ptr_off;
+        core::ptr::write_unaligned((idt_ptr_site + 2) as *mut u64, (buffer as usize + text_len + 72) as u64);
+        // 5) 参数块放 GDT 之后
         let args_at = gdt_at + 72;
-        let go32_low = buffer as usize + ((go32_sym) - text_start);
-        let _ = go32_low;
         let words = [
             args.level5pg, args.pagemap_top, args.entry_lo, args.entry_hi,
             args.stack_lo, args.stack_hi, gdt_at as u32, args.nx_available,
@@ -318,20 +330,11 @@ pub unsafe fn stage_low_buffer(
         for (index, word) in words.iter().enumerate() {
             core::ptr::write_unaligned((args_at + index * 4) as *mut u32, *word);
         }
-        // **重定向拷贝里的 GDTR/IDTR**：`.quad spinup_gdt` 指向的是高地址原版 ——
-        // Exit 后高地址不可靠，CPU 取段描述符会 #GP（真机实测 data=0x20）。
-        // 汇编里 GDTR/IDTR 是 `spinup_gdt_ptr`/`spinup_idt_ptr`（[limit u16][base u64]，
-        // base 在 +8）；把它们的 base 改成**低地址 GDT**。
-        let gdt_base = gdt_at as u64;
-        let idt_zero: [u8; 10] = [0; 10];
-        let _ = idt_zero;
-        // GDTR = [limit u16][base u64]：**base 在 +2**，limit 保持在 +0（0x47）。
-        let gdt_ptr_site = buffer as usize + ((&raw const spinup_gdt_ptr as usize) - text_start);
-        core::ptr::write_unaligned((gdt_ptr_site + 2) as *mut u64, gdt_base);
+        // 6) 低地址栈：参数块之后 4 KiB
+        let stack_top = args_at + 52 + 4096;
+        return Some((buffer as usize, stack_top, args_at));
     }
-    let stack_top = buffer as usize + total;
-    let common64_low = buffer as usize; // text 起点 = spinup_common64
-    Some((common64_low, stack_top, buffer as usize + text_len + 72))
+
 }
 
 #[cfg(not(target_os = "uefi"))]
