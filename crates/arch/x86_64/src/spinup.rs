@@ -358,6 +358,7 @@ pub unsafe fn spinup_go(go32: usize, stack_top: usize, args: usize, enter_addr: 
     // jmp 目标是本模块汇编导出的 64 位入口（不返回）。
     unsafe {
         core::arch::asm!(
+            "cli",
             "mov rdi, {go32}",
             "mov rsi, {stack}",
             "mov rdx, {args}",
