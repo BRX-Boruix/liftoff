@@ -325,10 +325,9 @@ pub unsafe fn stage_low_buffer(
         let gdt_base = gdt_at as u64;
         let idt_zero: [u8; 10] = [0; 10];
         let _ = idt_zero;
-        core::ptr::write_unaligned(
-            (buffer as usize + ((&raw const spinup_gdt_ptr as usize) - text_start)) as *mut u64,
-            gdt_base,
-        );
+        // GDTR = [limit u16][base u64]：**base 在 +2**，limit 保持在 +0（0x47）。
+        let gdt_ptr_site = buffer as usize + ((&raw const spinup_gdt_ptr as usize) - text_start);
+        core::ptr::write_unaligned((gdt_ptr_site + 2) as *mut u64, gdt_base);
     }
     let stack_top = buffer as usize + total;
     let common64_low = buffer as usize; // text 起点 = spinup_common64
