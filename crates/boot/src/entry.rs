@@ -881,6 +881,11 @@ mod enter_kernel_tests {
         ) -> Result<(), MapError> {
             Ok(())
         }
+        // 假表不建模翻译：如实回答「未映射」，不假装知道。
+        fn translate(&self, _virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+            None
+        }
+
         unsafe fn activate(&self) {}
     }
     use super::{EntryError, Handoff, HandoffError, enter_kernel};
@@ -2348,6 +2353,11 @@ mod load_and_activate_tests {
             MAP_CALLS.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        // 假表不建模翻译：如实回答「未映射」，不假装知道。
+        fn translate(&self, _virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+            None
+        }
+
         unsafe fn activate(&self) {
             ACTIVATE_CALLS.fetch_add(1, Ordering::SeqCst);
         }
@@ -2365,6 +2375,11 @@ mod load_and_activate_tests {
         ) -> Result<(), MapError> {
             Ok(())
         }
+        // 假表不建模翻译：如实回答「未映射」，不假装知道。
+        fn translate(&self, _virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+            None
+        }
+
         unsafe fn activate(&self) {
             ACTIVATE_FAIL.fetch_add(1, Ordering::SeqCst);
         }

@@ -185,6 +185,17 @@ pub trait PageTable {
         Err(MapError::UnsupportedGranularity)
     }
 
+    /// 查虚拟地址的映射：返回物理地址与**生效权限**；未映射返回 `None`。
+    ///
+    /// 这是**只读**操作，不改页表。
+    ///
+    /// 「生效权限」= 沿途各级权限的**交集**：x86-64 上写权限需要每一级都允许，
+    /// 可执行由各级的 NX 共同决定。只报叶项权限是常见错误 —— 那样会报出一个
+    /// 「可写」的地址，而实际写入会被上级拒绝。
+    ///
+    /// **必须如实回答**：未映射就是 `None`，不得为「看起来完整」而编造地址（S09）。
+    fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)>;
+
     /// 激活本页表：此后 CPU 用其解析地址。
     ///
     /// # Safety

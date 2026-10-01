@@ -27,6 +27,31 @@ const LARGE_ADDR_MASK: u64 = 0x000F_FFFF_FFE0_0000;
 /// 每级页表项数。
 const ENTRIES_PER_TABLE: u64 = 512;
 
+/// 把沿途各级页表项折算成**语义权限**：取交集。
+///
+/// 只报叶项权限是常见错误 —— 会报出一个「可写」的地址，而实际写入被上级拒绝。
+fn effective_flags(levels: &[u64]) -> PageFlags {
+    let mut present = true;
+    let mut writable = true;
+    let mut executable = true;
+    for entry in levels {
+        present &= entry & PTE_PRESENT != 0;
+        writable &= entry & PTE_WRITABLE != 0;
+        executable &= entry & PTE_NX == 0;
+    }
+    let mut flags = PageFlags::none();
+    if present {
+        flags = flags.with(PageFlags::present());
+    }
+    if writable {
+        flags = flags.with(PageFlags::writable());
+    }
+    if executable {
+        flags = flags.with(PageFlags::executable());
+    }
+    flags
+}
+
 
 /// x86_64 页表（4 级 + 2 MiB 大页）。
 pub struct X86PageTable<A> {
@@ -159,6 +184,47 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
         Ok(())
     }
 
+    fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+        let v = virt.as_u64();
+        // 逐级下钻；任一级不存在即「未映射」。`read_entry` 失败（帧不在直接映射内）
+        // 也按未映射处理 —— 查不到就是查不到，不猜。
+        let pml4 = self.read_entry(self.root, (v >> 39) & 0x1FF).ok()?;
+        if pml4 & PTE_PRESENT == 0 {
+            return None;
+        }
+        let pdpt = self
+            .read_entry(PhysFrame::containing(PhysAddr::new(pml4 & FRAME_ADDR_MASK)), (v >> 30) & 0x1FF)
+            .ok()?;
+        if pdpt & PTE_PRESENT == 0 {
+            return None;
+        }
+        if pdpt & PTE_HUGE != 0 {
+            // 1 GiB 页：本实现不创建，但**如实处理**而不是当作未映射。
+            let base = pdpt & 0x000F_FFFF_C000_0000;
+            let phys = base | (v & 0x3FFF_FFFF);
+            return Some((PhysAddr::new(phys), effective_flags(&[pml4, pdpt])));
+        }
+        let pd = self
+            .read_entry(PhysFrame::containing(PhysAddr::new(pdpt & FRAME_ADDR_MASK)), (v >> 21) & 0x1FF)
+            .ok()?;
+        if pd & PTE_PRESENT == 0 {
+            return None;
+        }
+        if pd & PTE_HUGE != 0 {
+            // 2 MiB 大页：基址掩掉低 21 位，再或上页内偏移。
+            let phys = (pd & LARGE_ADDR_MASK) | (v & (LARGE_PAGE_SIZE - 1));
+            return Some((PhysAddr::new(phys), effective_flags(&[pml4, pdpt, pd])));
+        }
+        let pte = self
+            .read_entry(PhysFrame::containing(PhysAddr::new(pd & FRAME_ADDR_MASK)), (v >> 12) & 0x1FF)
+            .ok()?;
+        if pte & PTE_PRESENT == 0 {
+            return None;
+        }
+        let phys = (pte & FRAME_ADDR_MASK) | (v & (PAGE_SIZE - 1));
+        Some((PhysAddr::new(phys), effective_flags(&[pml4, pdpt, pd, pte])))
+    }
+
     unsafe fn activate(&self) {
         // 宿主测试目标上**不执行** `mov cr3`（特权指令，用户态直接
         // STATUS_PRIVILEGED_INSTRUCTION 崩溃）：宿主只验证映射构建逻辑，
@@ -183,7 +249,7 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
 #[cfg(test)]
 mod tests {
     use super::{FrameAllocator, LARGE_PAGE_SIZE, X86PageTable};
-    use arch::addr::{PhysAddr, PhysFrame, VirtAddr};
+    use arch::addr::{PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr};
     use arch::hhdm::DirectMap;
     use arch::paging::{MapError, PageFlags, PageTable};
     use std::vec::Vec;
@@ -362,6 +428,49 @@ mod tests {
             pt.map_range_pages(VirtAddr::new(0), PhysAddr::new(0), 0, PageFlags::present()),
             Err(MapError::Empty),
         );
+    }
+
+    #[test]
+    fn translate_resolves_a_four_kib_mapping_with_its_flags() {
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        pt.map_range_pages(
+            VirtAddr::new(0x1000),
+            PhysAddr::new(0x5000),
+            PAGE_SIZE,
+            PageFlags::present().with(PageFlags::writable()),
+        )
+        .expect("映射成功");
+        let (phys, flags) = pt.translate(VirtAddr::new(0x1000)).expect("应能翻译");
+        assert_eq!(phys.as_u64(), 0x5000, "4 KiB 页的物理地址应逐位对上");
+        assert!(flags.is_present(), "生效权限应含 present");
+        assert!(flags.is_writable(), "生效权限应含 writable");
+        assert!(!flags.is_executable(), "未请求可执行 -> NX 置位 -> 不可执行");
+        // 未映射必须返回 None，**不能编一个地址出来**（S09）。
+        assert!(pt.translate(VirtAddr::new(0x9000)).is_none(), "未映射应返回 None");
+    }
+
+    #[test]
+    fn translate_resolves_a_two_mib_page_and_preserves_the_offset() {
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        pt.map_range(
+            VirtAddr::new(0x200000),
+            PhysAddr::new(0x400000),
+            LARGE_PAGE_SIZE,
+            PageFlags::present().with(PageFlags::executable()),
+        )
+        .expect("大页映射成功");
+        // 大页内偏移必须保留：0x2A_BCDE 距 0x20_0000 为 0xA_BCDE。
+        // 期望值写成**显式算术**而不是一个大字面量：`0x40_A_BCDE` 这种下划线位置会被
+        // 解析成 `0x40ABCDE`（少一组 0），第一版就是这么写错、把正确实现判成失败的。
+        let expected = 0x40_0000u64 + 0xA_BCDEu64;
+        let (phys, flags) = pt.translate(VirtAddr::new(0x2A_BCDE)).expect("应能翻译");
+        assert_eq!(phys.as_u64(), expected, "大页内偏移必须保留");
+        assert!(flags.is_executable(), "请求了可执行 -> NX 未置位");
+        assert!(!flags.is_writable(), "未请求可写");
     }
 
     #[test]

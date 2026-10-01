@@ -83,6 +83,11 @@ mod tests {
             Ok(())
         }
 
+        // 这些假表不建模翻译：如实回答「未映射」，而不是假装知道。
+        fn translate(&self, _virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+            None
+        }
+
         unsafe fn activate(&self) {}
     }
 
@@ -133,7 +138,12 @@ mod tests {
                 self.pages.push((virt.as_u64(), phys.as_u64(), len));
                 Ok(())
             }
-            unsafe fn activate(&self) {}
+            // 这些假表不建模翻译：如实回答「未映射」，而不是假装知道。
+        fn translate(&self, _virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+            None
+        }
+
+        unsafe fn activate(&self) {}
         }
 
         let mut table = Recording { large: Vec::new(), pages: Vec::new() };
