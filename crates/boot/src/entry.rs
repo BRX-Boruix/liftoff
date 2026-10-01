@@ -184,15 +184,8 @@ fn stage_text(stage: BringUpError) -> &'static [u8] {
     }
 }
 
-/// 只激活页表（不返回）。
-///
-/// # Safety
-///
-/// 调用方必须保证新页表仍映射当前正在执行的代码与栈。
-unsafe fn activate_only<P: PageTable>(table: &mut P) {
-    // SAFETY: 由调用方保证（见函数文档）。
-    unsafe { table.activate() };
-}
+// （原 activate_only 辅助已删除：激活现在只发生一次，即 ExitBootServices 成功之后、
+// 跳转之前，位于 enter_kernel —— 先激活再 Exit 会让固件在 Exit 内部挂死，真机实测。）
 
 /// 把可用区间**向下对齐**到 `align`，并把长度补到整页（含尾部）。
 ///
@@ -1594,9 +1587,8 @@ pub unsafe fn bring_up(
     for byte in b"[liftoff] step: activating\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
-    // SAFETY: 由调用方保证（见函数文档）。
-    unsafe { activate_only(&mut page_table) };
-    for byte in b"[liftoff] step: activated\n" as &[u8] {
+    // 激活已移到 Exit 之后（enter_kernel 内）—— 此处只保留页表构建结果。
+    for byte in b"[liftoff] step: table ready\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
     // 激活后**自检**：从内核的虚拟地址读回几个字节，与源映像比对。
