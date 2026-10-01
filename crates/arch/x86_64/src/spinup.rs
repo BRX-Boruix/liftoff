@@ -124,6 +124,13 @@ core::arch::global_asm!(
     "    xor eax, eax",
     "    mov cr4, eax",
     "    mov cr3, eax",
+    "    sub esp, 8",
+    "    sgdt [esp]",
+    "    mov eax, [esp + 2]",
+    "    add esp, 8",
+    "    mov byte ptr [eax + 0x3d], 0x89",
+    "    mov ax, 0x38",
+    "    ltr ax",
     "spinup_go32_end:",
     // 32 位重升：PAT、LA57、CR0.WP、CR3=新表、PAE、EFER、CR0.PG、重进 64。
     "limine_spinup_32:",
