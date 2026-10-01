@@ -1481,6 +1481,9 @@ pub unsafe fn bring_up(
     // 激活后**自检**：从内核的虚拟地址读回几个字节，与源映像比对。
     // 这能把“映射错了”与“映射对了但内核自己崩”区分开，避免继续盲猜。
     {
+        for byte in b"[liftoff] step: checking kernel map\n" as &[u8] {
+            crate::PlatformImpl::write_byte(*byte);
+        }
         let first = &c.segments[0];
         let offset = usize::try_from(first.p_offset).unwrap_or(0);
         let mut ok = offset + 8 <= len;
