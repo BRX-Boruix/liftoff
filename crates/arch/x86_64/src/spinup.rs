@@ -88,10 +88,14 @@ core::arch::global_asm!(
     // rdi = spinup_go32 低地址拷贝，rsi = 低地址栈顶，rdx = 32 位参数区指针。
     "    cli",
     "    lgdt [rdx]",
+    "    mov al, 0x62",
+    "    out dx, al",
     "    lidt [rdx + 10]",
     "    lea rbx, [rip + .reload_cs]",
     "    push 0x28",
     "    push rbx",
+    "    mov al, 0x63",
+    "    out dx, al",
     "    retfq",
     ".reload_cs:",
     "    mov eax, 0x30",
@@ -107,6 +111,8 @@ core::arch::global_asm!(
     // 32 位段：关分页、清 CR0/CR3/CR4/EFER（对照 spinup_go32）。
     ".code32",
     "spinup_go32:",
+    "    mov al, 0x64",
+    "    out dx, al",
     "    mov eax, 0x20",
     "    mov ds, ax",
     "    mov es, ax",
@@ -131,6 +137,8 @@ core::arch::global_asm!(
     "    mov byte ptr [eax + 0x3d], 0x89",
     "    mov ax, 0x38",
     "    ltr ax",
+    "    mov al, 0x65",
+    "    out dx, al",
     "spinup_go32_end:",
     // 32 位重升：PAT、LA57、CR0.WP、CR3=新表、PAE、EFER、CR0.PG、重进 64。
     "limine_spinup_32:",
