@@ -1,7 +1,7 @@
 //! x86_64 架构实现。
 //!
-//! 汇编边界（ADR-051）：单条语义操作使用内联 `asm!`；需要整块复制到低内存执行的
-//! trampoline 另置于 `global_asm!`（尚未实现）。
+//! 汇编边界（ADR-051）：单条语义操作使用内联 asm!；需要整块复制到低内存执行的
+//! trampoline 另置于 global_asm!（见 spinup 模块）。
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -11,3 +11,4 @@ extern crate std;
 
 pub mod platform;
 pub mod paging;
+pub mod spinup;
