@@ -9,7 +9,8 @@ use loader::elf::{ElfError, ProgramHeader, load_segments, parse_elf_header, pars
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
-use crate::responses::{Responses, fill_executable_file};
+use crate::responses::{Responses, fill_executable_file, fill_framebuffer};
+use firmware::graphics::GraphicsSink;
 use limine::scan::RequestHit;
 use mm::plan::{Mapping, PlanError};
 use mm::usable::UsableRange;
@@ -22,7 +23,8 @@ use current::X86PageTable;
 use firmware::block::DeviceIndex;
 use firmware_current::current::{
     ALLOCATE_ANY_PAGES, AllocatePages, BootServicesTable, EFI_LOADER_DATA, EfiFrameAllocator,
-    ExitBootServices, Handle, SUCCESS, SystemTable, UefiBlockDevices, UefiBootServices, acpi_rsdp,
+    ExitBootServices, Handle, SUCCESS, SystemTable, UefiBlockDevices, UefiBootServices, UefiGraphics,
+    acpi_rsdp, graphics_output_mode,
     UefiMemoryMapSource, boot_services_of,
 };
 
@@ -137,6 +139,12 @@ pub fn start_with<P: Platform>(
             map_key: &mut *core::ptr::addr_of_mut!(MAP_KEY),
             destination: destination_phys,
             rsdp: acpi_rsdp(&*system_table),
+            framebuffer: graphics_output_mode(
+                (*boot_services).locate_handle,
+                (*boot_services).handle_protocol,
+            )
+            .map(|mode| UefiGraphics::new(mode).framebuffer().ok())
+            .flatten(),
         };
         // SAFETY: 由 `check_before_entry` 与页表规划共同保证（见 `bring_up` 文档）。
         bring_up(&*boot_services, image_handle, c, |entry| <P as Platform>::jump_to(entry))
@@ -1361,6 +1369,8 @@ pub struct BringUp<'a, 'b> {
     pub destination: u64,
     /// ACPI 的 RSDP（从固件配置表取；没有就是 `None`，不编造）。
     pub rsdp: Option<*mut core::ffi::c_void>,
+    /// 帧缓冲（从固件 GOP 取；没有就 `None`，不编造）。
+    pub framebuffer: Option<firmware::graphics::FramebufferInfo>,
 }
 
 /// 交接失败原因（保留环节）。
@@ -1649,6 +1659,11 @@ pub unsafe fn bring_up(
     // RSDP 只在**真的从配置表找到**时才填；没有就留空 —— 给假指针比不给更糟。
     if let Some(rsdp) = c.rsdp {
         c.responses.set_rsdp(rsdp);
+    }
+    // 帧缓冲同理：只有**真的从固件拿到**才填。内核很可能先往帧缓冲输出，
+    // 之后才初始化串口 —— 帧缓冲为空时它可能就停在那里。
+    if let Some(info) = &c.framebuffer {
+        fill_framebuffer(c.responses, info).map_err(BringUpError::Responses)?;
     }
     // 可执行地址与可执行文件：两者的值我们**自己就知道**（装载决策），不需要问固件。
     c.responses.set_executable_address(c.destination, kernel_virt);

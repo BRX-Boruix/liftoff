@@ -28,6 +28,8 @@ pub mod current {
     pub use efi::types::SystemTable;
     pub use efi::uefi_block_devices::UefiBlockDevices;
     pub use efi::uefi_files::UefiFiles;
+    pub use efi::graphics::GraphicsOutputMode;
+    pub use efi::graphics::graphics_output_mode;
     pub use efi::uefi_graphics::UefiGraphics;
     pub use efi::uefi_memory_source::UefiMemoryMapSource;
 }
