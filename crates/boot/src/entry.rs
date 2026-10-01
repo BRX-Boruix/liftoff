@@ -275,6 +275,10 @@ pub unsafe fn handoff(
         }
         // SAFETY: 由调用方保证（见函数文档与 `exit_prepared` 的 SAFETY 契约）。
         let exit_result = unsafe { exit_prepared(exit, image_handle, map_key) };
+        // 到这里 = Exit 调用**返回了**（成功或失败都算）。打印 R 作为「活着的」证据。
+        // （真机专用：out 指令在宿主用户态是特权指令。）
+        #[cfg(target_os = "uefi")]
+        crate::PlatformImpl::write_byte(b'R');
         match exit_result {
             Ok(()) => {
                 // Exit 成功：**关中断**（旧实现 misc.c:429 同款）—— 引导服务失效后
