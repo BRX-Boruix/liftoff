@@ -280,6 +280,86 @@ impl Responses {
     }
 }
 #[cfg(test)]
+/// 请求覆盖：内核声明什么，我们就必须应答什么。
+///
+/// 为什么值得一组专门的测试：这是目标项 ①「按内核声明的请求真正填充」的**可执行定义**。
+/// 此前的证据只是「内核能启动」—— 那证明的是"至少用到的那些填对了"，不是"声明集被完整
+/// 覆盖"。E5 排查时正是靠一次性的 Python 对齐才发现 7/7 全覆盖，但那个结论没有任何东西
+/// 守着：将来内核多声明一个请求，我们会**静默不应答**，而内核可能只是降级而不是报错。
+#[cfg(test)]
+mod request_coverage_tests {
+    use super::Responses;
+    use limine::base::COMMON_MAGIC;
+    use limine::scan::KNOWN_REQUESTS;
+
+    /// ① 协议 crate 里定义的**每一个**请求，`Responses` 都必须有应答。
+    ///
+    /// 这条断言的是「我们声称实现的协议面」与「实际能应答的集合」一致 ——
+    /// `KNOWN_REQUESTS` 是协议侧的单点定义（S15），不在这里重抄一份。
+    #[test]
+    fn every_known_request_has_a_response() {
+        let mut responses = Responses::new();
+        for (id, _size) in KNOWN_REQUESTS {
+            assert!(
+                responses.pointer_for(id).is_some(),
+                "协议定义了请求 {:#x?}，但 Responses 没有对应应答",
+                id,
+            );
+        }
+    }
+
+    /// ② 真实内核**声明**的每一个请求，都必须被应答。
+    ///
+    /// 按 `COMMON_MAGIC` 直接扫描，不依赖 START/END 标记 —— 内核可以不带标记而仍然
+    /// 声明请求（实测它正是如此：7 个 `COMMON_MAGIC`）。
+    #[test]
+    fn every_request_the_kernel_declares_is_answered() {
+        let Some(image) = crate::test_support::real_kernel() else {
+            // 不静默跳过：产物不在时必须看得见。
+            std::eprintln!("跳过：真实 ISO 不存在（无法验证内核声明集）");
+            return;
+        };
+        let magic = [COMMON_MAGIC[0], COMMON_MAGIC[1]];
+        let mut responses = Responses::new();
+        let mut declared = 0usize;
+        let mut at = 0usize;
+        while at + 32 <= image.len() {
+            let window = &image[at..at + 32];
+            let mut words = [0u64; 4];
+            for (index, slot) in words.iter_mut().enumerate() {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(&window[index * 8..index * 8 + 8]);
+                *slot = u64::from_le_bytes(raw);
+            }
+            if words[0] == magic[0] && words[1] == magic[1] {
+                declared += 1;
+                let id = words;
+                assert!(
+                    responses.pointer_for(&id).is_some(),
+                    "内核声明了请求 {:016x?}，但我们没有应答（会静默漏填）",
+                    id,
+                );
+                at += 32;
+                continue;
+            }
+            at += 8;
+        }
+        assert_eq!(declared, 7, "实测内核声明 7 个请求；数量变了说明内核换了声明集");
+    }
+
+    /// ③ 负对照：未知 ID 必须返回 `None`。
+    ///
+    /// 没有这条，上面两条断言就可能是「永远通过」的空断言 —— 若 `pointer_for` 对任何
+    /// 输入都返回 `Some`，覆盖测试会毫无意义地全绿。
+    #[test]
+    fn an_unknown_request_has_no_response() {
+        let mut responses = Responses::new();
+        let bogus = [0u64, 0, 0xdead_beef_dead_beef, 0xfeed_face_feed_face];
+        assert!(responses.pointer_for(&bogus).is_none(), "未知 ID 不应有应答");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::Responses;
     use limine::base::{HHDM_REQUEST_ID, HhdmResponse};

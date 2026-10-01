@@ -13,6 +13,9 @@ extern crate std;
 /// 入口（bin）与本 lib 都经它使用平台能力；**实现的选择集中在这里**，入口不自己挑实现。
 pub use current::PlatformImpl;
 
+#[cfg(test)]
+pub mod test_support;
+
 pub mod diag;
 pub mod entry;
 pub mod media;

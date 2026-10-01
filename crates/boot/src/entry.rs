@@ -1285,12 +1285,9 @@ mod kernel_plan_tests {
     use mm::takeover::MustStay;
 
     /// 从真实 ISO 里取出内核映像（extent 33、24,619,400 字节）。
+    /// 委派到共享实现（S15）：ISO 路径、LBA 与长度只在 `test_support` 里定义一次。
     fn real_kernel() -> Option<std::vec::Vec<u8>> {
-        let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
-        let bytes = std::fs::read(iso).ok()?;
-        let at = 33 * 2048;
-        let size = 24_619_400;
-        bytes.get(at..at + size).map(|s| s.to_vec())
+        crate::test_support::real_kernel()
     }
 
     #[test]
@@ -2161,10 +2158,9 @@ mod copy_segments_tests {
     use loader::elf::{ElfError, ProgramHeader};
     use mm::plan::Mapping;
 
+    /// 委派到共享实现（S15）：ISO 路径、LBA 与长度只在 `test_support` 里定义一次。
     fn real_kernel() -> Option<std::vec::Vec<u8>> {
-        let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
-        let bytes = std::fs::read(iso).ok()?;
-        bytes.get(33 * 2048..33 * 2048 + 24_619_400).map(|s| s.to_vec())
+        crate::test_support::real_kernel()
     }
 
     fn mapping(virt: u64, phys: u64, len: u64) -> Mapping {
@@ -2374,10 +2370,9 @@ mod load_and_activate_tests {
         }
     }
 
+    /// 委派到共享实现（S15）：ISO 路径、LBA 与长度只在 `test_support` 里定义一次。
     fn real_kernel() -> Option<std::vec::Vec<u8>> {
-        let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../boruix.iso");
-        let bytes = std::fs::read(iso).ok()?;
-        bytes.get(33 * 2048..33 * 2048 + 24_619_400).map(|s| s.to_vec())
+        crate::test_support::real_kernel()
     }
 
     fn mapping(virt: u64, phys: u64, len: u64) -> Mapping {
