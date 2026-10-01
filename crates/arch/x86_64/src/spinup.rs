@@ -272,6 +272,10 @@ pub struct SpinupArgs {
 unsafe extern "C" {
     static spinup_text_start: u8;
     static spinup_text_end: u8;
+    #[allow(unused)]
+    static spinup_gdt_ptr: u8;
+    #[allow(unused)]
+    static spinup_idt_ptr: u8;
     static spinup_go32: u8;
     #[allow(unused)]
     fn spinup_common64();
@@ -314,6 +318,17 @@ pub unsafe fn stage_low_buffer(
         for (index, word) in words.iter().enumerate() {
             core::ptr::write_unaligned((args_at + index * 4) as *mut u32, *word);
         }
+        // **重定向拷贝里的 GDTR/IDTR**：`.quad spinup_gdt` 指向的是高地址原版 ——
+        // Exit 后高地址不可靠，CPU 取段描述符会 #GP（真机实测 data=0x20）。
+        // 汇编里 GDTR/IDTR 是 `spinup_gdt_ptr`/`spinup_idt_ptr`（[limit u16][base u64]，
+        // base 在 +8）；把它们的 base 改成**低地址 GDT**。
+        let gdt_base = gdt_at as u64;
+        let idt_zero: [u8; 10] = [0; 10];
+        let _ = idt_zero;
+        core::ptr::write_unaligned(
+            (buffer as usize + ((&raw const spinup_gdt_ptr as usize) - text_start)) as *mut u64,
+            gdt_base,
+        );
     }
     let stack_top = buffer as usize + total;
     let go32_low = buffer as usize + ((&raw const spinup_go32 as usize) - text_start);
