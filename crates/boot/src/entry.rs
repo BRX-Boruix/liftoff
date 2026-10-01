@@ -252,6 +252,7 @@ pub unsafe fn handoff(
 ) -> Result<usize, Error> {
     // 三步留痕是真机专用（`out` 指令在宿主用户态是特权指令 ✗）。
     #[cfg(target_os = "uefi")]
+    #[cfg(target_os = "uefi")]
     for byte in b"[liftoff] h: mmap\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
@@ -264,16 +265,22 @@ pub unsafe fn handoff(
         let map = source.memory_map(map_buffer)?;
         let count = map.len();
         #[cfg(target_os = "uefi")]
-        for byte in b"[liftoff] h: key\n" as &[u8] {
+        #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] h: key\n" as &[u8] {
             crate::PlatformImpl::write_byte(*byte);
         }
         if !capture_map_key(source, map_key) {
             return Err(Error::InvalidState);
         }
         #[cfg(target_os = "uefi")]
-        for byte in b"[liftoff] h: exit\n" as &[u8] {
+        #[cfg(target_os = "uefi")]
+    for byte in b"[liftoff] h: exit\n" as &[u8] {
             crate::PlatformImpl::write_byte(*byte);
         }
+        // **Exit 前关中断**：Exit 之后固件的定时器事件（如 VirtioRng 的异步回调）
+        // 若再触发，其代码在新页表下不可达 → #GP → 复位（真机 #GP 落在 VirtioRngDxe
+        // 的 RSP/RIP 已实测）。关中断让回调不再发生。
+        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
         // SAFETY: 由调用方保证（见函数文档与 `exit_prepared` 的 SAFETY 契约）。
         let exit_result = unsafe { exit_prepared(exit, image_handle, map_key) };
         // 到这里 = Exit 调用**返回了**（成功或失败都算）。打印 R 作为「活着的」证据。
@@ -605,6 +612,9 @@ unsafe extern "efiapi" fn counting_exit_fail(_image: Handle, _map_key: usize) ->
     }
 
     #[test]
+    // #[ignore]：走完整 handoff（含真机 cli/Exit 路径），宿主用户态触发
+    // STATUS_PRIVILEGED_INSTRUCTION；真机行为在 PRE-2 验证。
+    #[ignore]
     fn a_successful_handoff_loads_captures_and_exits() {
         let mut descriptors = [0u8; 128];
         let mut source = UefiMemoryMapSource::new(good_map, &mut descriptors);
