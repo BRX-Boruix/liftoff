@@ -9,7 +9,7 @@ use loader::elf::{ElfError, ProgramHeader, load_segments, parse_elf_header, pars
 use arch::platform::Platform;
 use firmware::boot_services::BootServicesControl;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
-use crate::responses::Responses;
+use crate::responses::{Responses, fill_executable_file};
 use limine::scan::RequestHit;
 use mm::plan::{Mapping, PlanError};
 use mm::usable::UsableRange;
@@ -169,6 +169,7 @@ fn stage_text(stage: BringUpError) -> &'static [u8] {
         BringUpError::DirectMap => b"[liftoff] stage: direct map\n",
         BringUpError::Apply(_) => b"[liftoff] stage: apply plan\n",
         BringUpError::Copy(_) => b"[liftoff] stage: copy segments\n",
+        BringUpError::Responses(_) => b"[liftoff] stage: responses\n",
         BringUpError::Handoff(_) => b"[liftoff] stage: handoff\n",
     }
 }
@@ -1376,6 +1377,8 @@ pub enum BringUpError {
     Apply(arch::paging::MapError),
     /// 拷贝段失败。
     Copy(KernelPlanError),
+    /// 填响应失败。
+    Responses(Error),
     /// 交接编排失败。
     Handoff(HandoffError),
 }
@@ -1477,6 +1480,14 @@ pub unsafe fn bring_up(
     unsafe { activate_only(&mut page_table) };
     let _ = stays;
     // 8) 交接：填响应 → 检查 → 取键退出 → 跳转。
+    //
+    // HHDM 偏移是**必须**的：内核靠它把物理地址翻成虚拟地址。不填（或填 0）它会算错地址，
+    // 真实运行里表现为跳转后立刻复位 —— 这很可能就是复位的原因。
+    c.responses.set_hhdm_offset(HHDM_OFFSET);
+    // 可执行地址与可执行文件：两者的值我们**自己就知道**（装载决策），不需要问固件。
+    c.responses.set_executable_address(c.destination, kernel_virt);
+    fill_executable_file(c.responses, c.destination, len as u64)
+        .map_err(BringUpError::Responses)?;
     let h = Handoff {
         image: &mut c.kernel_out[..len],
         hits: c.hits,
