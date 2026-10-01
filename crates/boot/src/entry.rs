@@ -1662,29 +1662,36 @@ pub unsafe fn bring_up(
         }
     }
     let _ = stays;
-    // 只扫**已装载段**的文件区间：固件里内存访问极慢，扫全映像不可行。
+    // 扫描范围：**优先 `.data` 节**（实测真实内核的 7 个请求全在其中，约 345 KB ——
+    // 固件里内存读约 100 µs/次，扫全映像或全段都跑不完）；节表不可用时**回退**到
+    // 已装载段区间（语义等价性由真实内核对照测试守住，只是慢）。
     static mut RANGES: [(usize, usize); 16] = [(0, 0); 16];
     let mut range_count = 0usize;
     // SAFETY: 引导阶段单线程；本数组在 `enter_kernel` 之前一直有效。
     let ranges = unsafe { &mut *core::ptr::addr_of_mut!(RANGES) };
-    for segment in &c.segments[..info.segment_count] {
-        if range_count == ranges.len() {
-            break;
+    if let Some((start, end)) = loader::elf::section_file_range(&c.kernel_out[..len], ".data") {
+        ranges[0] = (start, end);
+        range_count = 1;
+    } else {
+        for segment in &c.segments[..info.segment_count] {
+            if range_count == ranges.len() {
+                break;
+            }
+            let Ok(start) = usize::try_from(segment.p_offset) else {
+                continue;
+            };
+            let Ok(size) = usize::try_from(segment.p_filesz) else {
+                continue;
+            };
+            let Some(end) = start.checked_add(size) else {
+                continue;
+            };
+            if end > len {
+                continue;
+            }
+            ranges[range_count] = (start, end);
+            range_count += 1;
         }
-        let Ok(start) = usize::try_from(segment.p_offset) else {
-            continue;
-        };
-        let Ok(size) = usize::try_from(segment.p_filesz) else {
-            continue;
-        };
-        let Some(end) = start.checked_add(size) else {
-            continue;
-        };
-        if end > len {
-            continue;
-        }
-        ranges[range_count] = (start, end);
-        range_count += 1;
     }
     // 决定性检查：**激活之后**，那块固件页缓冲还读得到吗？
     // 自检只读过内核的虚拟映射，从没读过这块缓冲 —— 若它不在恒等映射里，
