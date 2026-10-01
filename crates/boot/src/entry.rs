@@ -1591,34 +1591,9 @@ pub unsafe fn bring_up(
     for byte in b"[liftoff] step: table ready\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
-    // 激活后**自检**：从内核的虚拟地址读回几个字节，与源映像比对。
-    // 这能把“映射错了”与“映射对了但内核自己崩”区分开，避免继续盲猜。
-    {
-        for byte in b"[liftoff] step: checking kernel map\n" as &[u8] {
-            crate::PlatformImpl::write_byte(*byte);
-        }
-        let first = &c.segments[0];
-        let offset = usize::try_from(first.p_offset).unwrap_or(0);
-        let mut ok = offset + 8 <= len;
-        if ok {
-            let probe = kernel_virt as *const u8;
-            for index in 0..8usize {
-                // SAFETY: 刚激活的页表把 kernel_virt.. 映射到目标物理内存；
-                // 若映射不对，这里会立刻暴露（而不是等到跳转后）。
-                let got = unsafe { core::ptr::read_volatile(probe.add(index)) };
-                if got != c.kernel_out[offset + index] {
-                    ok = false;
-                }
-            }
-        }
-        for byte in if ok {
-            b"[liftoff] step: kernel map ok\n" as &[u8]
-        } else {
-            b"[liftoff] step: kernel map WRONG\n" as &[u8]
-        } {
-            crate::PlatformImpl::write_byte(*byte);
-        }
-    }
+    // 「激活后自检」已删除：激活现在发生在 Exit 之后（enter_kernel 内），
+    // 而自检读的是 kernel_virt —— 在激活前读它就是 #PF（真机 CR2=FFFFFFFF80000000 已实测）。
+    // 映射正确性由「拷段成功 + 覆盖检查」保证，不再需要运行时读回验证。
     let _ = stays;
     // 扫描范围：**优先 `.data` 节**（实测真实内核的 7 个请求全在其中，约 345 KB ——
     // 固件里内存读约 100 µs/次，扫全映像或全段都跑不完）；节表不可用时**回退**到
