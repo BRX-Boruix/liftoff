@@ -80,10 +80,12 @@ core::arch::global_asm!(
     ".global limine_spinup_32_end",
     ".global spinup_gdt_ptr",
     ".global spinup_idt_ptr",
+    ".global spinup_text_start",
+    ".global spinup_text_end",
+    "spinup_text_start:",
+    "spinup_common64:",
     // 64 位入口（Exit 后从 enter_kernel 跳到这里）：加载自建 GDT/IDT，降 32 位。
     // rdi = spinup_go32 低地址拷贝，rsi = 低地址栈顶，rdx = 32 位参数区指针。
-    ".code64",
-    "spinup_common64:",
     "    cli",
     "    lgdt [rip + spinup_gdt_ptr]",
     "    lidt [rip + spinup_idt_ptr]",
@@ -223,6 +225,7 @@ core::arch::global_asm!(
     "    xor r15d, r15d",
     "    iretq",
     "limine_spinup_32_end:",
+    "spinup_text_end:",
     // 自建 GDT（build_gdt() 的字节在运行时填入 spinup_gdt）+ GDTR/IDTR。
     ".align 8",
     "spinup_gdt:",
