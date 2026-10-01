@@ -323,15 +323,120 @@ mod scan_requests_tests {
     }
 }
 
+/// 分块扫描大映像（每块 `chunk` 字节，`chunk == 0` 表示不分块）。
+///
+/// **为什么需要**：固件里对 24.6 MB 一次性扫描**跑不完**（实测 434 秒无输出），
+/// 而同一段映像分块扫描能正常跑完（64 KB × 64 段全部通过）。宿主上全量扫描只要 0.57 秒，
+/// 所以这是**固件环境的限制**，不是算法问题 —— 但接口必须按它工作。
+///
+/// 两个正确性要点：
+/// - 请求可能**跨块边界** → 每块与下一块**重叠 32 字节**（一个请求 ID 的长度）；
+/// - 重叠会让同一请求被扫到两次 → 按 `offset` **去重**。
+pub fn scan_chunked(
+    image: &[u8],
+    chunk: usize,
+    hits: &mut [RequestHit],
+) -> Result<usize, ScanError> {
+    /// 一个请求 ID 的字节长度：重叠必须至少这么大，否则跨块请求会漏。
+    const OVERLAP: usize = 32;
+    let chunk = if chunk == 0 { image.len().max(1) } else { chunk };
+    let mut count = 0usize;
+    let mut part = [RequestHit::EMPTY; 64];
+    let mut start = 0usize;
+    while start < image.len() {
+        let end = core::cmp::min(start + chunk, image.len());
+        let found = scan_requests(&image[start..end], &mut part)?;
+        for hit in &part[..found] {
+            let absolute = RequestHit {
+                id: hit.id,
+                offset: hit.offset + start,
+                size: hit.size,
+            };
+            // 重叠区域会重复命中同一个请求 —— 按偏移去重。
+            if hits[..count].iter().any(|existing| existing.offset == absolute.offset) {
+                continue;
+            }
+            if count == hits.len() {
+                return Err(ScanError::TooManyRequests);
+            }
+            hits[count] = absolute;
+            count += 1;
+        }
+        if end == image.len() {
+            break;
+        }
+        // 回退 OVERLAP 字节以覆盖跨块请求；**必须严格推进**，否则死循环。
+        let next = end.saturating_sub(OVERLAP);
+        start = if next > start { next } else { end };
+    }
+    Ok(count)
+}
+
+/// 在若干**文件区间**内扫描（区间通常来自 ELF 的已装载段）。
+///
+/// **为什么需要**：固件里内存访问极慢（量级估计每次读约 100 微秒），扫 24.6 MB 不可行。
+/// 而请求必须位于**会被装载的段**里才可能在运行中存在 —— 真实内核的 7 个请求都在第三个段内。
+/// 只扫已装载段约 10 MB，是 2.5 倍的减少，且**语义等价**（由真实内核对照测试守住）。
+pub fn scan_ranges(
+    image: &[u8],
+    ranges: &[(usize, usize)],
+    chunk: usize,
+    hits: &mut [RequestHit],
+) -> Result<usize, ScanError> {
+    let mut count = 0usize;
+    for (start, end) in ranges {
+        if start >= end || *end > image.len() {
+            continue;
+        }
+        let mut part = [RequestHit::EMPTY; 64];
+        let found = scan_chunked(&image[*start..*end], chunk, &mut part)?;
+        for hit in &part[..found] {
+            let absolute = RequestHit {
+                id: hit.id,
+                offset: hit.offset + *start,
+                size: hit.size,
+            };
+            if hits[..count].iter().any(|existing| existing.offset == absolute.offset) {
+                continue;
+            }
+            if count == hits.len() {
+                return Err(ScanError::TooManyRequests);
+            }
+            hits[count] = absolute;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 #[cfg(test)]
 mod real_kernel_scan_tests {
-    use super::{HHDM_REQUEST_ID, MEMMAP_REQUEST_ID, RequestHit, scan_requests};
+    use super::{HHDM_REQUEST_ID, MEMMAP_REQUEST_ID, RequestHit, scan_requests, scan_ranges};
 
     /// 从真实 ISO 里取出内核映像（extent 33、24,619,400 字节）。
     fn real_kernel() -> Option<std::vec::Vec<u8>> {
         let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../boruix.iso");
         let bytes = std::fs::read(iso).ok()?;
         bytes.get(33 * 2048..33 * 2048 + 24_619_400).map(|s| s.to_vec())
+    }
+
+    /// 真实内核三个 `PT_LOAD` 段的文件区间（实测自 `readelf`：offset/filesz）。
+    const REAL_SEGMENTS: [(usize, usize); 3] = [
+        (0x1000, 0x1000 + 0x223cb0),
+        (0x224000, 0x224000 + 0x4d5780),
+        (0x6fa000, 0x6fa000 + 0x2bea88),
+    ];
+
+    #[test]
+    fn scanning_only_the_loaded_segments_still_finds_every_request() {
+        let Some(image) = real_kernel() else {
+            std::eprintln!("跳过：真实 ISO 不存在");
+            return;
+        };
+        let mut hits = [RequestHit::EMPTY; 64];
+        let count = scan_ranges(&image, &REAL_SEGMENTS, 4 << 20, &mut hits).expect("扫描应成功");
+        std::eprintln!("按段区间扫到 {} 个请求", count);
+        assert_eq!(count, 7, "按段区间扫描必须与全量扫描得到同样的 7 个请求");
     }
 
     #[test]
