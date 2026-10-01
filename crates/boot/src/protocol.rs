@@ -73,6 +73,15 @@ pub fn fill_responses(
             }
         }
         if let Some(pointer) = responses.pointer_for(&hit.id) {
+            // **写进内核映像的必须是 HHDM 地址**（对照 brxLimine：它把每一个响应指针
+            // 都过 `reported_addr`，即 `物理 + direct_map_offset`）。
+            //
+            // 响应容器在引导器的**低地址**内存里：裸地址只在初始恒等映射中有效，内核
+            // 一旦切到用户进程的地址空间，读同一指针就 #PF —— 真机实测落在
+            // `arch_x86_64::smp::requested_cpu_count` 读 `0x3de16680`。
+            // 偏移只在这一处（写入内核映像的边界）加，`pointer_for` 仍返回裸指针，
+            // 宿主测试因此可以直接解引用它。
+            let pointer = crate::entry::HHDM_OFFSET.wrapping_add(pointer as u64) as *mut core::ffi::c_void;
             fill_response(image, &hit, pointer).map_err(|_| ScanError::UnclosedRegion)?;
             filled += 1;
         }
@@ -178,11 +187,16 @@ mod fill_responses_tests {
             fill_responses(&mut image, &[], &mut hits, &mut responses).expect("填充成功");
         assert_eq!(report.hits, 1);
         assert_eq!(report.filled, 1);
-        // 请求头里 response 在 +40；把那里读出来应与容器给出的地址一致。
+        // 请求头里 response 在 +40；写进去的必须是 **HHDM 地址**（`裸地址 + direct_map_offset`），
+        // 因为裸地址只在初始恒等映射里有效，内核切到用户地址空间后就够不到它了。
         let at = hits[0].offset + 40;
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&image[at..at + 8]);
-        assert_eq!(usize::from_ne_bytes(buf), expected as usize);
+        assert_eq!(
+            usize::from_ne_bytes(buf),
+            crate::entry::HHDM_OFFSET as usize + expected as usize,
+            "写进内核映像的响应指针必须是 HHDM 地址"
+        );
     }
 
     #[test]
