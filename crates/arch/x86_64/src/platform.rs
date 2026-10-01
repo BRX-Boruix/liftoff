@@ -32,9 +32,19 @@ impl Platform for X86_64 {
     }
 
     unsafe fn jump_to(entry: u64) -> ! {
+        // Limine 协议只保证 RSP 必须指向有效栈：固件栈在 ExitBootServices 之后的
+        // 状态未知，所以这里改用调用方预留的参数（RDI = 入口前栈顶）作为新栈，
+        // 再跳入内核。RDI 同时保留入口参数语义由调用方约定。
         // SAFETY: 由调用方保证（见 trait 的 SAFETY 契约）。
         unsafe {
-            core::arch::asm!("jmp {entry}", entry = in(reg) entry, options(noreturn));
+            core::arch::asm!(
+                "mov rsp, {new_stack}",
+                "xor rbp, rbp",
+                "jmp {entry}",
+                new_stack = in(reg) 0xffff_ff80_80ae_d000u64,
+                entry = in(reg) entry,
+                options(noreturn),
+            );
         }
     }
 
