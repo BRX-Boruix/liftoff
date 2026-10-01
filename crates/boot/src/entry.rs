@@ -1918,7 +1918,8 @@ pub unsafe fn bring_up(
     c.responses.set_hhdm_offset(HHDM_OFFSET);
     // RSDP 只在**真的从配置表找到**时才填；没有就留空 —— 给假指针比不给更糟。
     if let Some(rsdp) = c.rsdp {
-        c.responses.set_rsdp(rsdp);
+        // **HHDM 地址**（对照 brxLimine `limine.c:1104`：`rsdp_response->address = reported_addr(rsdp)`）。
+    c.responses.set_rsdp((HHDM_OFFSET.wrapping_add(rsdp as u64)) as *mut core::ffi::c_void);
     }
     // 帧缓冲同理：只有**真的从固件拿到**才填。内核很可能先往帧缓冲输出，
     // 之后才初始化串口 —— 帧缓冲为空时它可能就停在那里。

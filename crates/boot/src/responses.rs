@@ -576,7 +576,8 @@ pub fn fill_executable_file(
 ) -> Result<(), Error> {
     responses.executable_file_data = File {
         revision: 0,
-        address: address as *mut core::ffi::c_void,
+        // **HHDM 地址**（对照 brxLimine `limine.c:424/427`：`ret.address = reported_addr(file->fd)`）。
+        address: crate::entry::HHDM_OFFSET.wrapping_add(address) as *mut core::ffi::c_void,
         size,
         path: KERNEL_PATH.as_ptr() as *mut core::ffi::c_char,
         string: core::ptr::null_mut(),
@@ -613,7 +614,13 @@ mod fill_executable_file_tests {
         assert!(!response.executable_file.is_null(), "必须给出可执行文件描述");
         // SAFETY: 指针指向容器内的 `File`。
         let file: &File = unsafe { &*response.executable_file };
-        assert_eq!(file.address as u64, 0x10_0000, "地址是装载后的物理位置");
+        // **必须是 HHDM 地址**（对照 brxLimine `limine.c:424/427`：`ret.address = reported_addr(file->fd)`）。
+        // 裸物理地址只在初始恒等映射里存在，切到用户地址空间后内核读它就会 #PF。
+        assert_eq!(
+            file.address as u64,
+            crate::entry::HHDM_OFFSET + 0x10_0000,
+            "地址必须是物理地址 + direct_map_offset"
+        );
         assert_eq!(file.size, 24_619_400, "大小取自实测的内核长度");
         assert_eq!(file.media_type, MEDIA_TYPE_GENERIC, "未指明具体介质类型时不冒充");
         assert_eq!(file.partition_index, 0, "未跟踪分区索引就置零，不编造");
