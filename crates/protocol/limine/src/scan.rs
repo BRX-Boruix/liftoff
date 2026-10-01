@@ -318,3 +318,30 @@ mod scan_requests_tests {
         assert_eq!(count, 0, "有标记时以标记为准，标记外的不算");
     }
 }
+
+#[cfg(test)]
+mod real_kernel_scan_tests {
+    use super::{HHDM_REQUEST_ID, MEMMAP_REQUEST_ID, RequestHit, scan_requests};
+
+    /// 从真实 ISO 里取出内核映像（extent 33、24,619,400 字节）。
+    fn real_kernel() -> Option<std::vec::Vec<u8>> {
+        let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../boruix.iso");
+        let bytes = std::fs::read(iso).ok()?;
+        bytes.get(33 * 2048..33 * 2048 + 24_619_400).map(|s| s.to_vec())
+    }
+
+    #[test]
+    fn the_real_kernel_requests_are_found_without_markers() {
+        let Some(image) = real_kernel() else {
+            std::eprintln!("跳过：真实 ISO 不存在");
+            return;
+        };
+        let mut hits = [RequestHit::EMPTY; 64];
+        let count = scan_requests(&image, &mut hits).expect("扫描应成功");
+        std::eprintln!("真实内核里找到 {} 个请求", count);
+        assert!(count >= 5, "真实内核声明了多个请求（实测 COMMON_MAGIC 出现 7 次），实得 {count}");
+        let has = |id: &[u64; 4]| hits[..count].iter().any(|hit| &hit.id == id);
+        assert!(has(&HHDM_REQUEST_ID), "必须找到 HHDM 请求");
+        assert!(has(&MEMMAP_REQUEST_ID), "必须找到内存映射请求");
+    }
+}
