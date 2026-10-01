@@ -1713,25 +1713,6 @@ pub unsafe fn bring_up(
     for byte in b"[liftoff] step: plan applied\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
-    copy_kernel_segments(
-        &c.kernel_out[..len],
-        &c.segments[..info.segment_count],
-        &c.plan[..plan_count],
-        &mut write,
-    )
-    .map_err(BringUpError::Copy)?;
-    // **应用 ELF 重定位**（`ET_DYN` 内核必需）：拷完段之后立刻做，因为内核的数据段
-    // 里存的是需要重定位修正的槽位。我们按**链接地址**装载，所以 `slide = 0`。
-    // 不做的后果已实测：内核 `_start` 读自己的栈指针读到 0，`RSP = 0`，入口第一条
-    // `call` 写 `-8` 而 #PF（单步证据见 docs/TODO/liftoff.md）。
-    let applied = apply_kernel_relocations(
-        &c.kernel_out[..len],
-        &c.plan[..plan_count],
-        0,
-        &mut write,
-    )
-    .map_err(BringUpError::Copy)?;
-    let _ = applied;
     // 真机排障脚手架（CR4/RDMSR/RIP/RSP 寄存器读取）已删除：它们的使命已完成，
     // 且宿主测试二进制里这些特权指令会让整个测试进程以 STATUS_PRIVILEGED_INSTRUCTION
     // 崩溃 —— 这就是此前「偶发」测试崩溃的真正原因（并非偶发）。
@@ -1955,6 +1936,34 @@ pub unsafe fn bring_up(
         // 再升级成 #DF → 三重故障。
         base_revision: 0,
     };
+    // **响应指针必须在拷段之前写进映像。** 内核运行的是 `copy_kernel_segments` 之后
+    // 的那块内存，而 `fill_responses` 写的是暂存缓冲 —— 顺序错了，指针就永远送不到
+    // 内核手里。真机实测的后果：内核报 `Failed to get HHDM response from Limine`
+    // 并在 `mm::init` 里 panic（`crates/mm/src/lib.rs:113`）。
+    let _ = crate::protocol::fill_responses(
+        &mut c.kernel_out[..len],
+        &ranges[..range_count],
+        c.hits,
+        c.responses,
+    )
+    .map_err(|error| BringUpError::Handoff(HandoffError::Fill(error)))?;
+    copy_kernel_segments(
+        &c.kernel_out[..len],
+        &c.segments[..info.segment_count],
+        &c.plan[..plan_count],
+        &mut write,
+    )
+    .map_err(BringUpError::Copy)?;
+    // **应用 ELF 重定位**（`ET_DYN` 内核必需）：拷完段之后立刻做。
+    let applied = apply_kernel_relocations(
+        &c.kernel_out[..len],
+        &c.plan[..plan_count],
+        0,
+        &mut write,
+    )
+    .map_err(BringUpError::Copy)?;
+    let _ = applied;
+
     let Some(spinup_low) = (unsafe {
         current::spinup::stage_low_buffer(low_buffer.as_mut_ptr(), spinup_buf_len, &spinup_args)
     }) else {
