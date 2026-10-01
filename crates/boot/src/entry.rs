@@ -1676,67 +1676,8 @@ pub unsafe fn bring_up(
         // 规模-时间判据已完成使命（1 MB 能过、4 MB 卡住的量级已确认），删除。
         // 分块扫描改用**与真实路径相同**的已装载段区间：此前这里扫的是全部 24.6 MB，
         // 它才是把整次运行拖过 400 秒的元凶 —— 真实路径早已只扫约 10 MB。
-        // 逐条打印扫描结果：**与真实路径同一把扫子**（只扫已装载段区间），
-        // 每 1 MB 打一个点作为进度留痕 —— 点停住＝某段卡住；点走完＝逐条列出请求。
-        let mut total = 0usize;
-        {
-            let mut part = [RequestHit::EMPTY; 64];
-            if let Ok(n) = limine::scan::scan_ranges(&c.kernel_out, ranges, 4 << 20, &mut part) {
-                for hit in &part[..n] {
-                    if total < hits.len() {
-                        hits[total] = *hit;
-                        total += 1;
-                    }
-                }
-            }
-        }
-        for byte in b"[liftoff] scan done\n" as &[u8] {
-            crate::PlatformImpl::write_byte(*byte);
-        }
-        match Ok::<usize, limine::scan::ScanError>(total) {
-            Err(_) => {
-                for byte in b"[liftoff] scan ERR\n" as &[u8] {
-                    crate::PlatformImpl::write_byte(*byte);
-                }
-            }
-            Ok(0) => {
-                for byte in b"[liftoff] scan 0 hits\n" as &[u8] {
-                    crate::PlatformImpl::write_byte(*byte);
-                }
-            }
-            Ok(count) => {
-            for hit in &hits[..count] {
-                let name: &[u8] = if hit.id == limine::base::HHDM_REQUEST_ID {
-                    b"[liftoff] req: hhdm\n"
-                } else if hit.id == limine::memmap::MEMMAP_REQUEST_ID {
-                    b"[liftoff] req: memmap\n"
-                } else if hit.id == limine::framebuffer::FRAMEBUFFER_REQUEST_ID {
-                    b"[liftoff] req: framebuffer\n"
-                } else if hit.id == limine::rsdp::RSDP_REQUEST_ID {
-                    b"[liftoff] req: rsdp\n"
-                } else if hit.id == limine::executable_file::EXECUTABLE_FILE_REQUEST_ID {
-                    b"[liftoff] req: executable_file\n"
-                } else if hit.id == limine::executable_address::EXECUTABLE_ADDRESS_REQUEST_ID {
-                    b"[liftoff] req: executable_address\n"
-                } else if hit.id == limine::entry_point::ENTRY_POINT_REQUEST_ID {
-                    b"[liftoff] req: entry_point\n"
-                } else if hit.id == limine::module::MODULE_REQUEST_ID {
-                    b"[liftoff] req: modules\n"
-                } else if hit.id == limine::mp::MP_REQUEST_ID {
-                    b"[liftoff] req: smp\n"
-                } else if hit.id == limine::firmware_type::FIRMWARE_TYPE_REQUEST_ID {
-                    b"[liftoff] req: firmware_type\n"
-                } else if hit.id == limine::bootloader_info::BOOTLOADER_INFO_REQUEST_ID {
-                    b"[liftoff] req: bootloader_info\n"
-                } else {
-                    b"[liftoff] req: other\n"
-                };
-                for byte in name {
-                    crate::PlatformImpl::write_byte(*byte);
-                }
-            }
-            }
-        }
+        // 诊断扫描块已删除：它与真实路径各扫一遍 .data（约 345 KB），重复且时间翻倍。
+        // 真实路径（fill_responses）扫完后会由交接留痕（filled/checked/…）继续汇报。
     }
     // 8) 交接：填响应 → 检查 → 取键退出 → 跳转。
     //
