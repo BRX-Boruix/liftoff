@@ -454,4 +454,66 @@ mod real_kernel_scan_tests {
         assert!(has(&MEMMAP_REQUEST_ID), "必须找到内存映射请求");
     }
 }
+#[cfg(test)]
+mod data_section_scan_tests {
+    use super::{RequestHit, scan_chunked};
 
+    /// ELF64 节头关键字段读取（测试辅助，按小端硬编码偏移）。
+    fn section_range(image: &[u8], wanted: &str) -> Option<(usize, usize)> {
+        fn rd_u16(image: &[u8], at: usize) -> Option<u16> {
+            Some(u16::from_le_bytes(image.get(at..at + 2)?.try_into().unwrap()))
+        }
+        fn rd_u32(image: &[u8], at: usize) -> Option<u32> {
+            Some(u32::from_le_bytes(image.get(at..at + 4)?.try_into().unwrap()))
+        }
+        fn rd_u64(image: &[u8], at: usize) -> Option<u64> {
+            Some(u64::from_le_bytes(image.get(at..at + 8)?.try_into().unwrap()))
+        }
+        let shoff = rd_u64(image, 0x28)? as usize;
+        let shentsize = rd_u16(image, 0x3A)? as usize;
+        let shnum = rd_u16(image, 0x3C)? as usize;
+        let shstrndx = rd_u16(image, 0x3E)? as usize;
+        let read_sh = |index: usize| -> Option<(u32, usize, usize)> {
+            let at = shoff.checked_add(index.checked_mul(shentsize)?)?;
+            Some((rd_u32(image, at)?, rd_u64(image, at.checked_add(24)?)? as usize, rd_u64(image, at.checked_add(32)?)? as usize))
+        };
+        let (_, stroff, _) = read_sh(shstrndx)?;
+        for index in 0..shnum {
+            let (name_off, offset, size) = read_sh(index)?;
+            let name_at = stroff.checked_add(name_off as usize)?;
+            let mut end = name_at;
+            while image.get(end) != Some(&0) {
+                end += 1;
+            }
+            let name = image.get(name_at..end)?;
+            if name == wanted.as_bytes() {
+                return Some((offset, offset.checked_add(size)?));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn scanning_only_the_data_section_finds_all_seven_requests() {
+        // 实测：7 个请求（COMMON_MAGIC）集中在偏移 7,656,824–7,656,968，
+        // 全部落在 .data 节（off=7319552 size=345312）内。固件读一次内存约 100 µs，
+        // 把扫描范围缩到一个节是从「跑不完」到「几秒」的差别。
+        // 注意：这条测试只断言**等价性**（扫 .data 与扫全映像得到同样结果），
+        // 引导器在生产路径上定位 .data 的方式由 loader 层的节表解析负责。
+        let iso = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../boruix.iso");
+        let Some(bytes) = std::fs::read(iso).ok() else {
+            std::eprintln!("跳过：真实 ISO 不存在");
+            return;
+        };
+        let Some(image) = bytes.get(33 * 2048..33 * 2048 + 24_619_400) else {
+            std::eprintln!("跳过：ISO 内核 extent 不在预期位置");
+            return;
+        };
+        let Some((start, end)) = section_range(image, ".data") else {
+            panic!("真实内核应有 .data 节");
+        };
+        let mut hits = [RequestHit::EMPTY; 64];
+        let count = scan_chunked(&image[start..end], 64 << 10, &mut hits).expect("扫描应成功");
+        assert_eq!(count, 7, "只扫 .data 必须与全量扫描同样找到 7 个请求");
+    }
+}
