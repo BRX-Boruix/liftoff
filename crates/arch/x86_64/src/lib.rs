@@ -10,6 +10,7 @@
 extern crate std;
 
 pub mod features;
+pub mod lapic;
 pub mod platform;
 pub mod paging;
 pub mod spinup;
