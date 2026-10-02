@@ -26,6 +26,16 @@ pub enum PartitionError {
     BufferTooSmall,
 }
 
+impl core::fmt::Display for PartitionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ShortSector => f.write_str("扇区不足 512 字节"),
+            Self::NotAPartitionTable => f.write_str("缺 0x55AA 签名，不是分区表"),
+            Self::BufferTooSmall => f.write_str("调用方给的输出缓冲太小"),
+        }
+    }
+}
+
 const ENTRY_TABLE_OFFSET: usize = 446;
 const ENTRY_SIZE: usize = 16;
 const ENTRY_COUNT: usize = 4;

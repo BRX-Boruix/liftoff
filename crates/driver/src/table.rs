@@ -26,6 +26,87 @@ pub enum TableError {
     Gpt(GptError),
 }
 
+impl core::fmt::Display for TableError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Partition(err) => write!(f, "MBR 层出错: {err}"),
+            Self::Gpt(err) => write!(f, "GPT 层出错: {err}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_error_display_tests {
+    use super::{GptError, PartitionError, TableError};
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    #[test]
+    fn every_partition_table_error_has_a_distinct_human_readable_message() {
+        // 三条链路都要可读：`TableError` 是外层，它包着 MBR 与 GPT 两层，
+        // 只让外层可读而内层是变体名，真机上等于没有信息。
+        // **分层断言，而不是跨层断言**：`PartitionError` 与 `GptError` 各有一个
+        // `BufferTooSmall`，内层消息字面相同是合理的（它们说的是同一件事）。
+        // 真正的要求是：① 每一层内部互不重复；② 经外层渲染后**可区分** ——
+        // 真机上到达串口的只有外层形式。
+        let mut seen: Vec<String> = Vec::new();
+        for text in [
+            format!("{}", PartitionError::ShortSector),
+            format!("{}", PartitionError::NotAPartitionTable),
+            format!("{}", PartitionError::BufferTooSmall),
+            format!("{}", GptError::ShortImage),
+            format!("{}", GptError::NotGpt),
+            format!("{}", GptError::BadHeaderSize),
+            format!("{}", GptError::HeaderCrcMismatch),
+            format!("{}", GptError::BadEntrySize),
+            format!("{}", GptError::EntriesCrcMismatch),
+            format!("{}", GptError::EntriesOutOfBounds),
+            format!("{}", GptError::BadEntryRange),
+            format!("{}", GptError::BufferTooSmall),
+        ] {
+            assert!(!text.is_empty(), "每条错误都必须有消息");
+            seen.push(text);
+        }
+        assert_eq!(seen.len(), 12, "必须覆盖 PartitionError 与 GptError 的全部变体");
+
+        // ① 层内互不重复。
+        let mut inner: Vec<String> = Vec::new();
+        for text in [
+            format!("{}", PartitionError::ShortSector),
+            format!("{}", PartitionError::NotAPartitionTable),
+            format!("{}", PartitionError::BufferTooSmall),
+        ] {
+            assert!(!inner.contains(&text), "MBR 层内消息不得重复: {text}");
+            inner.push(text);
+        }
+        let mut inner: Vec<String> = Vec::new();
+        for text in [
+            format!("{}", GptError::ShortImage),
+            format!("{}", GptError::NotGpt),
+            format!("{}", GptError::BadHeaderSize),
+            format!("{}", GptError::HeaderCrcMismatch),
+            format!("{}", GptError::BadEntrySize),
+            format!("{}", GptError::EntriesCrcMismatch),
+            format!("{}", GptError::EntriesOutOfBounds),
+            format!("{}", GptError::BadEntryRange),
+            format!("{}", GptError::BufferTooSmall),
+        ] {
+            assert!(!inner.contains(&text), "GPT 层内消息不得重复: {text}");
+            inner.push(text);
+        }
+
+        // ② 两个同名的 `BufferTooSmall` 经外层渲染后必须**可区分**。
+        let mbr = format!("{}", TableError::from(PartitionError::BufferTooSmall));
+        let gpt = format!("{}", TableError::from(GptError::BufferTooSmall));
+        assert_ne!(mbr, gpt, "同名的内层错误经外层渲染后必须可区分");
+
+        // 外层必须把内层消息**带出来**，而不是只说「某一层出错」。
+        let outer = format!("{}", TableError::from(GptError::NotGpt));
+        assert!(outer.contains("EFI PART"), "外层必须带出内层消息: {outer}");
+    }
+}
+
 impl From<PartitionError> for TableError {
     fn from(error: PartitionError) -> Self {
         Self::Partition(error)

@@ -40,6 +40,22 @@ pub enum GptError {
     BufferTooSmall,
 }
 
+impl core::fmt::Display for GptError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ShortImage => f.write_str("映像不足，连 GPT 头都放不下"),
+            Self::NotGpt => f.write_str("签名不是 EFI PART"),
+            Self::BadHeaderSize => f.write_str("header_size 不合理"),
+            Self::HeaderCrcMismatch => f.write_str("GPT 头 CRC32 不匹配（表被破坏）"),
+            Self::BadEntrySize => f.write_str("entry_size 不合理"),
+            Self::EntriesCrcMismatch => f.write_str("分区项数组 CRC32 不匹配（表被破坏）"),
+            Self::EntriesOutOfBounds => f.write_str("分区项数组越出映像范围"),
+            Self::BadEntryRange => f.write_str("分区项区间倒置（last 小于 first）"),
+            Self::BufferTooSmall => f.write_str("调用方给的输出缓冲太小"),
+        }
+    }
+}
+
 /// GPT 头的关键字段。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GptHeader {
