@@ -139,6 +139,38 @@ pub fn icr_writes(access: ApicAccess, value: u64) -> IcrSequence {
     }
 }
 
+/// `IA32_APIC_BASE` MSR（`0x1B`）—— xAPIC/x2APIC 的模式开关就在这里。
+pub const IA32_APIC_BASE: u32 = 0x1B;
+
+/// `IA32_APIC_BASE` bit 11：APIC **全局**使能。
+pub const APIC_BASE_ENABLE: u64 = 1 << 11;
+
+/// `IA32_APIC_BASE` bit 10：**x2APIC** 使能。
+pub const APIC_BASE_X2APIC: u64 = 1 << 10;
+
+/// 从 `IA32_APIC_BASE` 判断 x2APIC 是否**真的**已启用。
+///
+/// **两个位都要看，只看 bit 10 会误判**：bit 10 只有在 bit 11（APIC 全局使能）也为 1 时才生效。
+/// 固件把 APIC 整体关着、而 bit 10 残留为 1 是完全可能的 —— 那时按 x2APIC 去访问会得到
+/// 一个"看起来能读、实际无效"的结果，比直接失败更难查。
+pub const fn x2apic_enabled(apic_base: u64) -> bool {
+    apic_base & APIC_BASE_ENABLE != 0 && apic_base & APIC_BASE_X2APIC != 0
+}
+
+/// 打开 x2APIC 后的 `IA32_APIC_BASE` 值。
+///
+/// **同时置 bit 11**：只置 bit 10 而不开 APIC 全局使能，等于把开关放在一个关着的总闸后面。
+pub const fn with_x2apic_enabled(apic_base: u64) -> u64 {
+    apic_base | APIC_BASE_ENABLE | APIC_BASE_X2APIC
+}
+
+/// 关掉 x2APIC（退回 xAPIC）后的值。
+///
+/// **只清 bit 10，保留 bit 11**：LAPIC 仍要通过 MMIO 访问，全局使能不能关。
+pub const fn with_x2apic_disabled(apic_base: u64) -> u64 {
+    (apic_base | APIC_BASE_ENABLE) & !APIC_BASE_X2APIC
+}
+
 /// 选访问方式：固件是否已启用 x2APIC。
 ///
 /// **不是"有 x2APIC 就用"**：brxLimine 的语义是「**内核**是否支持 x2APIC」—— 内核不支持时
@@ -288,6 +320,43 @@ mod tests {
         let seq = icr_writes(ApicAccess::X2apic, value);
         assert_eq!(seq.first, RegisterWrite::Msr { index: X2APIC_MSR_ICR, value });
         assert_eq!(seq.second, None, "x2APIC 只需一次写入");
+    }
+
+    #[test]
+    fn x2apic_counts_as_enabled_only_when_the_apic_is_globally_enabled_too() {
+        // **只看 bit 10 是错的**：bit 11 关着时 bit 10 无效。固件留下"bit 10 残留为 1"
+        // 是完全可能的，那时按 x2APIC 访问会得到"看起来能读、实际无效"的结果。
+        assert!(!x2apic_enabled(0), "两个位都关 = 未启用");
+        // **这里我写反了**：消息说「只开全局 = 仍是 xAPIC」，断言却要求它为 true ——
+        // **断言与它自己的消息矛盾**。这类错不是位区间或大小算错，而是"写完没读一遍"。
+        assert!(!x2apic_enabled(APIC_BASE_ENABLE), "只开全局 = 仍是 xAPIC");
+        assert!(!x2apic_enabled(APIC_BASE_X2APIC), "**只置 bit 10 不算启用**");
+        assert!(x2apic_enabled(APIC_BASE_ENABLE | APIC_BASE_X2APIC), "两位都置才算启用");
+    }
+
+    #[test]
+    fn enabling_x2apic_also_opens_the_global_apic_gate() {
+        // 只置 bit 10 而不开 bit 11，等于把开关放在一个关着的总闸后面。
+        let enabled = with_x2apic_enabled(0);
+        assert!(enabled & APIC_BASE_X2APIC != 0, "必须置 bit 10");
+        assert!(enabled & APIC_BASE_ENABLE != 0, "**也必须置 bit 11**");
+        assert!(x2apic_enabled(enabled));
+    }
+
+    #[test]
+    fn disabling_x2apic_keeps_the_lapic_reachable() {
+        // 退回 xAPIC 时 **LAPIC 仍要能通过 MMIO 访问**，所以 bit 11 必须留着。
+        let disabled = with_x2apic_disabled(APIC_BASE_ENABLE | APIC_BASE_X2APIC);
+        assert_eq!(disabled & APIC_BASE_X2APIC, 0, "必须清 bit 10");
+        assert_ne!(disabled & APIC_BASE_ENABLE, 0, "**bit 11 必须保留**，否则 LAPIC 整体不可达");
+        assert!(!x2apic_enabled(disabled));
+    }
+
+    #[test]
+    fn the_mode_switches_round_trip() {
+        let on = with_x2apic_enabled(APIC_BASE_ENABLE);
+        assert!(x2apic_enabled(on));
+        assert!(!x2apic_enabled(with_x2apic_disabled(on)));
     }
 
     #[test]
