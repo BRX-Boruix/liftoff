@@ -478,11 +478,18 @@ unsafe fn start_aps(
     #[cfg(target_os = "uefi")]
     {
         // SAFETY: 仍在 boot services 期间，且在任何 AP 启动之前。
-        if let Err(error) = unsafe { current::lapic::revert_firmware_x2apic() } {
-            report_fmt::<crate::PlatformImpl>(format_args!(
-                "[liftoff] ap: 固件开着 x2APIC 而内核不支持，回退 xAPIC 失败：{error}\n"
-            ));
-            return 0;
+        match unsafe { current::lapic::revert_firmware_x2apic() } {
+            // 确实回退了才打印：这样"回退了"与"本来就没开"在串口上可区分。
+            Ok(true) => report_fmt::<crate::PlatformImpl>(format_args!(
+                "[liftoff] ap: 固件原开着 x2APIC，已回退到 xAPIC\n"
+            )),
+            Ok(false) => {}
+            Err(error) => {
+                report_fmt::<crate::PlatformImpl>(format_args!(
+                    "[liftoff] ap: 固件开着 x2APIC 而内核不支持，回退 xAPIC 失败：{error}\n"
+                ));
+                return 0;
+            }
         }
     }
     let access = unsafe { current::lapic::firmware_access(false) };

@@ -410,11 +410,14 @@ pub unsafe fn firmware_apic_state() -> ApicState {
 /// 必须在任何 AP 启动之前调用：x2APIC 还开着时按 xAPIC 发 IPI 不会报错，
 /// 只会**什么都不发生**。
 #[cfg(target_os = "uefi")]
-pub unsafe fn revert_firmware_x2apic() -> Result<(), ApicError> {
+/// 返回值：`Ok(true)` 表示**确实做了回退**，`Ok(false)` 表示本来就没生效、无需回退。
+/// 两者都不是错误，但调用方需要能**区分**它们 —— 否则"回退了"与"没什么可退"
+/// 在日志上完全一样，而这两件事的可观测性完全不同。
+pub unsafe fn revert_firmware_x2apic() -> Result<bool, ApicError> {
     // SAFETY: 调用方保证特权级与时机（见函数文档）。
     let apic_base = unsafe { rdmsr(IA32_APIC_BASE) };
     let Some((disabled, xapic)) = xapic_revert_steps(apic_base) else {
-        return Ok(());
+        return Ok(false);
     };
     // **先查再写**：永久关闭的 CPU 上写这个 MSR 会 #GP。
     let arch_capabilities_present =
@@ -440,7 +443,7 @@ pub unsafe fn revert_firmware_x2apic() -> Result<(), ApicError> {
     if x2apic_enabled(now) {
         return Err(ApicError::RevertDidNotTakeEffect);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// 同 [`firmware_apic_state`]。
