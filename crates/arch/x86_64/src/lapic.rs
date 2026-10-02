@@ -148,6 +148,31 @@ pub const APIC_BASE_ENABLE: u64 = 1 << 11;
 /// `IA32_APIC_BASE` bit 10：**x2APIC** 使能。
 pub const APIC_BASE_X2APIC: u64 = 1 << 10;
 
+/// 读一个 MSR。
+///
+/// **只在 UEFI 目标上存在**：`rdmsr` 是特权指令，宿主测试里执行会让整个测试进程崩掉。
+///
+/// # Safety
+///
+/// `index` 必须是**当前 CPU 上存在**的 MSR —— 读不存在的 MSR 会 `#GP`。
+/// `IA32_APIC_BASE` 在 x86-64 上必然存在，读它是安全的。
+#[cfg(target_os = "uefi")]
+pub unsafe fn rdmsr(index: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: 由调用方保证 MSR 存在（见函数文档）。
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") index,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((high as u64) << 32) | low as u64
+}
+
 /// 从 `IA32_APIC_BASE` 判断 x2APIC 是否**真的**已启用。
 ///
 /// **两个位都要看，只看 bit 10 会误判**：bit 10 只有在 bit 11（APIC 全局使能）也为 1 时才生效。

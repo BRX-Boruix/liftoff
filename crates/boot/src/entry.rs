@@ -343,6 +343,20 @@ unsafe fn register_madt_cpus(responses: &mut crate::responses::Responses, rsdp_a
         cpuid_id,
         if mmio_id == cpuid_id { "MATCH" } else { "MISMATCH" }
     ));
+
+    // 【S4 探针】**只读** `IA32_APIC_BASE`（MSR `0x1B`），看固件把 APIC 配成了哪种模式。
+    //
+    // 读 MSR 无副作用 ✓，且该 MSR 在 x86-64 上必然存在 ✓ —— 所以这一步**不带故障风险**
+    // （与上一轮那个 MMIO 探针不同）。它决定 S4 是否真的需要**去改**这个 MSR：
+    // 若固件已经开了 x2APIC 而内核不支持，就必须退回 xAPIC（brxLimine 的做法）。
+    // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在。
+    let apic_base = unsafe { current::lapic::rdmsr(current::lapic::IA32_APIC_BASE) };
+    report_fmt::<crate::PlatformImpl>(format_args!(
+        "[liftoff] apic_base={:#x} x2apic={} global_enable={}\n",
+        apic_base,
+        current::lapic::x2apic_enabled(apic_base),
+        apic_base & current::lapic::APIC_BASE_ENABLE != 0
+    ));
 }
 
 fn report_fmt<P: Platform>(args: core::fmt::Arguments<'_>) {
