@@ -544,6 +544,46 @@ mod tests {
     }
 
     #[test]
+    fn the_full_low_4gib_sequence_matches_the_bootloader_plan() {
+        // **按 `bring_up` 的真实顺序**组合：先 identity 大页（含低 2 MiB）-> 头部 4 KiB
+        // （触发拆分）-> 主体大页 -> 显式解除页零。这条测试回答的是「映射逻辑本身
+        // 对不对」，与真机环境（帧预算、固件行为）分开定位。
+        let (mut alloc, dm) = harness(256);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        let rw = PageFlags::present().with(PageFlags::writable());
+        // ① identity：低内存大页（`plan_identity` 的产物）。
+        pt.map_range(VirtAddr::new(0), PhysAddr::new(0), LARGE_PAGE_SIZE, rw)
+            .expect("identity 大页");
+        // ② 头部 4 KiB：触发拆分。
+        pt.map_range_pages(
+            VirtAddr::new(0x1000),
+            PhysAddr::new(0x1000),
+            LARGE_PAGE_SIZE - 0x1000,
+            rw,
+        )
+        .expect("头部 4 KiB");
+        // ③ 主体大页。
+        pt.map_range(
+            VirtAddr::new(0x200000),
+            PhysAddr::new(0x200000),
+            LARGE_PAGE_SIZE,
+            rw,
+        )
+        .expect("主体大页");
+        // ④ 显式解除页零。
+        pt.unmap(VirtAddr::new(0), PAGE_SIZE).expect("解除页零");
+
+        assert!(pt.translate(VirtAddr::new(0)).is_none(), "页零必须已解除");
+        assert!(pt.translate(VirtAddr::new(0x1000)).is_some(), "头部必须仍在");
+        assert_eq!(
+            pt.translate(VirtAddr::new(0x1000)).expect("头部可翻译").0.as_u64(),
+            0x1000,
+        );
+        assert!(pt.translate(VirtAddr::new(0x200000)).is_some(), "主体必须仍在");
+    }
+
+    #[test]
     fn unmap_removes_a_four_kib_mapping() {
         let (mut alloc, dm) = harness(64);
         let root = alloc.allocate_zeroed().expect("根表帧");

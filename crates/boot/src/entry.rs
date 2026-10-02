@@ -1607,16 +1607,13 @@ pub fn build_plan(request: &PlanRequest<'_>, out: &mut [Mapping]) -> Result<usiz
     // 后果：内核终端初始化成功（`fb=0x80000000 1280x800 bpp=32`）后写帧缓冲即
     // #PF（`CR2=0x80000000`、错误码 `0x2`）。
     //
-    // **大页对齐**：低 4 GiB 恒等映射必须走 2 MiB 大页 —— 若用 4 KiB 粒度，
-    // 4 GiB / 2 MiB = 2048 张页表，真机帧预算根本供不起（实测：apply 直接
-    // OutOfMemory，`entry failed`）。所以仍从 `0` 起，**多映射页零**是与 Limine
-    // 的已知偏差。
+    // **从 `0` 起的大页（页零仍被映射）—— 当前状态，混合粒度已实现但真机仍失败。**
     //
-    // **混合粒度（头部 2 MiB 用 4 KiB、主体用大页）曾尝试过并真机失败**：它撞上
-    // 一个与特性无关的潜在缺陷 —— `plan_identity` 先在该 PD 项建了 2 MiB 大页，
-    // 而 `table_or_create` **不检查 PS 位**，于是把大页的物理地址当作页表帧地址，
-    // 往任意物理内存写 PTE → 内存损坏 → 复位循环。**要消掉页零偏差，必须先让
-    // `table_or_create` 正确处理「此处已有更大粒度的映射」（报错或拆分）。**
+    // 全部 4 KiB 需要 2048 张页表，帧预算供不起（实测 OutOfMemory）。混合粒度
+    // （头部 4 KiB + 主体大页 + 显式解除页零）的**映射逻辑已由宿主测试证明正确**
+    // （`the_full_low_4gib_sequence_matches_the_bootloader_plan`），但**真机仍然
+    // 复位循环、`entry failed`**，原因尚未定位 —— 说明问题在宿主测试覆盖不到的
+    // 层面（帧预算/固件交互等）。**在定位之前保持这个已知可工作的形态。**
     //
     // 缓冲不足时报错而不是静默跳过：丢掉必需映射 = 换表即故障。
     {
@@ -2197,15 +2194,12 @@ mod build_plan_tests {
 
     #[test]
     fn the_low_4gib_identity_mapping_uses_a_large_page_from_zero() {
-        // **从 0 起是当前的必要选择，不是偷懒**：若全部用 4 KiB，4 GiB / 2 MiB
-        // = 2048 张页表，真机帧预算供不起（实测 apply OutOfMemory、`entry failed`）。
+        // **当前形态：从 0 起的一条 2 MiB 大页。**
         //
-        // 混合粒度（头部 2 MiB 用 4 KiB + 主体大页）也试过并**真机失败**：`plan_identity`
-        // 先在该 PD 项建了 2 MiB 大页，而 `table_or_create` 当时**不检查 PS 位**，
-        // 把大页的页帧基址当成页表帧地址 → 往任意物理内存写 PTE → 复位循环。
-        // **那个缺陷已修**（现在报 `AlreadyMappedLarger`，见 `paging.rs` 的护栏测试），
-        // 所以混合粒度**重新成为可行方向** —— 但它需要「拆分已存在的大页」这一步，
-        // 尚未实现。在那之前，多映射页零是与 Limine 的已知偏差。
+        // 混合粒度（头部 4 KiB + 主体大页 + 解除页零）的映射逻辑已由宿主测试证明
+        // 正确（`paging::tests::the_full_low_4gib_sequence_matches_the_bootloader_plan`），
+        // 但**真机仍失败**（复位循环、`entry failed`），原因尚未定位。在定位之前
+        // 保持这个已知可工作的形态 —— **多映射页零是与 Limine 的已知偏差**。
         let hhdm = [range(0x1000_0000, LARGE)];
         let mut plan = [Mapping::EMPTY; 64];
         let count = build_plan(
