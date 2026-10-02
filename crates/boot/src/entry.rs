@@ -2586,30 +2586,12 @@ pub unsafe fn bring_up(
     // 【D3 测量 · **单位标定**】`GetNextMonotonicCount` 的单位**不能猜** ✗ ——
     // 用**已知时长**的 `Stall` 把它**测出来** ✓：停 10 毫秒，量计数差 ✓。
     // 这样"计数 → 时间"的换算是**实测**的，不是假设的 ✓。
-    {
-        let mut before = 0u64;
-        // SAFETY: 仍在 boot services 期间（Exit 在后面）✓ —— 字段是函数指针，直接调用 ✓，
-        // 与 `table.stall` 同一手法 ✓。
-        unsafe { (table.get_next_monotonic_count)(&mut before) };
-        // SAFETY: 同上 —— 固件延时，10 毫秒。
-        unsafe { (table.stall)(10_000) };
-        let mut after = 0u64;
-        // SAFETY: 同上。
-        unsafe { (table.get_next_monotonic_count)(&mut after) };
-        report_fmt::<crate::PlatformImpl>(format_args!(
-            "[liftoff] 标定：停 10 毫秒 = 计数差 {}（**据此换算** ✓）\n",
-            // **经固件门面**取 ✓ —— `current` 在本 crate 里指的是**架构选择器** ✗，
-            // 而单调计数是 **UEFI 概念**，不属于 arch 层 ✓。
-            firmware_current::current::monotonic_delta(before, after)
-        ));
-    }
-    // 【D3 测量 · TSC 标定】固件的单调计数**已两次证伪** ✗（停 10 毫秒只涨 1），
-    // 改用 **TSC** ✓ —— 它是**已知会走**的计数器 ✓，但**频率未知** ✗，所以同样**实测标定** ✓。
+    // 【D3 测量】固件的单调计数**已两次真机证伪** ✗（停 10 毫秒只涨 1），改用 **TSC** ✓，
+    // 并**用已知 10 毫秒的 `Stall` 实测标定频率** ✓。结果留在作用域里，供后面算耗时 ✓。
     //
-    // **必须按目标门控** ✗：`read_tsc` 只在 UEFI 目标上存在 ✓（`rdtsc` 是特权无关但目标相关的路径），
-    // 宿主构建里没有它 ✗ —— 第一次我漏了这个门控，**宿主测试构建直接编译失败** ✓。
+    // 宿主构建没有 `rdtsc` ✓ → 用 `(0, None)` 占位并**跳过打印** ✓，**不编造** ✓。
     #[cfg(target_os = "uefi")]
-    {
+    let (boot_start, tsc_hz): (u64, Option<u64>) = {
         // SAFETY: `rdtsc` 无副作用 ✓；仍在 boot services 期间（`Stall` 可用 ✓）。
         let t0 = unsafe { current::features::read_tsc() };
         // SAFETY: 固件延时 10 毫秒 ✓。
@@ -2617,7 +2599,8 @@ pub unsafe fn bring_up(
         // SAFETY: 同上。
         let t1 = unsafe { current::features::read_tsc() };
         let ticks = firmware_current::current::monotonic_delta(t0, t1);
-        match current::features::hz_from_ticks(ticks, 10_000) {
+        let hz = current::features::hz_from_ticks(ticks, 10_000);
+        match hz {
             Some(hz) => report_fmt::<crate::PlatformImpl>(format_args!(
                 "[liftoff] TSC 标定：{} Hz（停 10 毫秒实测，{} 个计数 ✓）\n",
                 hz, ticks
@@ -2626,7 +2609,12 @@ pub unsafe fn bring_up(
                 "[liftoff] TSC 标定失败（时长为零）\n"
             )),
         }
-    }
+        (t0, hz)
+    };
+    // 宿主构建里这两项**只用于占位** ✗ —— 打印分支是 UEFI 门控的 ✓，所以它们在本构建里
+    // 不会被读 ✓。用下划线前缀如实表达"**故意不用**" ✓，而不是留 4 个警告 ✗。
+    #[cfg(not(target_os = "uefi"))]
+    let (_boot_start, _tsc_hz): (u64, Option<u64>) = (0, None);
     for byte in b"[liftoff] step: applying plan\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
@@ -2664,6 +2652,20 @@ pub unsafe fn bring_up(
         crate::PlatformImpl::write_byte(*byte);
     }
     // 激活已移到 Exit 之后（enter_kernel 内）—— 此处只保留页表构建结果。
+    // 【D3 测量】用**标定出的频率**算耗时 ✓。**跨度如实标注** ✗ —— 起点是上面的 TSC 标定点，
+    // **不是**进程入口 ✓（"引导总耗时"要到入口点才算，那需要另取一个起点 ✓）。
+    #[cfg(target_os = "uefi")]
+    if let Some(hz) = tsc_hz {
+        // SAFETY: `rdtsc` 无副作用 ✓；仍在 boot services 期间 ✓。
+        let end = unsafe { current::features::read_tsc() };
+        let ticks = firmware_current::current::monotonic_delta(boot_start, end);
+        if let Some(micros) = current::features::micros_from_ticks(ticks, hz) {
+            report_fmt::<crate::PlatformImpl>(format_args!(
+                "[liftoff] 标定点→换表完成：{} 微秒（{} 个计数 @ {} Hz）\n",
+                micros, ticks, hz
+            ));
+        }
+    }
     for byte in b"[liftoff] step: table ready\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
