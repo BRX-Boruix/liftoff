@@ -9,6 +9,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod ap;
 pub mod features;
 pub mod lapic;
 pub mod platform;
