@@ -23,7 +23,19 @@ pub const ALLOCATE_ANY_PAGES: u32 = 0;
 ///
 /// 需要它是因为**实模式只有 20 位寻址** ✗ —— AP 跳板必须落在 1 MiB 以下，
 /// 否则 AP 醒来取不到第一条指令（表现为"发了 IPI 但 AP 不醒"）。
-pub const ALLOCATE_MAX_ADDRESS: u32 = 2;
+///
+/// 【缺陷修正】这里曾经写成 **2** ✗。UEFI 规范里 `EFI_ALLOCATE_TYPE` 的枚举顺序是
+/// `AllocateAnyPages`(0)、`AllocateMaxAddress`(**1**)、`AllocateAddress`(2) ✓ ——
+/// 值 2 是 `AllocateAddress`，语义**正好相反**：它要求**正好分配在给定地址** ✗。
+/// 于是"在 1 MiB 以下随便找一页"变成了"必须把 0xF_F000 这一页给我"：真机上 OVMF
+/// 交不出那一页 → 分配失败 → `[liftoff] ap: 低页分配失败` → **一个 AP 都起不来** ✗。
+///
+/// **为什么原来的测试没抓到** ✗：它断言 `SEEN_TYPE == ALLOCATE_MAX_ADDRESS` ——
+/// 把**实现**钉在常量上，却**没有把常量钉在规范上** ✓。两条都要有 ✓。
+pub const ALLOCATE_MAX_ADDRESS: u32 = 1;
+/// `AllocateAddress`：`memory` 是**要求的准确地址**（与上一个**不是**同一件事 ✗）。
+/// 目前没有调用方，但显式列出枚举值，好让上面的常量有东西可对照 ✓。
+pub const ALLOCATE_ADDRESS: u32 = 2;
 /// 内存类型：引导器数据。
 pub const EFI_LOADER_CODE: u32 = 1;
 pub const EFI_LOADER_DATA: u32 = 2;
@@ -227,7 +239,10 @@ impl FrameAllocator for EfiFrameAllocator {
 
 #[cfg(test)]
 mod efi_frame_allocator_tests {
-    use super::{ALLOCATE_ANY_PAGES, ALLOCATE_MAX_ADDRESS, EFI_LOADER_DATA, EfiFrameAllocator};
+    use super::{
+        ALLOCATE_ADDRESS, ALLOCATE_ANY_PAGES, ALLOCATE_MAX_ADDRESS, EFI_LOADER_CODE,
+        EFI_LOADER_DATA, EfiFrameAllocator,
+    };
     use arch::paging::FrameAllocator;
     use crate::types::{Status, SUCCESS, DEVICE_ERROR};
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -269,6 +284,20 @@ mod efi_frame_allocator_tests {
         assert_eq!(base % 4096, 0, "测试夹具必须页对齐");
         unsafe { *memory = base + MISALIGN.load(Ordering::SeqCst) as u64 };
         SUCCESS
+    }
+
+    #[test]
+    fn the_allocate_type_and_memory_type_values_match_the_uefi_spec() {
+        // 【缺陷】`ALLOCATE_MAX_ADDRESS` 曾经是 2 ✗ —— 规范里它是 **1**，2 是 `AllocateAddress`。
+        // 这一个数字让"在 1 MiB 以下找一页"变成了"必须给我 0xF_F000 这一页" ✗，
+        // 真机上表现为 `[liftoff] ap: 低页分配失败`、**一个 AP 都起不来** ✗。
+        // 所以这里钉的是**规范值**，与上面那条"实现是否用了这个常量"是**两件事** ✓。
+        assert_eq!(ALLOCATE_ANY_PAGES, 0);
+        assert_eq!(ALLOCATE_MAX_ADDRESS, 1, "AllocateMaxAddress 是 1，不是 2");
+        assert_eq!(ALLOCATE_ADDRESS, 2, "2 是 AllocateAddress：要求准确地址");
+        // 内存类型同理（`EFI_MEMORY_TYPE` 的枚举顺序）。
+        assert_eq!(EFI_LOADER_CODE, 1);
+        assert_eq!(EFI_LOADER_DATA, 2);
     }
 
     #[test]
