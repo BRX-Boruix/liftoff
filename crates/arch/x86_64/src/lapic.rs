@@ -296,6 +296,30 @@ pub unsafe fn mmio_read32(address: u64) -> u32 {
     unsafe { core::ptr::read_volatile(address as *const u32) }
 }
 
+/// 从 `LAPIC_ID` 寄存器的**原始 32 位值**里取出 APIC 标识（高 8 位）✓。
+///
+/// **纯逻辑、宿主可测** ✓ —— 移位写错不会崩，只会得到一个"看起来像标识"的错值 ✗，
+/// 所以把它单独拎出来钉住 ✓。
+#[inline]
+pub const fn lapic_id_from_register(register: u32) -> u32 {
+    register >> 24
+}
+
+/// 经 **MMIO** 读本地 APIC 的标识。
+///
+/// **为什么它在实现层而不是 `boot`**：这是对**设备寄存器**的指针运算 + 易失读 ✓ ——
+/// 让它留在中性层就是**跨层直连** ✗（S14 / ADR-007）。中性层只说"要 APIC 标识" ✓。
+///
+/// # Safety
+/// 调用方必须保证 LAPIC 的 MMIO **已被映射**。**未映射时是取数故障（复位）**，
+/// 不是返回错误 ✗ —— 无法把它变成 `Option` 而不撒谎 ✓。
+#[cfg(target_os = "uefi")]
+pub unsafe fn read_id_via_mmio() -> u32 {
+    // SAFETY: 由调用方保证 MMIO 已映射（见函数文档）。
+    let raw = unsafe { mmio_read32(LAPIC_DEFAULT_BASE + LAPIC_ID as u64) };
+    lapic_id_from_register(raw)
+}
+
 /// 写一个 32 位 MMIO 寄存器。
 ///
 /// # Safety
@@ -374,6 +398,17 @@ pub unsafe fn send_ipi(access: ApicAccess, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_apic_id_is_the_top_byte_of_the_register() {
+        // 【为什么值得单独测】移位数写错不会崩，只会给出一个**看起来像标识**的错值 ✗ ——
+        // 而它会被拿去和 CPUID 的结果比对，于是"比对了但比的是错的东西" ✗。
+        assert_eq!(lapic_id_from_register(0x0A00_0000), 0x0A);
+        assert_eq!(lapic_id_from_register(0x0000_0000), 0x00);
+        assert_eq!(lapic_id_from_register(0xFF00_0000), 0xFF);
+        // 低 24 位是**其他字段**（保留位/型号等）—— 绝不能被当成标识 ✓。
+        assert_eq!(lapic_id_from_register(0x0000_FFFF), 0x00, "低 24 位不是标识");
+    }
 
     #[test]
     fn init_ipi_places_the_destination_differently_per_mode() {

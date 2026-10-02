@@ -349,11 +349,10 @@ unsafe fn register_madt_cpus(
     //
     // 常量走 `current::lapic` 而不是在 `boot` 里写裸地址（S01 / ADR-007）。
     // SAFETY: 见上 —— 本探针的全部目的就是验证这个假设是否成立。
-    let mmio_id = unsafe {
-        core::ptr::read_volatile(
-            (current::lapic::LAPIC_DEFAULT_BASE + current::lapic::LAPIC_ID as u64) as *const u32,
-        )
-    } >> 24;
+    // **经抽象层取**（C2）：裸 MMIO 的指针运算与易失读留在实现层 ✓ ——
+    // 中性层自己做就是跨层直连 ✗（S14 / ADR-007）。
+    // SAFETY: 见探针说明 —— 本探针的全部目的就是验证"固件映射了 LAPIC 的 MMIO"这个假设。
+    let mmio_id = unsafe { current::lapic::read_id_via_mmio() };
     let cpuid_id = <crate::PlatformImpl as arch::platform::Platform>::bsp_lapic_id();
     report_fmt::<crate::PlatformImpl>(format_args!(
         "[liftoff] lapic: mmio_id={:#x} cpuid_id={:#x} {}\n",
