@@ -581,6 +581,42 @@ mod tests {
         );
     }
 
+    /// **经 trait 泛型**调用每个 `PageTable` 能力。
+    ///
+    /// 关键在 `P: PageTable` 这个泛型约束：它强制走 **trait 分派**，而不是具体类型上
+    /// 可能存在的同名**固有方法**。
+    fn call_capabilities_through_trait<P: PageTable>(table: &mut P) -> Result<(), MapError> {
+        table.map_range_pages(
+            VirtAddr::new(0x1000),
+            PhysAddr::new(0x1000),
+            PAGE_SIZE,
+            PageFlags::present().with(PageFlags::writable()),
+        )?;
+        table.unmap(VirtAddr::new(0x1000), PAGE_SIZE)
+    }
+
+    #[test]
+    fn page_table_capabilities_are_reachable_through_the_trait() {
+        // **这条测试守着一次真机三连失败的根因，值得写清楚。**
+        //
+        // `map_range_pages` 曾**只**作为 `X86PageTable` 的固有方法存在。于是宿主测试
+        // `pt.map_range_pages(...)` 命中固有方法、一切正常；而 `mm::apply::apply` 是
+        // 泛型 `P: PageTable`，命中的是 trait 的**默认实现** —— 那个默认返回
+        // `UnsupportedGranularity`，真机因此连续三次 `entry failed`。
+        //
+        // 修法是把方法移进 trait impl。**但"移对了"本身需要护栏**：下面经泛型调用，
+        // 若哪天又有人把某个能力只写成固有方法而忘了 trait impl，这条测试立刻变红。
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        call_capabilities_through_trait(&mut pt)
+            .expect("经 trait 的 4 KiB 映射与解除都必须可用（默认实现会返回 UnsupportedGranularity）");
+        assert!(
+            pt.translate(VirtAddr::new(0x1000)).is_none(),
+            "经 trait 解除后，具体类型上必须看到结果 —— 两者必须是同一份实现",
+        );
+    }
+
     #[test]
     fn the_full_low_4gib_sequence_matches_the_bootloader_plan() {
         // **按 `bring_up` 的真实顺序**组合：先 identity 大页（含低 2 MiB）-> 头部 4 KiB
