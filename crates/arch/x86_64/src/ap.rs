@@ -347,6 +347,7 @@ impl core::fmt::Display for StageError {
 /// +0x000  跳板代码（实模式入口，必须落在页首 —— SIPI 的 cs:ip 指向页首）
 /// +0x800  参数块（ApTrampoline，40 字节）
 /// +0x880  GDTR 的 6 字节描述符
+/// +0x890  远指针槽（6 字节，**运行期**由跳板填绝对地址 ✓）
 /// +0x900  GDT 副本（`spinup::build_gdt()`）
 /// ```
 pub fn install(
@@ -446,6 +447,18 @@ pub fn stage_frame(frame: &ApTrampoline, low: &mut [u8]) -> Result<(), StageErro
 // 3. **标签差值**：`asm_check.py` 记录过一个真实故障 —— 把标签差值写成裸标签，
 //    汇编器把它当成 **RIP 相对内存读取** ✗。所以地址一律经 `lea` 或 `add` 立即数 ✓。
 
+/// **运行期填入的远指针槽**（4 字节偏移 + 2 字节选择子）。
+///
+/// **为什么需要它**：选择子 `0x18` 指向的是 **flat 段（基址 0）** ✓ —— 那是给 BSP 的
+/// `spinup` 用的同一套 GDT。所以 `jmp far 0x18:0x24` 会跳到**线性地址 0x24**，而不是
+/// "页基址 + 0x24" ✗ —— AP 一进保护模式就取指故障 ✗。
+/// 第 111 轮真机实测正是如此：跳板进度停在 `1`（实模式已执行 ✓、保护模式没到 ✗）。
+/// 参考实现同样在**运行期**把 `页基址 + 段内偏移` 写进这样一个槽再跳 ✓
+/// （`common/sys/smp_trampoline.asm_x86:16-21` ✓）。
+pub const AP_FARPTR_OFFSET: usize = 0x890;
+/// 远指针槽的字节数（4 字节偏移 + 2 字节选择子）。
+pub const AP_FARPTR_BYTES: usize = 6;
+
 /// GDT 在本页内的偏移。
 ///
 /// **GDT 必须在低内存**：进保护模式时还没有分页 ✗。它由 `install` 写 ——
@@ -456,6 +469,8 @@ pub const AP_GDT_OFFSET: usize = 0x900;
 const _: () = assert!(AP_FRAME_OFFSET + core::mem::size_of::<ApTrampoline>() <= AP_GDTR_OFFSET);
 const _: () = assert!(AP_GDTR_OFFSET + AP_GDTR_BYTES <= AP_GDT_OFFSET);
 const _: () = assert!(AP_GDT_OFFSET + 9 * 8 <= AP_PAGE_SIZE);
+const _: () = assert!(AP_GDTR_OFFSET + AP_GDTR_BYTES <= AP_FARPTR_OFFSET);
+const _: () = assert!(AP_FARPTR_OFFSET + AP_FARPTR_BYTES <= AP_GDT_OFFSET);
 
 #[cfg(target_os = "uefi")]
 core::arch::global_asm!(
@@ -479,6 +494,8 @@ core::arch::global_asm!(
     ".set AP_F_INFO, AP_FRAME + 20",
     ".set AP_F_STACK_LO, AP_FRAME + 24",
     ".set AP_GDTR, AP_FRAME + 0x80",
+    // 远指针槽：在 GDTR 描述符之后、GDT 之前 ✓（编译期断言守住不重叠 ✓）。
+    ".set AP_FARPTR, AP_FRAME + 0x90",
     ".code16",
     "ap_trampoline_start:",
     "    cli",
@@ -491,9 +508,16 @@ core::arch::global_asm!(
     "    mov eax, cr0",
     "    or eax, 1",
     "    mov cr0, eax",
-    "    .byte 0x66, 0xea",
-    "    .long AP_MODE32_OFF",
-    "    .word 0x18",
+    // **远跳的偏移必须是绝对线性地址** ✓（选择子 0x18 是 flat 段，基址 0 ✗）。
+    // 所以运行期把"页基址 + 段内偏移"写进槽里，再 `jmp far` 读它 ✓ ——
+    // 与参考实现同一手法（`smp_trampoline.asm_x86:16-21` ✓）。
+    // 编码写成显式字节：`67 66 FF /5` = addr32 + opsize32 + `jmp far m16:32 [ebx+disp32]`，
+    // 免得汇编器按 16 位模式给出 `m16:16`（那样只会读走 4 个字节 ✗）。
+    "    lea eax, [ebx + AP_MODE32_OFF]",
+    "    mov [ebx + AP_FARPTR], eax",
+    "    mov dword ptr [ebx + AP_FARPTR + 4], 0x18",
+    "    .byte 0x67, 0x66, 0xff, 0xab",
+    "    .long AP_FARPTR",
     ".code32",
     "ap_mode32:",
     // 进度标记 2：远跳进了保护模式。
