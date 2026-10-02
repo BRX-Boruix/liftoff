@@ -531,6 +531,41 @@ mod tests {
     }
 
     #[test]
+    fn splitting_preserves_page_zero_so_the_hybrid_needs_an_explicit_unmap() {
+        // **这条测试记录一个推演结论，并用实现证实它。**
+        //
+        // 混合粒度（头部 0x1000..0x200000 用 4 KiB + 主体大页）看起来能消掉
+        // 「多映射页零」的偏差。但拆分是**如实复制**原大页 —— 复制出的页表第 0 项
+        // 仍然映射 `0..0x1000`，而头部映射只覆盖 `0x1000` 起，**不会碰第 0 项**。
+        //
+        // 所以：**混合粒度本身消不掉页零偏差，还需要显式的 unmap**（或等价的
+        // 「清除区间」能力）。这正是 `unmap` 从「无消费者」变成「有消费者」的原因。
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        // 模拟 `plan_identity` 先为低内存建 2 MiB 大页。
+        pt.map_range(
+            VirtAddr::new(0),
+            PhysAddr::new(0),
+            LARGE_PAGE_SIZE,
+            PageFlags::present().with(PageFlags::writable()),
+        )
+        .expect("大页映射成功");
+        // 再建头部 4 KiB 映射（会触发拆分）。
+        pt.map_range_pages(
+            VirtAddr::new(0x1000),
+            PhysAddr::new(0x1000),
+            LARGE_PAGE_SIZE - 0x1000,
+            PageFlags::present().with(PageFlags::writable()),
+        )
+        .expect("应拆分而不是报错");
+        assert!(
+            pt.translate(VirtAddr::new(0)).is_some(),
+            "拆分如实复制，页零仍被映射 —— 所以混合粒度单独用不足以消掉页零偏差",
+        );
+    }
+
+    #[test]
     fn splits_an_existing_large_page_and_preserves_the_mapping() {
         // 拆分：已有 2 MiB 大页时，要在其区间内建 4 KiB 页，必须把大页**拆成**
         // 一张页表，并**如实复制**原有映射 —— 少一项或权限不对，原本可访问的地址
