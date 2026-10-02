@@ -744,6 +744,20 @@ pub enum EntryError {
     EmptySpan,
 }
 
+impl core::fmt::Display for EntryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoEntry => f.write_str("入口地址为 0，不可跳转"),
+            // **地址必须打出来**：不做有损扁平化正是这条错误存在的理由，
+            // 丢掉地址就等于丢掉了唯一的定位线索。
+            Self::NotCovered { address } => {
+                write!(f, "必须保持映射的地址 {address:#x} 未被规划覆盖")
+            }
+            Self::EmptySpan => f.write_str("必须保持映射的区间长度为 0（调用方错误）"),
+        }
+    }
+}
+
 /// 进入内核前的**前置检查**（纯，宿主可测）：入口非零，且必须保持映射的区间都被规划覆盖。
 ///
 /// 返回入口地址；任一项不满足即报错 —— **绝不带着未覆盖的代码或栈跳转**。
@@ -954,7 +968,8 @@ impl core::fmt::Display for HandoffError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Fill(err) => write!(f, "响应填充扫描失败: {err:?}"),
-            Self::BeforeEntry(err) => write!(f, "跳转前检查失败: {err:?}"),
+            // `EntryError` 现已实现 `Display`，故用 `{}`。
+            Self::BeforeEntry(err) => write!(f, "跳转前检查失败: {err}"),
             Self::Exit(err) => write!(f, "退出引导服务失败: {err}"),
         }
     }
@@ -1684,7 +1699,30 @@ impl core::fmt::Display for PlanBuildError {
 
 #[cfg(test)]
 mod error_display_tests {
-    use super::{KernelPlanError, PlanBuildError};
+    use super::{EntryError, KernelPlanError, PlanBuildError};
+
+    #[test]
+    fn entry_error_keeps_the_uncovered_address_in_its_message() {
+        // `NotCovered` 携带地址，而**那正是这条错误存在的理由** —— 消息里没有地址，
+        // 真机上就只能看到「有东西没被覆盖」，无从下手。
+        let text = format!("{}", EntryError::NotCovered { address: 0xffff_ffff_8003_78d0 });
+        assert!(text.contains("0xffffffff800378d0"), "必须打出具体地址: {text}");
+        assert!(text.contains("未被规划覆盖"), "必须说明是什么问题: {text}");
+    }
+
+    #[test]
+    fn entry_error_variants_have_distinct_messages() {
+        let mut seen: Vec<String> = Vec::new();
+        for text in [
+            format!("{}", EntryError::NoEntry),
+            format!("{}", EntryError::NotCovered { address: 0x1000 }),
+            format!("{}", EntryError::EmptySpan),
+        ] {
+            assert!(!text.is_empty(), "每条错误都必须有消息");
+            assert!(!seen.contains(&text), "消息不得重复: {text}");
+            seen.push(text);
+        }
+    }
     use std::format;
     use std::string::String;
     use std::vec::Vec;
