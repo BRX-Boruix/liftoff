@@ -64,6 +64,9 @@ fn plan_with(
     ranges: &[UsableRange],
     out: &mut [Mapping],
     large: u64,
+    // **下界**：区间起点先抬到 `floor` 再按 `large` 向上对齐 ✓ —— 抬下界与对齐必须在
+    // **同一处** ✗，否则"规划器说从某处起、这里却按原起点对齐"就是两边各说各话 ✗。
+    floor: u64,
     virt_of: impl Fn(u64) -> Option<u64>,
 ) -> Result<usize, PlanError> {
     if large == 0 {
@@ -71,7 +74,7 @@ fn plan_with(
     }
     let mut count = 0;
     for range in ranges {
-        let base = range.base.as_u64();
+        let base = range.base.as_u64().max(floor);
         let end = match range.end() {
             Some(end) => end,
             None => continue,
@@ -99,13 +102,24 @@ fn plan_with(
     Ok(count)
 }
 
+/// 恒等映射的**下界**：第 0 页**不映射** ✓。
+///
+/// **为什么必须有**：固件的可用区间常常**从 `0` 开始**（常规内存），照搬就会把页零也
+/// 映射进去 ✗ —— 那样空指针解引用会变成"静默读写物理 0"，而不是**故障** ✗。
+/// 与 Limine 一致：`base_revision == 0` 的规则把低 4 GiB 恒等映射**从 `0x1000` 起** ✓
+/// （`limine.c:200-203`）✓。
+///
+/// 此前是在 `bring_up` 里**事后 `unmap(0, 0x1000)`** 绕过的 ✗；在**规划阶段**就不产生它，
+/// 那个绕过才能删掉 ✓。
+pub const IDENTITY_LOW_FLOOR: u64 = 0x1000;
+
 /// 规划**恒等映射**（`virt == phys`），返回产出的映射条数。
 pub fn plan_identity(
     ranges: &[UsableRange],
     out: &mut [Mapping],
     large: u64,
 ) -> Result<usize, PlanError> {
-    plan_with(ranges, out, large, Some)
+    plan_with(ranges, out, large, IDENTITY_LOW_FLOOR, Some)
 }
 
 /// 规划 **HHDM** 映射（`virt == offset + phys`）。
@@ -115,7 +129,7 @@ pub fn plan_hhdm(
     out: &mut [Mapping],
     large: u64,
 ) -> Result<usize, PlanError> {
-    plan_with(ranges, out, large, |phys| offset.checked_add(phys))
+    plan_with(ranges, out, large, 0, |phys| offset.checked_add(phys))
 }
 
 /// 规划**内核高区**映射：物理区间 [phys_base, phys_base+len) 映射到
@@ -131,7 +145,7 @@ pub fn plan_kernel_high(
     large: u64,
 ) -> Result<usize, PlanError> {
     let span = [UsableRange { base: PhysAddr::new(phys_base), length: len }];
-    plan_with(&span, out, large, |phys| {
+    plan_with(&span, out, large, 0, |phys| {
         let delta = phys.checked_sub(phys_base)?;
         virt_base.checked_add(delta)
     })
@@ -142,6 +156,34 @@ mod tests {
     use std::format;
     use std::string::String;
     use std::vec::Vec;
+
+    #[test]
+    fn identity_planning_never_covers_the_first_page() {
+        // 【真机缺陷链】固件的可用区间常常**从 `0` 开始**（常规内存），照搬就会把页零也
+        // 映射进去 ✗ —— 页零必须保持未映射，空指针解引用才会**故障**，而不是静默读写物理 0 ✗。
+        // 此前是靠 `bring_up` 里**事后 `unmap(0, 0x1000)`** 绕过的 ✗（大页拆分如实复制会把
+        // 页零带下来）；现在要在**规划阶段**就不产生它 ✓。
+        let ranges = [crate::usable::UsableRange {
+            base: arch::addr::PhysAddr::new(0),
+            // **区间要小到装得进缓冲** ✗ —— 4 GiB 在 2 MiB 粒度下要 2048 条，
+            // 我第一版给了 8 条缓冲，于是规划器如实报 `BufferTooSmall` ✓（它没撒谎）。
+            length: 0x40_0000,
+        }];
+        let mut out = std::vec![super::Mapping::EMPTY; 8];
+        let n = super::plan_identity(&ranges, &mut out, 0x20_0000).expect("规划成功");
+        // **不能靠"整段丢掉"来满足断言** ✗ —— 那会连页零之后的低内存一起丢掉 ✓。
+        assert!(n > 0, "必须真的产出映射");
+        for m in &out[..n] {
+            assert!(m.virt.as_u64() >= super::IDENTITY_LOW_FLOOR, "虚拟侧不得覆盖页零");
+            assert!(m.phys.as_u64() >= super::IDENTITY_LOW_FLOOR, "物理侧不得覆盖页零");
+        }
+        assert_eq!(out[0].virt.as_u64(), 0x20_0000, "下界抬到 0x1000 后按 2 MiB 对齐");
+        assert_eq!(
+            out[n - 1].virt.as_u64() + 0x20_0000,
+            0x40_0000,
+            "必须一直覆盖到区间末尾（页零之后的内存不能丢）"
+        );
+    }
 
     #[test]
     fn every_plan_error_has_a_distinct_human_readable_message() {

@@ -2984,7 +2984,13 @@ mod build_plan_tests {
         assert!(count >= 3, "至少要有内核/HHDM/恒等三类映射，实得 {count}");
         let must_stay = [
             MustStay { start: kernel_virt, len: kernel_len },
-            MustStay { start: 0, len: 0x80_0000 },
+            // **从 `IDENTITY_LOW_FLOOR` 起** ✓：页零**有意不映射**（空指针解引用必须**故障**，
+            // 而不是静默读写物理 0）✗ —— 所以要求"覆盖 `0`"会与那条不变量**直接冲突** ✗。
+            // 这一行是**旧行为留在测试里的残留** ✓，随规划器的改动一起更正 ✓。
+            MustStay {
+                start: mm::plan::IDENTITY_LOW_FLOOR,
+                len: 0x80_0000 - mm::plan::IDENTITY_LOW_FLOOR,
+            },
         ];
         check_coverage(&plan[..count], &must_stay).expect("覆盖检查必须通过");
         // 内核段必须**可执行**：规划器默认只给 present()，那在 x86-64 上等于 NX，
