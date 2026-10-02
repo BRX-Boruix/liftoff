@@ -143,7 +143,7 @@ mod tests {
 
     use super::{ApField, ApTrampolineError, ApTrampolineInput, prepare};
 
-    fn input() -> ApTrampolineInput {
+    pub(super) fn input() -> ApTrampolineInput {
         ApTrampolineInput {
             hhdm: 0xffff_8000_0000_0000,
             cr3_top: 0x1000,
@@ -229,7 +229,13 @@ mod tests {
         assert_eq!(block.cr3, 0, "页表地址未填");
         assert_eq!(block.info_struct, 0, "MpInfo 地址未填");
     }
+}
 
+// ---- 以下**不是测试**：跳板的搬运与布局常量，`boot` 要真的用它们 ✗ ----
+//
+// 【缺陷修正】原先它们被夹在 `mod tests` **里面** ✗（`mod tests` 一直没闭合 ✓），
+// 于是这些项**只在测试里存在** ✗ —— `boot` 无论怎么写都找不到它们 ✗。
+// 这正是"没有调用方"的真实原因 ✓。
 
 /// 跳板被搬到的低内存页**必须**在 1 MiB 以下。
 ///
@@ -248,150 +254,6 @@ pub const AP_FRAME_OFFSET: usize = 0x800;
 
 /// GDTR 的 6 字节描述符在页内的**固定偏移**（紧跟在参数块之后）。
 pub const AP_GDTR_OFFSET: usize = 0x880;
-
-// 参数块字段偏移 —— **由 `offset_of!` 算出**，不手写 ✗（S13 单点 ✓）。
-//
-// 这几个只服务于下面的 `global_asm!`（汇编按固定偏移读参数块 ✓），而那段汇编只在
-// UEFI 目标上存在 ✓ —— 所以它们也**同样门控** ✓：宿主构建里根本不存在，就不会有
-// "从未使用"的警告 ✗。`stage()` 里改用**内联的 `offset_of!`** ✓，不依赖这些常量 ✓。
-#[cfg(target_os = "uefi")]
-const OFF_HHDM: usize = core::mem::offset_of!(ApTrampoline, hhdm);
-#[cfg(target_os = "uefi")]
-const OFF_TARGET_MODE: usize = core::mem::offset_of!(ApTrampoline, target_mode);
-#[cfg(target_os = "uefi")]
-const OFF_CR3: usize = core::mem::offset_of!(ApTrampoline, cr3);
-#[cfg(target_os = "uefi")]
-const OFF_INFO_STRUCT: usize = core::mem::offset_of!(ApTrampoline, info_struct);
-#[cfg(target_os = "uefi")]
-const OFF_TEMP_STACK_LO: usize = core::mem::offset_of!(ApTrampoline, temp_stack_lo);
-
-/// `MpInfo` 里 `goto_address` 的偏移（内核写完它，AP 就跳）。
-#[cfg(target_os = "uefi")]
-const MP_INFO_GOTO_ADDRESS: usize = 16;
-/// `MpInfo` 里 `reserved` 的偏移 —— **内核填的 AP 栈** ✓（见 `limine::mp` 的字段文档 ✓）。
-#[cfg(target_os = "uefi")]
-const MP_INFO_RESERVED: usize = 8;
-
-// ---------------------------------------------------------------------------
-// AP 跳板：**自包含**（实模式 → 保护模式 → 长模式 → 停车），不复用 spinup。
-//
-// **为什么自包含**：复用 `spinup_spinup32` 需要把暂存地址塞进它的参数帧，而参考实现
-// **本身也没有复用**它的 spinup ✓ —— 这是"自包含是对的"的证据 ✓。
-// ---------------------------------------------------------------------------
-#[cfg(target_os = "uefi")]
-core::arch::global_asm!(
-    ".section .text",
-    ".global ap_trampoline_start",
-    ".global ap_trampoline_end",
-    // ---- 16 位实模式入口 ----
-    ".code16",
-    "ap_trampoline_start:",
-    "    cli",
-    "    cld",
-    // 取加载段基址：AP 的 cs 不一定是 0，所以一切都以 cs 为基准算。
-    "    mov ebx, cs",
-    "    shl ebx, 4",
-    // GDTR 描述符在固定偏移处（SIPI 不给寄存器，只能按固定位置找）。
-    "    o32 lgdt [cs:{gdtr_off}]",
-    "    o32 lidt [cs:(.ap_idtr - ap_trampoline_start)]",
-    "    lea eax, [ebx + (.ap_mode32 - ap_trampoline_start)]",
-    "    mov [cs:(.ap_farjmp_off - ap_trampoline_start)], eax",
-    "    mov eax, 0x00000011",
-    "    mov cr0, eax",
-    "    o32 jmp far [cs:(.ap_farjmp - ap_trampoline_start)]",
-    "  .ap_farjmp:",
-    "    .ap_farjmp_off: dd 0",
-    "    .ap_farjmp_seg: dd 0x18",
-    "  .ap_idtr:",
-    "    .word 0",
-    "    .dd 0",
-    // ---- 32 位：建分页并回到长模式 ----
-    ".code32",
-    "  .ap_mode32:",
-    "    mov ax, 0x20",
-    "    mov ds, ax",
-    "    mov es, ax",
-    "    mov fs, ax",
-    "    mov gs, ax",
-    "    mov ss, ax",
-    "    xor eax, eax",
-    "    lldt ax",
-    "    mov cr4, eax",
-    // 临时栈（参数块给的低 32 位；栈在低 4 GiB 内 ✓）。
-    "    mov esp, [ebx + {frame} + {off_stack}]",
-    "    mov eax, [ebx + {frame} + {off_cr3}]",
-    "    mov cr3, eax",
-    "    mov eax, cr4",
-    "    bts eax, 5",
-    "    mov cr4, eax",
-    // EFER = LME（+NXE 若目标支持）
-    "    mov ecx, 0xc0000080",
-    "    mov eax, 1 << 8",
-    "    test dword ptr [ebx + {frame} + {off_target}], 1 << 3",
-    "    jz 1f",
-    "    or eax, 1 << 11",
-    "1:",
-    "    xor edx, edx",
-    "    wrmsr",
-    // CR0.PG（+WP 若目标要求）
-    "    mov eax, cr0",
-    "    test dword ptr [ebx + {frame} + {off_target}], 1 << 4",
-    "    jz 2f",
-    "    bts eax, 16",
-    "2:",
-    "    bts eax, 31",
-    "    mov cr0, eax",
-    "    lea eax, [ebx + (.ap_mode64 - ap_trampoline_start)]",
-    "    push 0x28",
-    "    push eax",
-    "    retf",
-    // ---- 64 位：置标志、停车、等内核指路 ----
-    ".code64",
-    "  .ap_mode64:",
-    "    mov ax, 0x30",
-    "    mov ds, ax",
-    "    mov es, ax",
-    "    mov fs, ax",
-    "    mov gs, ax",
-    "    mov ss, ax",
-    // 用 xchg 原子置 booted_flag（参考实现同款）。
-    "    mov eax, 1",
-    "    xchg byte ptr [rbx + {frame} + {off_booted}], al",
-    // rdi = MpInfo 的 HHDM 地址（我们的映像可能在 4 GiB 以上，不在内核恒等映射内）。
-    "    mov edi, dword ptr [rbx + {frame} + {off_info}]",
-    "    add rdi, qword ptr [rbx + {frame} + {off_hhdm}]",
-    // 自旋等内核写 goto_address。
-    "  .ap_spin:",
-    "    mov rax, qword ptr [rdi + {goto_off}]",
-    "    test rax, rax",
-    "    jnz .ap_go",
-    "    pause",
-    "    jmp .ap_spin",
-    "  .ap_go:",
-    "    mov rbx, cr3",
-    "    mov cr3, rbx",
-    // 切到**内核填的**栈（MpInfo.reserved）—— 引导器绝不该写那个字段。
-    "    mov rsp, qword ptr [rdi + {reserved_off}]",
-    "    push 0",
-    "    mov rsi, rsp",
-    "    push 0x30",
-    "    push rsi",
-    "    push 0x2",
-    "    push 0x28",
-    "    push rax",
-    "    iretq",
-    "ap_trampoline_end:",
-    frame = const AP_FRAME_OFFSET,
-    gdtr_off = const AP_GDTR_OFFSET,
-    off_hhdm = const OFF_HHDM,
-    off_booted = const core::mem::offset_of!(ApTrampoline, booted_flag),
-    off_target = const OFF_TARGET_MODE,
-    off_cr3 = const OFF_CR3,
-    off_info = const OFF_INFO_STRUCT,
-    off_stack = const OFF_TEMP_STACK_LO,
-    goto_off = const MP_INFO_GOTO_ADDRESS,
-    reserved_off = const MP_INFO_RESERVED,
-);
 
 /// AP 唤醒位置（SIPI 向量）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -476,6 +338,12 @@ pub fn stage(
     // SIPI 向量 = 基址 >> 12（必须落在低 8 位）。
     Ok(SipiVector((base >> 12) as u8))
 }
+
+#[cfg(test)]
+mod staging_tests {
+    use super::tests::input;
+    use super::{AP_FRAME_OFFSET, AP_GDTR_OFFSET, AP_PAGE_SIZE, ApTrampoline, StageError, prepare, stage};
+
     #[test]
     fn staging_puts_the_trampoline_at_the_page_start_and_the_frame_at_its_fixed_offset() {
         // **SIPI 只给向量**：AP 从 `vector<<12` 的**页首**开始执行 ✓，而参数块必须能被

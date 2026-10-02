@@ -33,6 +33,10 @@ pub use x86_64::features;
 #[cfg(feature = "impl-x86_64")]
 pub use x86_64::lapic;
 
+/// AP 启动跳板的参数块、搬运与布局常量（S5–S7）。
+#[cfg(feature = "impl-x86_64")]
+pub use x86_64::ap;
+
 #[cfg(feature = "impl-mock")]
 pub mod mock {
     //! 宿主测试用实现：不触碰硬件，但状态机行为真实（不是"假数据"）。
