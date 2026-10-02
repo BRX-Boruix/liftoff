@@ -257,6 +257,11 @@ impl EfiFrameAllocator {
 }
 
 impl FrameAllocator for EfiFrameAllocator {
+    /// 报**真实计数** ✓（与固有方法同名 ✓ —— 这里转发到**同一个字段** ✓，不是两套数 ✓）。
+    fn allocated(&self) -> Option<usize> {
+        Some(self.allocated)
+    }
+
     fn allocate_zeroed(&mut self) -> Option<PhysFrame> {
         let mut address: u64 = 0;
         // SAFETY: 由固件填写 `address`；其余参数按 UEFI 契约给出。

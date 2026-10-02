@@ -2845,6 +2845,16 @@ pub unsafe fn bring_up(
         "[liftoff] 低页分配器已交付 {} 帧\n",
         low_frames.allocated()
     ));
+    // **主分配器**（页表帧等）✓ —— 与低页计数**分开报** ✓：两者是不同实例 ✓，
+    // 合并成一个"总数"就把两个口径混在一起了 ✗。`None` 时**如实说"不报"** ✓，不编造 0 ✗。
+    match page_table.allocated_frames() {
+        Some(frames) => report_fmt::<crate::PlatformImpl>(format_args!(
+            "[liftoff] 主分配器已交付 {frames} 帧（页表帧等）\n"
+        )),
+        None => report_fmt::<crate::PlatformImpl>(format_args!(
+            "[liftoff] 主分配器不报帧数\n"
+        )),
+    }
         }
     }
     // **引导器自述**：`BootloaderInfoResponse` 的 name/version 此前一直是 NULL ——

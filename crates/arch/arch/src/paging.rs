@@ -160,6 +160,15 @@ pub fn validate_range(
 pub trait FrameAllocator {
     /// 取一个已零化的物理页帧；耗尽返回 `None`。
     fn allocate_zeroed(&mut self) -> Option<PhysFrame>;
+
+    /// 已交付的帧数；**实现可以不报** ✓ → 默认 `None` ✓。
+    ///
+    /// **为什么是 `Option` 而不是 `usize`** ✗：返回 `Some(0)` 会把"**不报**"伪装成
+    /// "**零占用**" ✗ —— 而台账 §4.1 要的正是"引导器运行期占了多少内存" ✓。
+    /// **宁可说"我不知道"，也不要报一个看起来合理的 0** ✓（S09）。
+    fn allocated(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// 页表：调用方按区间声明映射，页表层数与页大小由实现决定。
@@ -246,6 +255,19 @@ mod tests {
     use super::{FrameAllocator, MapError, PageFlags, pages_for, validate_range};
     use crate::addr::{Alignment, PhysAddr, PhysFrame, VirtAddr};
 
+
+    #[test]
+    fn an_allocator_that_does_not_report_its_count_says_so() {
+        // **默认必须是 `None`** ✓ —— 返回 `Some(0)` 会把"不报"伪装成"零占用" ✗，
+        // 而 §4.1 要的正是"运行期占了多少内存" ✓。
+        struct Silent;
+        impl FrameAllocator for Silent {
+            fn allocate_zeroed(&mut self) -> Option<PhysFrame> {
+                None
+            }
+        }
+        assert_eq!(Silent.allocated(), None, "不报就是 None，不是 0");
+    }
 
     #[test]
     fn frame_allocator_is_implementable() {

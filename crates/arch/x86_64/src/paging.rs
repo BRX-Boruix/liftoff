@@ -118,6 +118,17 @@ impl<A: FrameAllocator> X86PageTable<A> {
         Ok(virt.as_u64() as *mut u64)
     }
 
+    /// 页表帧等**已交付的帧数** —— 供中性层报"运行期内存" ✓。
+    ///
+    /// **为什么要有访问器**：字段是私有的 ✓ —— 让 `boot` 直接读私有字段会破坏封装 ✗，
+    /// 而改成 `pub` 又等于**邀请任何人改它** ✗。
+    ///
+    /// **为什么走 trait 而不是具体类型**：`X86PageTable<A>` 是泛型的 ✓ ——
+    /// 给具体类型写 impl 会让 **arch 依赖 efi** ✗（跨层 ✗）；trait 上的 `Option` 版本对任意 `A` 都成立 ✓。
+    pub fn allocated_frames(&self) -> Option<usize> {
+        self.allocator.allocated()
+    }
+
     fn read_entry(&self, frame: PhysFrame, index: u64) -> Result<u64, MapError> {
         let ptr = self.entry_ptr(frame, index)?;
         // SAFETY: 指针由直接映射给出且覆盖该帧；index 已由 debug_assert 与调用方限制在 0..512。
