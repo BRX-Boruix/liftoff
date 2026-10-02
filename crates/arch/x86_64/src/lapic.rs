@@ -139,6 +139,30 @@ pub fn icr_writes(access: ApicAccess, value: u64) -> IcrSequence {
     }
 }
 
+/// ICR 的**投递状态**位（bit 12）：1 = 上一次 IPI 尚未送达。
+pub const ICR_DELIVERY_STATUS: u64 = 1 << 12;
+
+/// ICR 是否**仍在投递中**（纯逻辑、宿主可测）。
+pub const fn icr_busy(icr: u64) -> bool {
+    icr & ICR_DELIVERY_STATUS != 0
+}
+
+/// 等待投递完成的自旋上限（对照 brxLimine `lapic.c:300`：一百万次 + `pause`）。
+///
+/// **必须有界** ✗：无界自旋在硬件异常时会把引导器挂死，而串口上什么都不显示。
+pub const ICR_WAIT_SPINS: u32 = 1_000_000;
+
+/// INIT assert 的 ICR 值（对照 brxLimine `smp.c:85` 的 `0x4500`）。
+///
+/// **由 `icr_value` 派生并由测试绑定** ✓（S13 单点 ✓）—— 不手写魔数 ✗。
+pub const IPI_INIT_ASSERT: u64 = 0x4500;
+/// INIT **deassert** 的 ICR 值（对照 `smp.c:96` 的 `0x0500`）。
+///
+/// 电平语义：INIT 之后必须发一次 deassert，否则后续 IPI 可能被忽略 ✗。
+pub const IPI_INIT_DEASSERT: u64 = 0x0500;
+/// SIPI 的 ICR 基础值（投递模式 Startup + assert）；向量按位或进去 ✓。
+pub const IPI_SIPI_BASE: u64 = 0x4600;
+
 /// `IA32_APIC_BASE` MSR（`0x1B`）—— xAPIC/x2APIC 的模式开关就在这里。
 pub const IA32_APIC_BASE: u32 = 0x1B;
 
@@ -243,6 +267,91 @@ pub fn icr_value(
         value |= ICR_LEVEL_ASSERT;
     }
     Ok(value)
+}
+
+/// 读一个 32 位 MMIO 寄存器。
+///
+/// # Safety
+/// `address` 必须是**已映射**的 MMIO（LAPIC 在低 4 GiB 恒等映射内 ✓），且为 4 字节对齐。
+#[cfg(target_os = "uefi")]
+pub unsafe fn mmio_read32(address: u64) -> u32 {
+    // SAFETY: 由调用方保证（见函数文档）。
+    unsafe { core::ptr::read_volatile(address as *const u32) }
+}
+
+/// 写一个 32 位 MMIO 寄存器。
+///
+/// # Safety
+/// 同 [`mmio_read32`]。
+#[cfg(target_os = "uefi")]
+pub unsafe fn mmio_write32(address: u64, value: u32) {
+    // SAFETY: 由调用方保证（见函数文档）。
+    unsafe { core::ptr::write_volatile(address as *mut u32, value) };
+}
+
+/// 写一个 MSR。
+///
+/// # Safety
+/// `index` 必须是**当前 CPU 上存在且可写**的 MSR —— 写不存在的 MSR 会 `#GP`。
+#[cfg(target_os = "uefi")]
+pub unsafe fn wrmsr(index: u32, value: u64) {
+    // SAFETY: 由调用方保证 MSR 存在且可写（见函数文档）。
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") index,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// 执行一次由 [`icr_writes`] 产出的寄存器写入。
+///
+/// # Safety
+/// 同 [`mmio_write32`] / [`wrmsr`]。
+#[cfg(target_os = "uefi")]
+unsafe fn apply_write(write: RegisterWrite) {
+    match write {
+        RegisterWrite::Mmio32 { address, value } => unsafe { mmio_write32(address, value) },
+        RegisterWrite::Msr { index, value } => unsafe { wrmsr(index, value) },
+    }
+}
+
+/// 读 ICR 的当前值（用于轮询投递状态）。
+///
+/// # Safety
+/// 同 [`mmio_read32`] / [`rdmsr`]。
+#[cfg(target_os = "uefi")]
+unsafe fn read_icr(access: ApicAccess) -> u64 {
+    match access {
+        // xAPIC：投递状态在 ICR **低半**（ICR0）里 ✓。
+        ApicAccess::Xapic { base } => unsafe { mmio_read32(base + LAPIC_ICR_LOW as u64) as u64 },
+        ApicAccess::X2apic => unsafe { rdmsr(X2APIC_MSR_ICR) },
+    }
+}
+
+/// 发一个 IPI 并**等到它被投递**（轮询 ICR 的投递状态位）。
+///
+/// 顺序由 [`icr_writes`] 保证 ✓（xAPIC 必须先写高半 —— 写低半才触发发送 ✓）。
+///
+/// # Safety
+/// 同 [`apply_write`]；且 `access` 必须与固件当前实际模式一致 ✗（用 x2APIC 的 MSR 去访问
+/// 一个 xAPIC 模式的 LAPIC 不会报错，只会**什么都不发生** ✗）。
+#[cfg(target_os = "uefi")]
+pub unsafe fn send_ipi(access: ApicAccess, value: u64) {
+    let sequence = icr_writes(access, value);
+    unsafe { apply_write(sequence.first) };
+    if let Some(second) = sequence.second {
+        unsafe { apply_write(second) };
+    }
+    for _ in 0..ICR_WAIT_SPINS {
+        if !icr_busy(unsafe { read_icr(access) }) {
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 #[cfg(test)]
@@ -393,6 +502,38 @@ mod tests {
         assert_eq!(select_access(true, true), ApicAccess::X2apic);
         // 内核支持但固件没开 -> **不擅自打开**：那需要写 MSR 0x1B，属独立决定（S4）。
         assert_eq!(select_access(true, false), ApicAccess::Xapic { base: LAPIC_DEFAULT_BASE });
+    }
+
+    #[test]
+    fn the_ipi_constants_are_exactly_what_the_encoder_produces() {
+        // **把常量绑到编码器上** ✓（S13 单点 ✓）—— 常量是手写的十六进制，
+        // 而"手写魔数"正是本会话反复出错的地方 ✗。这里让编码器当裁判 ✓。
+        // 目的地取 0：这两个常量只描述**投递模式 + assert**，与目的地无关 ✓。
+        assert_eq!(
+            IPI_INIT_ASSERT,
+            icr_value(ApicMode::X2apic, ApicId(0), DeliveryMode::Init, 0, true).expect("合法"),
+            "INIT assert 必须与编码器一致"
+        );
+        assert_eq!(
+            IPI_INIT_DEASSERT,
+            icr_value(ApicMode::X2apic, ApicId(0), DeliveryMode::Init, 0, false).expect("合法"),
+            "INIT deassert 必须与编码器一致"
+        );
+        assert_eq!(
+            IPI_SIPI_BASE,
+            icr_value(ApicMode::X2apic, ApicId(0), DeliveryMode::Startup, 0, true).expect("合法"),
+            "SIPI 基础值必须与编码器一致"
+        );
+    }
+
+    #[test]
+    fn the_delivery_status_bit_is_the_one_the_reference_polls() {
+        // brxLimine `lapic.c:301` 轮询的是 `ICR0 & (1 << 12)` ✓。
+        assert_eq!(ICR_DELIVERY_STATUS, 1 << 12);
+        assert!(icr_busy(1 << 12), "置位即投递中");
+        assert!(!icr_busy(0), "清零即已送达");
+        // 其他位不得被误判成投递中 ✓。
+        assert!(!icr_busy(0x4500), "0x4500 不含 bit 12");
     }
 
     #[test]
