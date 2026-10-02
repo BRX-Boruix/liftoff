@@ -44,6 +44,18 @@ pub enum PlanError {
     AddressOverflow,
 }
 
+impl core::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // 这些消息会经 `PlanBuildError` 一路走到真机串口（`report_failure`），
+        // 所以必须**人类可读**，而不是只有 `Debug` 的变体名。
+        match self {
+            Self::InvalidPageSize => f.write_str("页粒度为零"),
+            Self::BufferTooSmall => f.write_str("调用方给的输出缓冲太小"),
+            Self::AddressOverflow => f.write_str("虚拟地址计算溢出"),
+        }
+    }
+}
+
 /// 规划**恒等映射**（`virt == phys`），返回产出的映射条数。
 /// 共用规划核心：按 `large` 对齐遍历区间，虚拟地址由 `virt_of` 给出。
 ///
@@ -127,6 +139,24 @@ pub fn plan_kernel_high(
 
 #[cfg(test)]
 mod tests {
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    #[test]
+    fn every_plan_error_has_a_distinct_human_readable_message() {
+        let mut seen: Vec<String> = Vec::new();
+        for err in [
+            PlanError::InvalidPageSize,
+            PlanError::BufferTooSmall,
+            PlanError::AddressOverflow,
+        ] {
+            let text = format!("{err}");
+            assert!(!text.is_empty(), "每条错误都必须有消息");
+            assert!(!seen.contains(&text), "消息不得重复: {text}");
+            seen.push(text);
+        }
+    }
     use super::{Mapping, PlanError, plan_identity};
     use crate::usable::UsableRange;
     use arch::addr::PhysAddr;

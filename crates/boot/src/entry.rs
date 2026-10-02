@@ -1673,11 +1673,11 @@ pub enum PlanBuildError {
 }
 
 impl core::fmt::Display for PlanBuildError {
-    // 载荷（`PlanError`）**尚无 `Display`**，故用 `{:?}`。
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::KernelBaseUnaligned => f.write_str("内核物理基址未按大页对齐"),
-            Self::Plan(err) => write!(f, "页表规划失败: {err:?}"),
+            // `PlanError` 现已实现 `Display`（中立层 `mm`），故用 `{}`。
+            Self::Plan(err) => write!(f, "页表规划失败: {err}"),
         }
     }
 }
