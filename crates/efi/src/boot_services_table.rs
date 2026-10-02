@@ -14,6 +14,21 @@ use core::ffi::c_void;
 /// `ExitBootServices` 的签名。
 pub type ExitBootServices = unsafe extern "efiapi" fn(image_handle: Handle, map_key: usize) -> Status;
 
+/// `EFI_BOOT_SERVICES.GetNextMonotonicCount` 的签名。
+///
+/// UEFI 契约：把当前计数写进 `count`，返回状态 ✓。**单位不在此处假设** ✗ ——
+/// 它由 [`monotonic_delta`] 的调用方**实测标定**（见 `bring_up` 里用已知 10 毫秒的 `Stall` 量的那一次 ✓）。
+pub type MonotonicCount = unsafe extern "efiapi" fn(count: *mut u64) -> Status;
+
+/// 两次单调计数之间的**差值**，**处理回绕** ✓。
+///
+/// 计数是**有界的**（UEFI 不保证不回绕）✗ —— 直接相减在回绕时给出一个巨大的错值 ✗，
+/// 而"耗时变成 10^19"**不会崩**，只会被当成真的 ✗。模 2^64 的减法正是回绕下的正确差值 ✓。
+#[inline]
+pub const fn monotonic_delta(start: u64, end: u64) -> u64 {
+    end.wrapping_sub(start)
+}
+
 /// `EFI_BOOT_SERVICES.Stall`：微秒级延时。
 pub type Stall = unsafe extern "efiapi" fn(microseconds: usize) -> Status;
 
@@ -123,8 +138,11 @@ pub struct BootServicesTable {
     pub unload_image: *mut c_void,
     /// 退出引导服务。
     pub exit_boot_services: ExitBootServices,
-    /// 单调计数（未使用）。
-    pub get_next_monotonic_count: *mut c_void,
+    /// **单调计数**（UEFI `GetNextMonotonicCount`）。
+    ///
+    /// 【类型更正】此前它被声明成 `*mut c_void`（"未使用"）✗ —— **那是假的类型** ✓：
+    /// 它是个**函数指针**，写错调用方就无从调用 ✓，而"未使用"不是留一个错类型的理由 ✗。
+    pub get_next_monotonic_count: MonotonicCount,
     /// **微秒级延时**。
     ///
     /// 用于 IPI 之间**必须的等待**：INIT 之后要等约 **10 ms** 才发 SIPI ✗ ——
@@ -139,6 +157,14 @@ pub struct BootServicesTable {
 #[cfg(test)]
 mod tests {
     use super::BootServicesTable;
+
+    #[test]
+    fn the_monotonic_delta_wraps_instead_of_reporting_a_huge_number() {
+        // 直接相减在回绕时给出巨大错值 ✗，而"耗时 = 10^19"**不会崩**，只会被当成真的 ✗。
+        assert_eq!(super::monotonic_delta(100, 250), 150);
+        assert_eq!(super::monotonic_delta(7, 7), 0);
+        assert_eq!(super::monotonic_delta(u64::MAX - 5, 4), 10, "回绕必须算对");
+    }
     use core::mem::offset_of;
 
     #[test]
@@ -192,6 +218,7 @@ impl EfiFrameAllocator {
     pub const fn allocated(&self) -> usize {
         self.allocated
     }
+
 }
 
 impl EfiFrameAllocator {

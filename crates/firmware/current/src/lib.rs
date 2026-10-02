@@ -22,6 +22,8 @@ pub mod current {
     pub use efi::boot_services_table::AllocatePages;
     pub use efi::boot_services_table::{ALLOCATE_ANY_PAGES, EFI_LOADER_CODE, EFI_LOADER_DATA};
     pub use efi::boot_services_table::EfiFrameAllocator;
+    // D3 测量：单调计数差（回绕安全）✓。
+    pub use efi::boot_services_table::monotonic_delta;
     // AP 启动要用固件延时（`Stall`）：INIT 后 10 ms、SIPI 间 200 µs ✓。
     pub use efi::boot_services_table::Stall;
     pub use efi::uefi_boot_services::UefiBootServices;

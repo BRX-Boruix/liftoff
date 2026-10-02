@@ -2583,6 +2583,26 @@ pub unsafe fn bring_up(
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys as *mut u8, bytes.len()) };
         Ok(())
     };
+    // 【D3 测量 · **单位标定**】`GetNextMonotonicCount` 的单位**不能猜** ✗ ——
+    // 用**已知时长**的 `Stall` 把它**测出来** ✓：停 10 毫秒，量计数差 ✓。
+    // 这样"计数 → 时间"的换算是**实测**的，不是假设的 ✓。
+    {
+        let mut before = 0u64;
+        // SAFETY: 仍在 boot services 期间（Exit 在后面）✓ —— 字段是函数指针，直接调用 ✓，
+        // 与 `table.stall` 同一手法 ✓。
+        unsafe { (table.get_next_monotonic_count)(&mut before) };
+        // SAFETY: 同上 —— 固件延时，10 毫秒。
+        unsafe { (table.stall)(10_000) };
+        let mut after = 0u64;
+        // SAFETY: 同上。
+        unsafe { (table.get_next_monotonic_count)(&mut after) };
+        report_fmt::<crate::PlatformImpl>(format_args!(
+            "[liftoff] 标定：停 10 毫秒 = 计数差 {}（**据此换算** ✓）\n",
+            // **经固件门面**取 ✓ —— `current` 在本 crate 里指的是**架构选择器** ✗，
+            // 而单调计数是 **UEFI 概念**，不属于 arch 层 ✓。
+            firmware_current::current::monotonic_delta(before, after)
+        ));
+    }
     for byte in b"[liftoff] step: applying plan\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
