@@ -2800,9 +2800,17 @@ pub unsafe fn bring_up(
     //
     // `*mut` 来自协议 ABI（Limine 用 C 的 `char *`）；这两个静态字符串**只读**，
     // 内核按协议只应读取它们。
+    // **必须是 HHDM 地址** ✓ —— 对照 brxLimine `limine.c:1012-1013`：
+    // `bootloader_info_response->name = reported_addr("Limine")` /
+    // `->version = reported_addr(LIMINE_VERSION)`，而
+    // `reported_addr(addr) = addr + direct_map_offset` ✓。
+    //
+    // 【E5 缺陷修正】我们此前把**映像里的指针**原样交出去 ✗ —— 内核经 HHDM 去读，
+    // 拿到的是无效地址（或读到 0）✗，串口实测 `[init] kernel version = 0x000` 与此吻合 ✓。
+    // 两个字符串都在引导器映像里，映像被恒等映射也在 HHDM 里 ✓，所以换算成立 ✓。
     c.responses.set_bootloader_info(
-        BOOTLOADER_NAME.as_ptr().cast_mut().cast(),
-        BOOTLOADER_VERSION.as_ptr().cast_mut().cast(),
+        (HHDM_OFFSET.wrapping_add(BOOTLOADER_NAME.as_ptr() as u64)) as *mut core::ffi::c_char,
+        (HHDM_OFFSET.wrapping_add(BOOTLOADER_VERSION.as_ptr() as u64)) as *mut core::ffi::c_char,
     );
     // RSDP 只在**真的从配置表找到**时才填；没有就留空 —— 给假指针比不给更糟。
     if let Some(rsdp) = c.rsdp {
