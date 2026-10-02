@@ -543,6 +543,18 @@ pub enum MediaError {
     Iso(IsoError),
 }
 
+impl core::fmt::Display for MediaError {
+    // 载荷（`TableError` / `IsoError`）**尚无 `Display`**，故用 `{:?}` —— 顶层消息
+    // 已人类可读，细节待载荷补齐后改为 `{}`。补齐清单见台账（系统性缺口）。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Device(err) => write!(f, "固件访问失败: {err}"),
+            Self::Table(err) => write!(f, "分区表解析失败: {err:?}"),
+            Self::Iso(err) => write!(f, "ISO9660 解析或读取失败: {err:?}"),
+        }
+    }
+}
+
 /// 从块设备上取出内核映像：判定分区表 → 选卷 → 读内核。
 ///
 /// 没有分区表时（`Ok(None)`）卷就是**整盘**（`start_lba = 0`）—— ISO 直接挂载正是这种情况。

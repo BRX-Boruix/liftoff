@@ -210,11 +210,9 @@ fn report_failure<P: Platform>(stage: &BringUpError) {
 ///
 /// 缓冲溢出即截断（`fmt` 返回 `Err` 被忽略）—— 诊断输出不该因为消息长就 panic。
 ///
-/// **这里用 `Debug` 而不是 `Display`，是有意的临时选择**：`MediaError`、
-/// `KernelPlanError`、`PlanBuildError`、`HandoffError` 四个类型**根本没有 `Display`**
-/// —— 它们无法用人类可读的形式说出自己。给它们补 `Display` 是独立的一步（已记入台账），
-/// 在补上之前先用 `Debug`，让**每一个**失败至少能报出名字，而不是只报环节。
-fn report_cause<P: Platform>(err: &impl core::fmt::Debug) {
+/// 用 `Display`：这四个顶层类型现已实现它，所以失败能报出**人类可读**的原因。
+/// 其**载荷**里还有 6 个类型没有 `Display`（清单在台账），那些位置暂用 `{:?}`。
+fn report_cause<P: Platform>(err: &impl core::fmt::Display) {
     struct Buf {
         bytes: [u8; 128],
         len: usize,
@@ -233,7 +231,7 @@ fn report_cause<P: Platform>(err: &impl core::fmt::Debug) {
     }
     use core::fmt::Write;
     let mut buf = Buf { bytes: [0; 128], len: 0 };
-    let _ = write!(buf, "[liftoff]   cause: {:?}\n", err);
+    let _ = write!(buf, "[liftoff]   cause: {}\n", err);
     report::<P>(&buf.bytes[..buf.len]);
 }
 
@@ -824,7 +822,12 @@ mod report_failure_tests {
         let text = capture(&BringUpError::Apply(MapError::UnsupportedGranularity));
         assert!(text.contains("stage: apply plan"), "必须打环节: {text}");
         assert!(text.contains("cause:"), "必须打具体原因: {text}");
-        assert!(text.contains("UnsupportedGranularity"), "原因必须点名到具体变体: {text}");
+        // 断言**人类可读**的消息（`Display`），而不是 Debug 里的变体名 —— 后者只是
+        // 临时手段，前者才是这次改进的实质。
+        assert!(
+            text.contains("实现不支持该页粒度"),
+            "原因必须是人类可读的消息: {text}"
+        );
     }
 
     #[test]
@@ -944,6 +947,17 @@ pub enum HandoffError {
     BeforeEntry(EntryError),
     /// 退出引导服务失败。
     Exit(Error),
+}
+
+impl core::fmt::Display for HandoffError {
+    // 载荷（`ScanError` / `EntryError`）**尚无 `Display`**，故用 `{:?}`。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Fill(err) => write!(f, "响应填充扫描失败: {err:?}"),
+            Self::BeforeEntry(err) => write!(f, "跳转前检查失败: {err:?}"),
+            Self::Exit(err) => write!(f, "退出引导服务失败: {err}"),
+        }
+    }
 }
 
 /// 完整交接编排：填充响应 → 跳转前检查 → 取键并退出 → 跳转。
@@ -1377,6 +1391,22 @@ pub enum KernelPlanError {
     RelocationNotMapped,
 }
 
+impl core::fmt::Display for KernelPlanError {
+    // 载荷（`ElfError`）**尚无 `Display`**，故用 `{:?}`。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Elf(err) => write!(f, "ELF 解析失败: {err:?}"),
+            Self::EntryOutsideSegments => f.write_str("入口不在任何装载段内"),
+            Self::EmptySegment => f.write_str("段的虚拟区间长度为 0"),
+            Self::Overflow => f.write_str("段区间末端溢出"),
+            Self::BufferTooSmall => f.write_str("调用方给的输出缓冲太小"),
+            Self::NotMapped => f.write_str("段的目标虚拟区间没有任何映射覆盖"),
+            Self::MapFailed => f.write_str("把规划写入页表失败"),
+            Self::RelocationNotMapped => f.write_str("重定位目标不在规划覆盖范围内"),
+        }
+    }
+}
+
 /// 解析内核映像，得出入口与装载段。
 ///
 /// 数值边界：每段 `vaddr + memsz` 都做 checked 加法（溢出即拒绝）；入口必须落在某段内，
@@ -1640,6 +1670,50 @@ pub enum PlanBuildError {
     KernelBaseUnaligned,
     /// 底层规划器报错。
     Plan(PlanError),
+}
+
+impl core::fmt::Display for PlanBuildError {
+    // 载荷（`PlanError`）**尚无 `Display`**，故用 `{:?}`。
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::KernelBaseUnaligned => f.write_str("内核物理基址未按大页对齐"),
+            Self::Plan(err) => write!(f, "页表规划失败: {err:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::{KernelPlanError, PlanBuildError};
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    #[test]
+    fn every_payloadless_variant_has_a_distinct_human_readable_message() {
+        // 这些消息会**直接出现在真机串口上**（`report_failure`），所以它们必须存在、
+        // 必须各不相同 —— 两条错误打印出同一行文字，等于没有诊断信息。
+        //
+        // 带载荷的变体不在此列：它们的 `Display` 由编译期保证（`write!` 要求载荷
+        // 实现 `Display`），而载荷自身的可读性缺口已记入台账。
+        let mut seen: Vec<String> = Vec::new();
+        let cases: [(String, &str); 8] = [
+            (format!("{}", KernelPlanError::EntryOutsideSegments), "入口"),
+            (format!("{}", KernelPlanError::EmptySegment), "长度为 0"),
+            (format!("{}", KernelPlanError::Overflow), "溢出"),
+            (format!("{}", KernelPlanError::BufferTooSmall), "缓冲"),
+            (format!("{}", KernelPlanError::NotMapped), "映射"),
+            (format!("{}", KernelPlanError::MapFailed), "页表"),
+            (format!("{}", KernelPlanError::RelocationNotMapped), "重定位"),
+            (format!("{}", PlanBuildError::KernelBaseUnaligned), "对齐"),
+        ];
+        for (text, keyword) in cases {
+            assert!(!text.is_empty(), "每条错误都必须有消息");
+            assert!(text.contains(keyword), "「{text}」应含「{keyword}」");
+            assert!(!seen.contains(&text), "消息不得重复: {text}");
+            seen.push(text);
+        }
+    }
 }
 
 /// 页表规划的输入。
