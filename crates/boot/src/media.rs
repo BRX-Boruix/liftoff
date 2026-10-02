@@ -544,12 +544,12 @@ pub enum MediaError {
 }
 
 impl core::fmt::Display for MediaError {
-    // `TableError` 已实现 `Display`；`IsoError` 尚未（台账缺口清单里最后一个）。
+    // 两个载荷（`TableError` / `IsoError`）现均实现 `Display`，**全链路人类可读**。
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Device(err) => write!(f, "固件访问失败: {err}"),
             Self::Table(err) => write!(f, "分区表解析失败: {err}"),
-            Self::Iso(err) => write!(f, "ISO9660 解析或读取失败: {err:?}"),
+            Self::Iso(err) => write!(f, "ISO9660 解析或读取失败: {err}"),
         }
     }
 }

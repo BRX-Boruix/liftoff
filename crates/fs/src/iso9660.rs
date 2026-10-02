@@ -38,6 +38,51 @@ pub enum IsoError {
     BufferTooSmall,
 }
 
+impl core::fmt::Display for IsoError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // 这些消息会经 `MediaError::Iso` 一路走到真机串口（`report_failure`）。
+        match self {
+            Self::ShortImage => f.write_str("映像不足，装不下卷描述符"),
+            Self::NotIso9660 => f.write_str("标识不是 CD001，不是 ISO9660"),
+            Self::NotPrimary => f.write_str("不是主卷描述符"),
+            Self::BadBlockSize => f.write_str("逻辑块大小为 0"),
+            Self::EndianMismatch => f.write_str("双端序两份不一致（映像损坏）"),
+            Self::BadRecordLength => f.write_str("目录记录长度非法（小于 33 或越出块尾）"),
+            Self::BadNameLength => f.write_str("目录记录的名字长度超出其记录范围"),
+            Self::BufferTooSmall => f.write_str("调用方给的输出缓冲太小"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod iso_error_display_tests {
+    use super::IsoError;
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    #[test]
+    fn every_iso_error_has_a_distinct_human_readable_message() {
+        let mut seen: Vec<String> = Vec::new();
+        for err in [
+            IsoError::ShortImage,
+            IsoError::NotIso9660,
+            IsoError::NotPrimary,
+            IsoError::BadBlockSize,
+            IsoError::EndianMismatch,
+            IsoError::BadRecordLength,
+            IsoError::BadNameLength,
+            IsoError::BufferTooSmall,
+        ] {
+            let text = format!("{err}");
+            assert!(!text.is_empty(), "每条错误都必须有消息");
+            assert!(!seen.contains(&text), "消息不得重复: {text}");
+            seen.push(text);
+        }
+        assert_eq!(seen.len(), 8, "必须覆盖全部 8 个变体");
+    }
+}
+
 /// 一个目录记录。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DirRecord {
