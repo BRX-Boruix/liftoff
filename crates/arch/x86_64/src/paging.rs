@@ -163,6 +163,41 @@ impl<A: FrameAllocator> X86PageTable<A> {
         Ok(fresh)
     }
 
+    /// 解除单个 4 KiB 页。
+    ///
+    /// **落在更大粒度映射内时报错**，不擅自拆分：拆分是「建立更细映射」的副作用，
+    /// 让 `unmap` 顺手做它会把「解除」变成有分配行为的操作，失败语义立刻复杂化。
+    /// 调用方若确实要解除大页区间，先建一条更细的映射（触发拆分）再调本方法。
+    fn unmap_page(&mut self, v: u64) -> Result<(), MapError> {
+        let pml4 = self.read_entry(self.root, (v >> 39) & 0x1FF)?;
+        if pml4 & PTE_PRESENT == 0 {
+            return Ok(());
+        }
+        let pdpt = self.read_entry(
+            PhysFrame::containing(PhysAddr::new(pml4 & FRAME_ADDR_MASK)),
+            (v >> 30) & 0x1FF,
+        )?;
+        if pdpt & PTE_PRESENT == 0 {
+            return Ok(());
+        }
+        if pdpt & PTE_HUGE != 0 {
+            return Err(MapError::UnsupportedGranularity);
+        }
+        let pd = self.read_entry(
+            PhysFrame::containing(PhysAddr::new(pdpt & FRAME_ADDR_MASK)),
+            (v >> 21) & 0x1FF,
+        )?;
+        if pd & PTE_PRESENT == 0 {
+            return Ok(());
+        }
+        if pd & PTE_HUGE != 0 {
+            return Err(MapError::UnsupportedGranularity);
+        }
+        let pt = PhysFrame::containing(PhysAddr::new(pd & FRAME_ADDR_MASK));
+        // 写 0：present=0 即「不存在」。**页表帧本身不回收** —— 它仍被上级项引用，
+        // 回收需要在每一级判断是否全空并改父项，属优化；当前无数据支撑其必要性（S32）。
+        self.write_entry(pt, (v >> 12) & 0x1FF, 0)
+    }
     /// 4 KiB 粒度映射。
     ///
     /// 与 `map_range`（2 MiB 大页）并列存在而不是替换它：大页是引导期的主要路径
@@ -240,6 +275,27 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
         }
         Ok(())
     }
+
+    fn unmap(&mut self, virt: VirtAddr, len: u64) -> Result<(), MapError> {
+        if len == 0 {
+            return Err(MapError::Empty);
+        }
+        let start = virt.as_u64();
+        if start % PAGE_SIZE != 0 {
+            return Err(MapError::MisalignedVirt);
+        }
+        if len % PAGE_SIZE != 0 {
+            return Err(MapError::MisalignedLength);
+        }
+        let end = start.checked_add(len).ok_or(MapError::Overflow)?;
+        let mut v = start;
+        while v < end {
+            self.unmap_page(v)?;
+            v += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
 
     fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
         let v = virt.as_u64();
@@ -484,6 +540,66 @@ mod tests {
         assert_eq!(
             pt.map_range_pages(VirtAddr::new(0), PhysAddr::new(0), 0, PageFlags::present()),
             Err(MapError::Empty),
+        );
+    }
+
+    #[test]
+    fn unmap_removes_a_four_kib_mapping() {
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        pt.map_range_pages(
+            VirtAddr::new(0x1000),
+            PhysAddr::new(0x5000),
+            PAGE_SIZE,
+            PageFlags::present(),
+        )
+        .expect("映射成功");
+        assert!(pt.translate(VirtAddr::new(0x1000)).is_some(), "解除前应可翻译");
+        pt.unmap(VirtAddr::new(0x1000), PAGE_SIZE).expect("解除成功");
+        assert!(
+            pt.translate(VirtAddr::new(0x1000)).is_none(),
+            "解除后必须不可翻译 —— 这是 `unmap` 的全部意义",
+        );
+        // **幂等**：对已解除的地址再解除不算错误（目标状态就是「不存在」）。
+        pt.unmap(VirtAddr::new(0x1000), PAGE_SIZE).expect("重复解除应成功");
+    }
+
+    #[test]
+    fn unmap_rejects_ranges_inside_a_large_page_instead_of_splitting() {
+        // 落在更大粒度映射内时报错，不擅自拆分 —— 那会把「解除」变成有分配行为的
+        // 操作。调用方应先建更细的映射（触发拆分）再解除。
+        let (mut alloc, dm) = harness(64);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        pt.map_range(
+            VirtAddr::new(0x200000),
+            PhysAddr::new(0x400000),
+            LARGE_PAGE_SIZE,
+            PageFlags::present(),
+        )
+        .expect("大页映射成功");
+        assert_eq!(
+            pt.unmap(VirtAddr::new(0x201000), PAGE_SIZE),
+            Err(MapError::UnsupportedGranularity),
+        );
+        // 报错之后映射必须**原样还在** —— 拒绝不能有副作用。
+        assert!(pt.translate(VirtAddr::new(0x201000)).is_some(), "拒绝不得破坏原映射");
+    }
+
+    #[test]
+    fn unmap_rejects_bad_arguments() {
+        let (mut alloc, dm) = harness(16);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        assert_eq!(pt.unmap(VirtAddr::new(0), 0), Err(MapError::Empty));
+        assert_eq!(
+            pt.unmap(VirtAddr::new(0x1001), PAGE_SIZE),
+            Err(MapError::MisalignedVirt),
+        );
+        assert_eq!(
+            pt.unmap(VirtAddr::new(0), PAGE_SIZE + 1),
+            Err(MapError::MisalignedLength),
         );
     }
 

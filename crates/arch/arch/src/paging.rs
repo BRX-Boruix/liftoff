@@ -196,6 +196,22 @@ pub trait PageTable {
     /// **必须如实回答**：未映射就是 `None`，不得为「看起来完整」而编造地址（S09）。
     fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)>;
 
+    /// 解除 `[virt, virt+len)` 的映射。
+    ///
+    /// **粒度**：本方法按 **4 KiB** 粒度解除。若目标区间落在**更大粒度**的映射
+    /// （2 MiB / 1 GiB 大页）内，实现应报 `UnsupportedGranularity`，调用方需先
+    /// 建立该区间内的更细映射（会触发拆分）再解除。
+    ///
+    /// **已解除的区间是幂等的**：对未映射的地址调用本方法不算错误 —— 「解除」的
+    /// 目标状态就是「不存在」，本来就不存在即已达成。
+    ///
+    /// 默认返回 `UnsupportedGranularity`：实现方按自身能力决定是否支持。
+    /// **报错是安全的默认**（不像「返回 `None`」会把「没实现」与「未映射」混为
+    /// 一谈）—— 调用方拿不到成功就会知道这件事没做成。
+    fn unmap(&mut self, _virt: VirtAddr, _len: u64) -> Result<(), MapError> {
+        Err(MapError::UnsupportedGranularity)
+    }
+
     /// 激活本页表：此后 CPU 用其解析地址。
     ///
     /// # Safety
