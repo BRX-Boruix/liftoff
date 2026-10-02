@@ -75,11 +75,11 @@ pub static SPINUP_GDT: SpinupGdt = SpinupGdt(build_gdt());
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpinupArgs {
-    /// 是否启用 5 级分页（我们传 `0` ✓）。
+    /// 是否启用 5 级分页（我们传 `0`）。
     ///
-    /// **这不是"偷懒的硬编码"，是有依据的** ✓：32 位跳板先 `xor eax, eax; mov cr4, eax`
-    /// **把 CR4 整体清零** ✓ —— 于是 LA57 必然已被关闭 ✓，而我们建的也是 4 级表 ✓。
-    /// 传 1 反而与清零后的状态矛盾 ✗。
+    /// **这不是"偷懒的硬编码"，是有依据的**：32 位跳板先 `xor eax, eax; mov cr4, eax`
+    /// **把 CR4 整体清零**—— 于是 LA57 必然已被关闭，而我们建的也是 4 级表。
+    /// 传 1 反而与清零后的状态矛盾。
     pub level5pg: u32,
     /// 内核页表顶层物理地址（低 4 GiB 内）。
     pub pagemap_top: u32,
@@ -93,14 +93,14 @@ pub struct SpinupArgs {
     pub stack_hi: u32,
     /// GDTR 指针（由 stage_low_buffer 填，调用方不必知道）。
     pub gdt: u32,
-    /// NX 可用 —— **由调用方探测填入** ✓，**不是常量** ✗。
+    /// NX 可用 —— **由调用方探测填入**，**不是常量**。
     ///
-    /// 【文档更正】这里原先写"NX 可用（1）" ✗ —— 那读起来像"写死 1"，
-    /// 而实际是**探测**的 ✓（E4）。写死的后果很具体：在没有 NX 的 CPU 上给 `EFER` 置 `NXE`
-    /// 是**保留位写入** → `#GP` ✗，而 QEMU 默认 CPU 有 NX，所以"恰好成立" ✗。
+    /// 【文档更正】这里原先写"NX 可用（1）" —— 那读起来像"写死 1"，
+    /// 而实际是**探测**的（E4）。写死的后果很具体：在没有 NX 的 CPU 上给 `EFER` 置 `NXE`
+    /// 是**保留位写入** → `#GP`，而 QEMU 默认 CPU 有 NX，所以"恰好成立"。
     ///
-    /// 探测点：`crates/boot/src/entry.rs` 调 `current::features::nx_available()` ✓，
-    /// 其纯逻辑在 `crates/arch/x86_64/src/features.rs`（读 CPUID 扩展特性 `EDX` 的 NX 位）✓。
+    /// 探测点：`crates/boot/src/entry.rs` 调 `current::features::nx_available()`，
+    /// 其纯逻辑在 `crates/arch/x86_64/src/features.rs`（读 CPUID 扩展特性 `EDX` 的 NX 位）。
     pub nx_available: u32,
     /// direct map offset 低 32 位。
     pub dmo_lo: u32,

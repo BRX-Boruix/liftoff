@@ -16,14 +16,14 @@ pub type ExitBootServices = unsafe extern "efiapi" fn(image_handle: Handle, map_
 
 /// `EFI_BOOT_SERVICES.GetNextMonotonicCount` 的签名。
 ///
-/// UEFI 契约：把当前计数写进 `count`，返回状态 ✓。**单位不在此处假设** ✗ ——
-/// 它由 [`monotonic_delta`] 的调用方**实测标定**（见 `bring_up` 里用已知 10 毫秒的 `Stall` 量的那一次 ✓）。
+/// UEFI 契约：把当前计数写进 `count`，返回状态。**单位不在此处假设**——
+/// 它由 [`monotonic_delta`] 的调用方**实测标定**（见 `bring_up` 里用已知 10 毫秒的 `Stall` 量的那一次）。
 pub type MonotonicCount = unsafe extern "efiapi" fn(count: *mut u64) -> Status;
 
-/// 两次单调计数之间的**差值**，**处理回绕** ✓。
+/// 两次单调计数之间的**差值**，**处理回绕**。
 ///
-/// 计数是**有界的**（UEFI 不保证不回绕）✗ —— 直接相减在回绕时给出一个巨大的错值 ✗，
-/// 而"耗时变成 10^19"**不会崩**，只会被当成真的 ✗。模 2^64 的减法正是回绕下的正确差值 ✓。
+/// 计数是**有界的**（UEFI 不保证不回绕） —— 直接相减在回绕时给出一个巨大的错值，
+/// 而"耗时变成 10^19"**不会崩**，只会被当成真的。模 2^64 的减法正是回绕下的正确差值。
 #[inline]
 pub const fn monotonic_delta(start: u64, end: u64) -> u64 {
     end.wrapping_sub(start)
@@ -36,20 +36,20 @@ pub type Stall = unsafe extern "efiapi" fn(microseconds: usize) -> Status;
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
 /// `AllocateMaxAddress`：`memory` 传入时是**允许的最高地址**，返回的页不高于它。
 ///
-/// 需要它是因为**实模式只有 20 位寻址** ✗ —— AP 跳板必须落在 1 MiB 以下，
+/// 需要它是因为**实模式只有 20 位寻址**—— AP 跳板必须落在 1 MiB 以下，
 /// 否则 AP 醒来取不到第一条指令（表现为"发了 IPI 但 AP 不醒"）。
 ///
-/// 【缺陷修正】这里曾经写成 **2** ✗。UEFI 规范里 `EFI_ALLOCATE_TYPE` 的枚举顺序是
-/// `AllocateAnyPages`(0)、`AllocateMaxAddress`(**1**)、`AllocateAddress`(2) ✓ ——
-/// 值 2 是 `AllocateAddress`，语义**正好相反**：它要求**正好分配在给定地址** ✗。
+/// 【缺陷修正】这里曾经写成 **2**。UEFI 规范里 `EFI_ALLOCATE_TYPE` 的枚举顺序是
+/// `AllocateAnyPages`(0)、`AllocateMaxAddress`(**1**)、`AllocateAddress`(2) ——
+/// 值 2 是 `AllocateAddress`，语义**正好相反**：它要求**正好分配在给定地址**。
 /// 于是"在 1 MiB 以下随便找一页"变成了"必须把 0xF_F000 这一页给我"：真机上 OVMF
-/// 交不出那一页 → 分配失败 → `[liftoff] ap: 低页分配失败` → **一个 AP 都起不来** ✗。
+/// 交不出那一页 → 分配失败 → `[liftoff] ap: 低页分配失败` → **一个 AP 都起不来**。
 ///
-/// **为什么原来的测试没抓到** ✗：它断言 `SEEN_TYPE == ALLOCATE_MAX_ADDRESS` ——
-/// 把**实现**钉在常量上，却**没有把常量钉在规范上** ✓。两条都要有 ✓。
+/// **为什么原来的测试没抓到**：它断言 `SEEN_TYPE == ALLOCATE_MAX_ADDRESS` ——
+/// 把**实现**钉在常量上，却**没有把常量钉在规范上**。两条都要有。
 pub const ALLOCATE_MAX_ADDRESS: u32 = 1;
-/// `AllocateAddress`：`memory` 是**要求的准确地址**（与上一个**不是**同一件事 ✗）。
-/// 目前没有调用方，但显式列出枚举值，好让上面的常量有东西可对照 ✓。
+/// `AllocateAddress`：`memory` 是**要求的准确地址**（与上一个**不是**同一件事）。
+/// 目前没有调用方，但显式列出枚举值，好让上面的常量有东西可对照。
 pub const ALLOCATE_ADDRESS: u32 = 2;
 /// 内存类型：引导器数据。
 pub const EFI_LOADER_CODE: u32 = 1;
@@ -140,17 +140,17 @@ pub struct BootServicesTable {
     pub exit_boot_services: ExitBootServices,
     /// **单调计数**（UEFI `GetNextMonotonicCount`）。
     ///
-    /// 【类型更正】此前它被声明成 `*mut c_void`（"未使用"）✗ —— **那是假的类型** ✓：
-    /// 它是个**函数指针**，写错调用方就无从调用 ✓，而"未使用"不是留一个错类型的理由 ✗。
+    /// 【类型更正】此前它被声明成 `*mut c_void`（"未使用"） —— **那是假的类型**：
+    /// 它是个**函数指针**，写错调用方就无从调用，而"未使用"不是留一个错类型的理由。
     pub get_next_monotonic_count: MonotonicCount,
     /// **微秒级延时**。
     ///
-    /// 用于 IPI 之间**必须的等待**：INIT 之后要等约 **10 ms** 才发 SIPI ✗ ——
-    /// 太早发 AP 会错过它（表现为"发了 IPI 但 AP 不醒"，串口上什么都没有 ✗）。
+    /// 用于 IPI 之间**必须的等待**：INIT 之后要等约 **10 ms** 才发 SIPI ——
+    /// 太早发 AP 会错过它（表现为"发了 IPI 但 AP 不醒"，串口上什么都没有）。
     ///
-    /// 用固件的 `Stall` 而不是忙等自旋 ✓：延时**准确**，而忙等的时长取决于 CPU 速度 ✗。
-    /// **可用性**：AP 启动发生在 `ExitBootServices` **之前**（Exit 在 `enter_kernel` 里 ✓），
-    /// 所以引导服务仍然有效 ✓。
+    /// 用固件的 `Stall` 而不是忙等自旋：延时**准确**，而忙等的时长取决于 CPU 速度。
+    /// **可用性**：AP 启动发生在 `ExitBootServices` **之前**（Exit 在 `enter_kernel` 里），
+    /// 所以引导服务仍然有效。
     pub stall: Stall,
 }
 
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn the_monotonic_delta_wraps_instead_of_reporting_a_huge_number() {
-        // 直接相减在回绕时给出巨大错值 ✗，而"耗时 = 10^19"**不会崩**，只会被当成真的 ✗。
+        // 直接相减在回绕时给出巨大错值，而"耗时 = 10^19"**不会崩**，只会被当成真的。
         assert_eq!(super::monotonic_delta(100, 250), 150);
         assert_eq!(super::monotonic_delta(7, 7), 0);
         assert_eq!(super::monotonic_delta(u64::MAX - 5, 4), 10, "回绕必须算对");
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn the_stall_offset_matches_the_spec() {
-        // **断言完整值** ✓（本会话反复栽在"手算区间"上 ✗）。
+        // **断言完整值**（本会话反复栽在"手算区间"上）。
         // 推导：hdr(24) + 之后每个指针 8 字节；`Stall` 紧跟 `GetNextMonotonicCount`。
         assert_eq!(offset_of!(BootServicesTable, exit_boot_services), 232);
         assert_eq!(offset_of!(BootServicesTable, get_next_monotonic_count), 240);
@@ -201,10 +201,10 @@ mod tests {
 /// 的契约要求零化，故取回后自己清零 —— 页表帧若残留旧数据，会产生**伪映射**（比崩溃更难查）。
 pub struct EfiFrameAllocator {
     allocate_pages: AllocatePages,
-    /// **已成功交付的帧数** ✓ —— 用来回答"引导器运行期到底占了多少内存"（台账 §4.1）✓。
+    /// **已成功交付的帧数**—— 用来回答"引导器运行期到底占了多少内存"（台账 §4.1）。
     ///
-    /// **只数成功交付的** ✓：被拒的（状态错误、未对齐、越界）**不计** ✗ ——
-    /// 否则"占了多少内存"会被虚报 ✗，而虚报的数字比没有数字更坏 ✓。
+    /// **只数成功交付的**：被拒的（状态错误、未对齐、越界）**不计**——
+    /// 否则"占了多少内存"会被虚报，而虚报的数字比没有数字更坏。
     allocated: usize,
 }
 
@@ -214,7 +214,7 @@ impl EfiFrameAllocator {
         Self { allocate_pages, allocated: 0 }
     }
 
-    /// 已成功交付的帧数 ✓。
+    /// 已成功交付的帧数。
     pub const fn allocated(&self) -> usize {
         self.allocated
     }
@@ -224,12 +224,12 @@ impl EfiFrameAllocator {
 impl EfiFrameAllocator {
     /// 取一帧，**不高于** `max_address`（UEFI `AllocateMaxAddress` 语义）。
     ///
-    /// 与 [`FrameAllocator::allocate_zeroed`] 同样自己清零（固件不保证零化 ✓），
-    /// 并且**再验一次**固件交回的地址确实不高于上界 ✓ —— 固件理当遵守，但
-    /// 越界的一页会让 AP 在实模式下取不到指令 ✗，宁可拒绝也不要一个"看起来成功"。
+    /// 与 [`FrameAllocator::allocate_zeroed`] 同样自己清零（固件不保证零化），
+    /// 并且**再验一次**固件交回的地址确实不高于上界 —— 固件理当遵守，但
+    /// 越界的一页会让 AP 在实模式下取不到指令，宁可拒绝也不要一个"看起来成功"。
     ///
-    /// `max_address` 是**允许的最高起始地址** ✓（调用方从 `AP_LOW_LIMIT - AP_PAGE_SIZE`
-    /// 这类**推导**得出 ✓，不手写 ✗）。
+    /// `max_address` 是**允许的最高起始地址**（调用方从 `AP_LOW_LIMIT - AP_PAGE_SIZE`
+    /// 这类**推导**得出，不手写）。
     pub fn allocate_zeroed_below(&mut self, max_address: u64) -> Option<PhysFrame> {
         let mut address: u64 = max_address;
         // SAFETY: 由固件填写 `address`；其余参数按 UEFI 契约给出。
@@ -242,22 +242,22 @@ impl EfiFrameAllocator {
         if address % PAGE_SIZE != 0 {
             return None;
         }
-        // 上界复核。**只比起始地址** ✓ —— 我第一版写成 `address + PAGE_SIZE > max + PAGE_SIZE`，
-        // 而 `max = u64::MAX` 时右边**溢出成 `None`** ✗，`?` 于是把合法分配也拒了 ✗。
-        // 这是本会话反复出现的"手算边界"同一个坑 ✓：能不加减就不加减 ✓。
+        // 上界复核。**只比起始地址**—— 我第一版写成 `address + PAGE_SIZE > max + PAGE_SIZE`，
+        // 而 `max = u64::MAX` 时右边**溢出成 `None`**，`?` 于是把合法分配也拒了。
+        // 这是本会话反复出现的"手算边界"同一个坑：能不加减就不加减。
         if address > max_address {
             return None;
         }
         // SAFETY: 固件刚分配的、页对齐的 4KiB 页，引导阶段该物理地址可直接访问。
         unsafe { core::ptr::write_bytes(address as *mut u8, 0, 4096) };
-        // **只在这里计数** ✓ —— 走到这一行就是"真的交出去了" ✓。
+        // **只在这里计数**—— 走到这一行就是"真的交出去了"。
         self.allocated += 1;
         Some(PhysFrame::containing(PhysAddr::new(address)))
     }
 }
 
 impl FrameAllocator for EfiFrameAllocator {
-    /// 报**真实计数** ✓（与固有方法同名 ✓ —— 这里转发到**同一个字段** ✓，不是两套数 ✓）。
+    /// 报**真实计数**（与固有方法同名 —— 这里转发到**同一个字段**，不是两套数）。
     fn allocated(&self) -> Option<usize> {
         Some(self.allocated)
     }
@@ -277,7 +277,7 @@ impl FrameAllocator for EfiFrameAllocator {
         }
         // SAFETY: `address` 是固件刚分配的、页对齐的 4KiB 页，引导阶段该物理地址可直接访问。
         unsafe { core::ptr::write_bytes(address as *mut u8, 0, 4096) };
-        // **只在这里计数** ✓ —— 走到这一行就是"真的交出去了" ✓。
+        // **只在这里计数**—— 走到这一行就是"真的交出去了"。
         self.allocated += 1;
         Some(PhysFrame::containing(PhysAddr::new(address)))
     }
@@ -292,8 +292,8 @@ mod efi_frame_allocator_tests {
 
     #[test]
     fn the_allocator_counts_only_the_frames_it_actually_handed_out() {
-        // **只数成功交付的帧** ✓ —— 被拒的（越界/状态错误/未对齐）不得计入 ✗，
-        // 否则"运行期占了多少内存"会被虚报 ✗（台账 §4.1 要的就是这个数）。
+        // **只数成功交付的帧**—— 被拒的（越界/状态错误/未对齐）不得计入，
+        // 否则"运行期占了多少内存"会被虚报（台账 §4.1 要的就是这个数）。
         CALLS.store(0, Ordering::SeqCst);
         FAIL.store(0, Ordering::SeqCst);
         MISALIGN.store(0, Ordering::SeqCst);
@@ -301,7 +301,7 @@ mod efi_frame_allocator_tests {
         assert_eq!(allocator.allocated(), 0, "一开始一个都没交出去");
         let _ = allocator.allocate_zeroed_below(u64::MAX).expect("上界足够大");
         assert_eq!(allocator.allocated(), 1, "成功一帧就记一帧");
-        // 上界远小于夹具返回的宿主地址 → 必被拒 ✓ → **不得计入** ✓。
+        // 上界远小于夹具返回的宿主地址 → 必被拒 → **不得计入**。
         let _ = allocator.allocate_zeroed_below(0x10);
         assert_eq!(allocator.allocated(), 1, "被拒的分配不得计入");
     }
@@ -350,10 +350,10 @@ mod efi_frame_allocator_tests {
 
     #[test]
     fn the_allocate_type_and_memory_type_values_match_the_uefi_spec() {
-        // 【缺陷】`ALLOCATE_MAX_ADDRESS` 曾经是 2 ✗ —— 规范里它是 **1**，2 是 `AllocateAddress`。
-        // 这一个数字让"在 1 MiB 以下找一页"变成了"必须给我 0xF_F000 这一页" ✗，
-        // 真机上表现为 `[liftoff] ap: 低页分配失败`、**一个 AP 都起不来** ✗。
-        // 所以这里钉的是**规范值**，与上面那条"实现是否用了这个常量"是**两件事** ✓。
+        // 【缺陷】`ALLOCATE_MAX_ADDRESS` 曾经是 2 —— 规范里它是 **1**，2 是 `AllocateAddress`。
+        // 这一个数字让"在 1 MiB 以下找一页"变成了"必须给我 0xF_F000 这一页"，
+        // 真机上表现为 `[liftoff] ap: 低页分配失败`、**一个 AP 都起不来**。
+        // 所以这里钉的是**规范值**，与上面那条"实现是否用了这个常量"是**两件事**。
         assert_eq!(ALLOCATE_ANY_PAGES, 0);
         assert_eq!(ALLOCATE_MAX_ADDRESS, 1, "AllocateMaxAddress 是 1，不是 2");
         assert_eq!(ALLOCATE_ADDRESS, 2, "2 是 AllocateAddress：要求准确地址");
@@ -364,7 +364,7 @@ mod efi_frame_allocator_tests {
 
     #[test]
     fn a_bounded_allocation_asks_with_the_max_address_type_and_passes_the_bound_through() {
-        // **断言完整值，不手算区间** ✓（本会话反复栽在"手算边界"上 ✗）。
+        // **断言完整值，不手算区间**（本会话反复栽在"手算边界"上）。
         CALLS.store(0, Ordering::SeqCst);
         FAIL.store(0, Ordering::SeqCst);
         MISALIGN.store(0, Ordering::SeqCst);
@@ -375,7 +375,7 @@ mod efi_frame_allocator_tests {
         assert_eq!(SEEN_MAX.load(Ordering::SeqCst), u64::MAX, "上界必须原样透传给固件");
         assert_eq!(SEEN_PAGES.load(Ordering::SeqCst), 1, "一帧 = 一个 4KiB 页");
         assert_eq!(SEEN_MEMTYPE.load(Ordering::SeqCst), EFI_LOADER_DATA as usize);
-        // 与无上界那条同样必须**已清零** ✓。
+        // 与无上界那条同样必须**已清零**。
         let base = frame.start_address().expect("帧地址可算").as_u64();
         // SAFETY: 固件刚交出的页，测试期间可读。
         let byte = unsafe { core::ptr::read_volatile(base as *const u8) };
@@ -384,13 +384,13 @@ mod efi_frame_allocator_tests {
 
     #[test]
     fn a_frame_the_firmware_returns_above_the_bound_is_rejected() {
-        // **这是本方法的全部意义**：越界的一页会让 AP 在实模式下取不到指令 ✗。
-        // 夹具交回的是宿主上一块**高地址**缓冲 ✓ —— 用一个很小的上界就能逼出拒绝 ✓。
+        // **这是本方法的全部意义**：越界的一页会让 AP 在实模式下取不到指令。
+        // 夹具交回的是宿主上一块**高地址**缓冲 —— 用一个很小的上界就能逼出拒绝。
         CALLS.store(0, Ordering::SeqCst);
         FAIL.store(0, Ordering::SeqCst);
         MISALIGN.store(0, Ordering::SeqCst);
         let mut allocator = EfiFrameAllocator::new(fake_alloc);
-        // 0xFF000 = 1 MiB - 4 KiB：跳板页的**推导**上界（整页都要 < 1 MiB ✓）。
+        // 0xFF000 = 1 MiB - 4 KiB：跳板页的**推导**上界（整页都要 < 1 MiB）。
         assert!(
             allocator.allocate_zeroed_below(0x000F_F000).is_none(),
             "固件交出越界地址时必须拒绝，而不是当作成功"

@@ -46,28 +46,28 @@ pub mod mock {
     use arch::platform::{InterruptState, Platform};
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-    /// mock 页表的**映射条数上限** —— **有界** ✓，超出如实报 `OutOfMemory` ✗（不静默丢映射）。
+    /// mock 页表的**映射条数上限** —— **有界**，超出如实报 `OutOfMemory`（不静默丢映射）。
     pub const MOCK_PAGE_TABLE_CAPACITY: usize = 32;
 
     /// 一条宿主侧映射。
     ///
-    /// 以**整段**为单位存（而不是逐页）✓：容量才有意义，`translate` 靠页内偏移算 ✓。
+    /// 以**整段**为单位存（而不是逐页）：容量才有意义，`translate` 靠页内偏移算。
     #[derive(Clone, Copy)]
     struct Entry {
         virt: u64,
         phys: u64,
         len: u64,
-        /// **2 MiB 大页**（用于"拒绝拆分"的判断 ✓）。
+        /// **2 MiB 大页**（用于"拒绝拆分"的判断）。
         large: bool,
         flags: PageFlags,
     }
 
-    /// 宿主测试用页表：**不碰真实内存** ✓，但语义按 `PageTable` 的契约 ✓。
+    /// 宿主测试用页表：**不碰真实内存**，但语义按 `PageTable` 的契约。
     ///
-    /// **能力范围如实声明** ✓：只支持 **4 KiB** 粒度 ✗；`map_range`（2 MiB）返回
-    /// `UnsupportedGranularity`，**不假装支持** ✗。
+    /// **能力范围如实声明**：只支持 **4 KiB** 粒度；`map_range`（2 MiB）返回
+    /// `UnsupportedGranularity`，**不假装支持**。
     /// 只支持**整段**操作 —— 只覆盖一段的一部分时返回 `UnsupportedGranularity`，
-    /// **不静默拆分** ✗（与真实现同一约定 ✓）。
+    /// **不静默拆分**（与真实现同一约定）。
     pub struct MockPageTable {
         entries: [Option<Entry>; MOCK_PAGE_TABLE_CAPACITY],
     }
@@ -112,7 +112,7 @@ pub mod mock {
 
     impl PageTable for MockPageTable {
         fn map_range(&mut self, _virt: VirtAddr, _phys: PhysAddr, _len: u64, _flags: PageFlags) -> Result<(), MapError> {
-            // **如实拒绝** ✓：mock 只有 4 KiB 粒度，不假装支持 2 MiB ✗。
+            // **如实拒绝**：mock 只有 4 KiB 粒度，不假装支持 2 MiB。
             Err(MapError::UnsupportedGranularity)
         }
 
@@ -145,13 +145,13 @@ pub mod mock {
                 if ee <= start || es >= end {
                     continue;
                 }
-                // **只允许整段解除** ✓ —— 部分覆盖会改变别的地址的粒度 ✗。
+                // **只允许整段解除**—— 部分覆盖会改变别的地址的粒度。
                 if es < start || ee > end {
                     return Err(MapError::UnsupportedGranularity);
                 }
                 *entry = None;
             }
-            // **未映射不算错** ✓：解除的目标状态就是"不存在"（与真实现同一约定 ✓）。
+            // **未映射不算错**：解除的目标状态就是"不存在"（与真实现同一约定）。
             Ok(())
         }
 
@@ -166,7 +166,7 @@ pub mod mock {
                     continue;
                 }
                 if es != start || ee != end {
-                    // **拒绝而不是静默拆分** ✓（与真实现同一约定 ✓）。
+                    // **拒绝而不是静默拆分**（与真实现同一约定）。
                     return Err(MapError::UnsupportedGranularity);
                 }
                 e.flags = flags;
@@ -176,27 +176,27 @@ pub mod mock {
             if touched {
                 Ok(())
             } else {
-                // **未映射必须报错** ✗ —— 假装成功会让调用方以为"权限已设" ✓。
+                // **未映射必须报错**—— 假装成功会让调用方以为"权限已设"。
                 Err(MapError::Unmapped)
             }
         }
 
         unsafe fn activate(&self) {
-            // **如实的不动作** ✓：宿主上没有可激活的页表 ✗ —— 不是假装激活成功 ✓。
+            // **如实的不动作**：宿主上没有可激活的页表 —— 不是假装激活成功。
         }
     }
 
     /// 输出记录缓冲的容量。
     ///
-    /// **有界** ✓：溢出必须**可观测**（见 `output_overflowed`）✗ —— 静默丢弃会让"输出被截断"
-    /// 看起来像"输出就这么多" ✗，而宿主测试正是靠这些字节做断言 ✓。
+    /// **有界**：溢出必须**可观测**（见 `output_overflowed`） —— 静默丢弃会让"输出被截断"
+    /// 看起来像"输出就这么多"，而宿主测试正是靠这些字节做断言。
     pub const OUTPUT_CAPACITY: usize = 512;
 
     /// 已记录的输出字节。
     static OUTPUT: [AtomicU8; OUTPUT_CAPACITY] = [const { AtomicU8::new(0) }; OUTPUT_CAPACITY];
-    /// 已记录的字节数（**不超过容量** ✓）。
+    /// 已记录的字节数（**不超过容量**）。
     static OUTPUT_LEN: AtomicUsize = AtomicUsize::new(0);
-    /// 是否发生过溢出（**如实记录，不隐藏** ✓）。
+    /// 是否发生过溢出（**如实记录，不隐藏**）。
     static OUTPUT_OVERFLOW: AtomicBool = AtomicBool::new(false);
 
     /// 宿主测试用的中断开关状态。
@@ -230,15 +230,15 @@ pub mod mock {
             INTERRUPTS_ENABLED.load(Ordering::SeqCst)
         }
 
-        /// 清空输出记录（含溢出标记）✓。
+        /// 清空输出记录（含溢出标记）。
         pub fn reset_output() {
             OUTPUT_LEN.store(0, Ordering::SeqCst);
             OUTPUT_OVERFLOW.store(false, Ordering::SeqCst);
         }
 
-        /// 把已记录的输出拷进 `out`，返回**真实长度** ✓。
+        /// 把已记录的输出拷进 `out`，返回**真实长度**。
         ///
-        /// **返回真实长度而不是容量** ✓ —— 调用方据此知道"到底写了多少"，不会被静默填零误导 ✗。
+        /// **返回真实长度而不是容量**—— 调用方据此知道"到底写了多少"，不会被静默填零误导。
         pub fn output(out: &mut [u8]) -> usize {
             let len = OUTPUT_LEN.load(Ordering::SeqCst).min(out.len());
             for (index, slot) in out[..len].iter_mut().enumerate() {
@@ -247,7 +247,7 @@ pub mod mock {
             len
         }
 
-        /// 记录是否**曾经溢出**（即输出被截断过）✓。
+        /// 记录是否**曾经溢出**（即输出被截断过）。
         pub fn output_overflowed() -> bool {
             OUTPUT_OVERFLOW.load(Ordering::SeqCst)
         }
@@ -274,13 +274,13 @@ pub mod mock {
         }
 
         fn write_byte(byte: u8) {
-            // **记录真实字节** ✓ —— 这是"零伪数据"的正面形态：既不编造输出，也不静默丢弃 ✓。
+            // **记录真实字节**—— 这是"零伪数据"的正面形态：既不编造输出，也不静默丢弃。
             let index = OUTPUT_LEN.load(Ordering::SeqCst);
             if index < OUTPUT_CAPACITY {
                 OUTPUT[index].store(byte, Ordering::SeqCst);
                 OUTPUT_LEN.store(index + 1, Ordering::SeqCst);
             } else {
-                // 溢出**如实标记** ✓ —— 不假装"输出就这么多" ✗。
+                // 溢出**如实标记**—— 不假装"输出就这么多"。
                 OUTPUT_OVERFLOW.store(true, Ordering::SeqCst);
             }
         }
@@ -336,21 +336,21 @@ mod tests {
         assert_eq!(pt.map_range_pages(VirtAddr::new(1), p, PAGE_SIZE, PageFlags::present()), Err(MapError::MisalignedVirt));
         assert_eq!(pt.map_range_pages(VirtAddr::new(0), PhysAddr::new(1), PAGE_SIZE, PageFlags::present()), Err(MapError::MisalignedPhys));
         assert_eq!(pt.map_range_pages(VirtAddr::new(0), p, PAGE_SIZE + 1, PageFlags::present()), Err(MapError::MisalignedLength));
-        // 2 MiB 粒度**如实拒绝** ✓ —— mock 只支持 4 KiB，不假装支持 ✗。
+        // 2 MiB 粒度**如实拒绝**—— mock 只支持 4 KiB，不假装支持。
         assert_eq!(pt.map_range(VirtAddr::new(0), p, PAGE_SIZE, PageFlags::present()), Err(MapError::UnsupportedGranularity));
     }
 
     #[test]
     fn mock_page_table_refuses_to_split_and_reports_unmapped_protect() {
         let (mut pt, _) = mapped(0x4000_0000);
-        // 未映射改权限**必须报错** ✗，不能假装成功 ✓。
+        // 未映射改权限**必须报错**，不能假装成功。
         assert_eq!(pt.protect(VirtAddr::new(0x8000_0000), PAGE_SIZE, PageFlags::present()), Err(MapError::Unmapped));
-        // **整段覆盖**是允许的 ✓ —— `mapped()` 建的 run 恰好一页，所以这一条**应当成功** ✗。
-        // （我第一版把它写成"必须被拒绝" ✗ —— 那是我把"整段"和"部分"搞混了：
-        //  一页的 run 被整段保护，本来就是合法的整段操作 ✓。）
+        // **整段覆盖**是允许的 —— `mapped()` 建的 run 恰好一页，所以这一条**应当成功**。
+        // （我第一版把它写成"必须被拒绝" —— 那是我把"整段"和"部分"搞混了：
+        //  一页的 run 被整段保护，本来就是合法的整段操作。）
         pt.protect(VirtAddr::new(0x4000_0000), PAGE_SIZE, PageFlags::present())
             .expect("整段覆盖应当允许");
-        // **部分覆盖**才必须拒绝 ✓ —— 建一个**两页**的 run，只保护其中一页。
+        // **部分覆盖**才必须拒绝 —— 建一个**两页**的 run，只保护其中一页。
         let mut two = MockPageTable::new();
         two.map_range_pages(
             VirtAddr::new(0x6000_0000),
@@ -362,16 +362,16 @@ mod tests {
         assert_eq!(
             two.protect(VirtAddr::new(0x6000_0000), PAGE_SIZE, PageFlags::present()),
             Err(MapError::UnsupportedGranularity),
-            "只覆盖两页 run 的一部分时**不得静默拆分** ✗"
+            "只覆盖两页 run 的一部分时**不得静默拆分**"
         );
-        // 整段覆盖两页则允许 ✓。
+        // 整段覆盖两页则允许。
         two.protect(VirtAddr::new(0x6000_0000), PAGE_SIZE * 2, PageFlags::present())
             .expect("整段两页应当允许");
     }
 
     #[test]
     fn mock_records_the_bytes_it_is_given() {
-        // **零伪数据**的正面形态：不编造输出，也不静默丢弃 ✓。
+        // **零伪数据**的正面形态：不编造输出，也不静默丢弃。
         Mock::reset_output();
         for byte in b"abc" {
             Mock::write_byte(*byte);
@@ -391,7 +391,7 @@ mod tests {
         }
         let mut buf = std::vec![0u8; OUTPUT_CAPACITY];
         assert_eq!(Mock::output(&mut buf), OUTPUT_CAPACITY, "记录长度必须**封顶**，不越界");
-        assert!(Mock::output_overflowed(), "溢出必须**可观测**，不能静默丢弃 ✗");
+        assert!(Mock::output_overflowed(), "溢出必须**可观测**，不能静默丢弃");
     }
 
     #[test]

@@ -51,10 +51,10 @@ fn huge_at_level(ps_page_size: Option<u64>, entry: u64) -> Option<u64> {
 /// 只报叶项权限是常见错误 —— 会报出一个「可写」的地址，而实际写入被上级拒绝。
 /// 把**语义权限**（[`PageFlags`]）编码成 PTE 位。
 ///
-/// **单点**（S13）✓：这段转换此前在 `map_range_pages` 与 `map_range` 里**各写了一遍** ✗ ——
-/// 两处漂移会让**同样的 `PageFlags` 得到不同的权限**，而权限错不会崩，只会静默放宽或收紧 ✗。
+/// **单点**（S13）：这段转换此前在 `map_range_pages` 与 `map_range` 里**各写了一遍**——
+/// 两处漂移会让**同样的 `PageFlags` 得到不同的权限**，而权限错不会崩，只会静默放宽或收紧。
 ///
-/// `PTE_PRESENT` **恒置** ✓：本函数用于**建立或修改已有映射**；清 present 是 `unmap` 的职责 ✓。
+/// `PTE_PRESENT` **恒置**：本函数用于**建立或修改已有映射**；清 present 是 `unmap` 的职责。
 #[inline]
 fn pte_bits(flags: PageFlags) -> u64 {
     let mut bits = PTE_PRESENT;
@@ -118,13 +118,13 @@ impl<A: FrameAllocator> X86PageTable<A> {
         Ok(virt.as_u64() as *mut u64)
     }
 
-    /// 页表帧等**已交付的帧数** —— 供中性层报"运行期内存" ✓。
+    /// 页表帧等**已交付的帧数** —— 供中性层报"运行期内存"。
     ///
-    /// **为什么要有访问器**：字段是私有的 ✓ —— 让 `boot` 直接读私有字段会破坏封装 ✗，
-    /// 而改成 `pub` 又等于**邀请任何人改它** ✗。
+    /// **为什么要有访问器**：字段是私有的 —— 让 `boot` 直接读私有字段会破坏封装，
+    /// 而改成 `pub` 又等于**邀请任何人改它**。
     ///
-    /// **为什么走 trait 而不是具体类型**：`X86PageTable<A>` 是泛型的 ✓ ——
-    /// 给具体类型写 impl 会让 **arch 依赖 efi** ✗（跨层 ✗）；trait 上的 `Option` 版本对任意 `A` 都成立 ✓。
+    /// **为什么走 trait 而不是具体类型**：`X86PageTable<A>` 是泛型的 ——
+    /// 给具体类型写 impl 会让 **arch 依赖 efi**（跨层）；trait 上的 `Option` 版本对任意 `A` 都成立。
     pub fn allocated_frames(&self) -> Option<usize> {
         self.allocator.allocated()
     }
@@ -214,9 +214,9 @@ impl<A: FrameAllocator> X86PageTable<A> {
     /// **落在更大粒度映射内时报错**，不擅自拆分：拆分是「建立更细映射」的副作用，
     /// 让 `unmap` 顺手做它会把「解除」变成有分配行为的操作，失败语义立刻复杂化。
     /// 调用方若确实要解除大页区间，先建一条更细的映射（触发拆分）再调本方法。
-    /// 改**一个 4 KiB 页**的权限位，**地址位原样保留** ✓ —— 这是本函数唯一的实质动作。
+    /// 改**一个 4 KiB 页**的权限位，**地址位原样保留**—— 这是本函数唯一的实质动作。
     ///
-    /// 落在大页里、或压根没映射，都**报错而不是拆分/假装成功** ✗（与 `unmap` 同一约定 ✓）。
+    /// 落在大页里、或压根没映射，都**报错而不是拆分/假装成功**（与 `unmap` 同一约定）。
     fn protect_page(&mut self, v: u64, bits: u64) -> Result<(), MapError> {
         let pml4 = self.read_entry(self.root, (v >> 39) & 0x1FF)?;
         if pml4 & PTE_PRESENT == 0 {
@@ -230,7 +230,7 @@ impl<A: FrameAllocator> X86PageTable<A> {
             return Err(MapError::Unmapped);
         }
         if pdpt & PTE_HUGE != 0 {
-            // 1 GiB 大页：**拒绝而不是拆分** ✓。
+            // 1 GiB 大页：**拒绝而不是拆分**。
             return Err(MapError::UnsupportedGranularity);
         }
         let pd = self.read_entry(
@@ -241,7 +241,7 @@ impl<A: FrameAllocator> X86PageTable<A> {
             return Err(MapError::Unmapped);
         }
         if pd & PTE_HUGE != 0 {
-            // 2 MiB 大页：**拒绝而不是拆分** ✓。
+            // 2 MiB 大页：**拒绝而不是拆分**。
             return Err(MapError::UnsupportedGranularity);
         }
         let pt_frame = PhysFrame::containing(PhysAddr::new(pd & FRAME_ADDR_MASK));
@@ -250,7 +250,7 @@ impl<A: FrameAllocator> X86PageTable<A> {
         if pte & PTE_PRESENT == 0 {
             return Err(MapError::Unmapped);
         }
-        // **只换权限位**：地址位从原项里取回 ✓ —— 写错这里就是"改权限顺手改掉了物理地址" ✗。
+        // **只换权限位**：地址位从原项里取回 —— 写错这里就是"改权限顺手改掉了物理地址"。
         self.write_entry(pt_frame, index, (pte & FRAME_ADDR_MASK) | bits)
     }
 
@@ -352,7 +352,7 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
     }
 
     fn protect(&mut self, virt: VirtAddr, len: u64, flags: PageFlags) -> Result<(), MapError> {
-        // 与 `unmap` 同一套校验（同一份语义：按 4 KiB 粒度处理一个区间）✓。
+        // 与 `unmap` 同一套校验（同一份语义：按 4 KiB 粒度处理一个区间）。
         if len == 0 {
             return Err(MapError::Empty);
         }
@@ -464,14 +464,14 @@ mod tests {
     #[test]
     fn the_permission_bits_are_encoded_in_one_place() {
         // 【S13 缺陷】这份"语义权限 → PTE 位"的转换此前在 `map_range_pages` 与 `map_range`
-        // 里**各写了一遍** ✗ —— 两处一旦漂移，**同样的 `PageFlags` 会得到不同的映射权限** ✗，
-        // 而权限错不会崩，只会让一段内存意外可写或不可执行 ✗。
-        // 现在只此一处，并由本测试钉住 ✓。
-        // `PTE_PRESENT` **恒置** ✓：本函数只用于**建立或修改已有映射** ——
-        // 清 present 是 `unmap` 的职责 ✓（这里如实钉住这个契约，而不是假装它会看 `is_present`）。
-        // **逐位断言，不断言整值** ✓ —— 我第一版写 `pte_bits(none()) == PTE_PRESENT` ✗，
-        // 而 `none()` **不是可执行**，NX 本来就该置上 —— 断言整值会把这个**正确行为**判成失败 ✗。
-        // 逐位断言问的才是"我关心的那一位对不对" ✓。
+        // 里**各写了一遍**—— 两处一旦漂移，**同样的 `PageFlags` 会得到不同的映射权限**，
+        // 而权限错不会崩，只会让一段内存意外可写或不可执行。
+        // 现在只此一处，并由本测试钉住。
+        // `PTE_PRESENT` **恒置**：本函数只用于**建立或修改已有映射** ——
+        // 清 present 是 `unmap` 的职责（这里如实钉住这个契约，而不是假装它会看 `is_present`）。
+        // **逐位断言，不断言整值**—— 我第一版写 `pte_bits(none()) == PTE_PRESENT`，
+        // 而 `none()` **不是可执行**，NX 本来就该置上 —— 断言整值会把这个**正确行为**判成失败。
+        // 逐位断言问的才是"我关心的那一位对不对"。
         let none = pte_bits(PageFlags::none());
         assert_eq!(none & PTE_PRESENT, PTE_PRESENT, "present 恒置");
         assert_eq!(none & PTE_WRITABLE, 0, "none 不可写");

@@ -1,9 +1,9 @@
 //! 卷：把分区表与块设备接起来，提供“按分区读块”（L4）。
 //!
-//! 边界：只认 `firmware::block::BlockDeviceSource` **抽象**（具体实现由门面注入 ✓）；
-//! 边界校验**复用** `firmware::block::validate_read`（单点定义 ✓，不写第二份 ✗）。
+//! 边界：只认 `firmware::block::BlockDeviceSource` **抽象**（具体实现由门面注入）；
+//! 边界校验**复用** `firmware::block::validate_read`（单点定义，不写第二份）。
 //!
-//! 约定：**被拒绝的读绝不触碰设备**（先判后调 ✓）—— 越界访问在引导器里是不可接受的 ✗。
+//! 约定：**被拒绝的读绝不触碰设备**（先判后调）—— 越界访问在引导器里是不可接受的。
 
 use firmware::block::{BlockDeviceSource, DeviceIndex};
 use firmware::error::Error;

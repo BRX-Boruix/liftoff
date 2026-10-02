@@ -370,7 +370,7 @@ pub fn unicode_to_cp437(code_point: u64) -> i32 {
         0x2026 => 250, // … (ellipsis) → ·
         0x2212 => 45,  // − (minus sign) → -
         // Check marks
-        0x2713 => 251, // ✓ → √
+        0x2713 => 251, // → √
         0x2714 => 251, // ✔ → √
         // Double arrows → single arrow equivalents
         0x21d0 => 27, // ⇐ → ←
@@ -441,7 +441,7 @@ mod tests {
         // 连字符 → 横线
         assert_eq!(unicode_to_cp437(0x2013), 45); // – → -
         // 对勾 → 根号
-        assert_eq!(unicode_to_cp437(0x2713), 251); // ✓ → √
+        assert_eq!(unicode_to_cp437(0x2713), 251); // → √
         // 求和号 → Σ
         assert_eq!(unicode_to_cp437(0x2211), 228); // ∑ → Σ
     }

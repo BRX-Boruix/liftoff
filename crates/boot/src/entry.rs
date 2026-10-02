@@ -29,8 +29,8 @@ use firmware_current::current::{
     acpi_rsdp, graphics_output_mode,
     UefiMemoryMapSource, boot_services_of,
 };
-// `Stall` 只在 `target_os = "uefi"` 的 AP 启动路径里用到 ✓ —— 宿主测试里它是未使用的 ✗，
-// 所以单独按目标门控导入（放进上面那个 use 组会让宿主构建报 unused import ✗）。
+// `Stall` 只在 `target_os = "uefi"` 的 AP 启动路径里用到 —— 宿主测试里它是未使用的，
+// 所以单独按目标门控导入（放进上面那个 use 组会让宿主构建报 unused import）。
 #[cfg(target_os = "uefi")]
 use firmware_current::current::Stall;
 
@@ -246,12 +246,12 @@ const MAX_ACPI_TABLE: usize = 64 * 1024;
 /// 导致编译失败并回退）。
 #[cfg(target_os = "uefi")]
 unsafe fn register_madt_cpus(
-    // **不是 `BootServicesTable`** ✗：`allocate_zeroed_below` 是 `EfiFrameAllocator` 的固有方法 ✓。
+    // **不是 `BootServicesTable`**：`allocate_zeroed_below` 是 `EfiFrameAllocator` 的固有方法。
     frames: &mut EfiFrameAllocator,
-    // **固件延时**：INIT 之后要等 10 ms、SIPI 之间要等 200 µs ✓ —— 忙等自旋的时长
-    // 取决于 CPU 速度 ✗，而 AP 醒来所需的时间与 CPU 速度无关 ✓。
+    // **固件延时**：INIT 之后要等 10 ms、SIPI 之间要等 200 µs —— 忙等自旋的时长
+    // 取决于 CPU 速度，而 AP 醒来所需的时间与 CPU 速度无关。
     stall: Stall,
-    // 引导器的直接映射区间 —— 用来把指针换算成**物理**地址 ✓（不做裸减法 ✗）。
+    // 引导器的直接映射区间 —— 用来把指针换算成**物理**地址（不做裸减法）。
     direct: DirectMap,
     responses: &mut crate::responses::Responses,
     rsdp_address: u64,
@@ -322,7 +322,7 @@ unsafe fn register_madt_cpus(
         return;
     }
 
-    // 容量与启动计划缓冲**共用同一个常量** ✓（不再各写一个 64 ✗）。
+    // 容量与启动计划缓冲**共用同一个常量**（不再各写一个 64）。
     let mut list = [utils::acpi::MadtCpu { processor_id: 0, apic_id: 0, enabled: false };
         crate::responses::AP_PLAN_CAPACITY];
     let Ok(total) = utils::acpi::cpus(&madt[..madt_len], &mut list) else {
@@ -349,8 +349,8 @@ unsafe fn register_madt_cpus(
     //
     // 常量走 `current::lapic` 而不是在 `boot` 里写裸地址（S01 / ADR-007）。
     // SAFETY: 见上 —— 本探针的全部目的就是验证这个假设是否成立。
-    // **经抽象层取**（C2）：裸 MMIO 的指针运算与易失读留在实现层 ✓ ——
-    // 中性层自己做就是跨层直连 ✗（S14 / ADR-007）。
+    // **经抽象层取**（C2）：裸 MMIO 的指针运算与易失读留在实现层 ——
+    // 中性层自己做就是跨层直连（S14 / ADR-007）。
     // SAFETY: 见探针说明 —— 本探针的全部目的就是验证"固件映射了 LAPIC 的 MMIO"这个假设。
     let mmio_id = unsafe { current::lapic::read_id_via_mmio() };
     let cpuid_id = <crate::PlatformImpl as arch::platform::Platform>::bsp_lapic_id();
@@ -363,31 +363,31 @@ unsafe fn register_madt_cpus(
 
     // 【S4 探针】**只读** `IA32_APIC_BASE`（MSR `0x1B`），看固件把 APIC 配成了哪种模式。
     //
-    // 读 MSR 无副作用 ✓，且该 MSR 在 x86-64 上必然存在 ✓ —— 所以这一步**不带故障风险**
+    // 读 MSR 无副作用，且该 MSR 在 x86-64 上必然存在 —— 所以这一步**不带故障风险**
     // （与上一轮那个 MMIO 探针不同）。它决定 S4 是否真的需要**去改**这个 MSR：
     // 若固件已经开了 x2APIC 而内核不支持，就必须退回 xAPIC（brxLimine 的做法）。
     // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在。
-    // **经实现层解析位域** ✓ —— 中性层不读 MSR、不解释 bit ✗（S13 单点 / ADR-007）。
-    // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在 ✓。
+    // **经实现层解析位域**—— 中性层不读 MSR、不解释 bit（S13 单点 / ADR-007）。
+    // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在。
     let apic = unsafe { current::lapic::firmware_apic_state() };
     report_fmt::<crate::PlatformImpl>(format_args!(
         "[liftoff] apic_base={:#x} x2apic={} global_enable={}\n",
         apic.base, apic.x2apic, apic.global_enable
     ));
 
-    // 【S5–S7 接线 · 第 ③ 段】真正把 AP 叫起来 —— **串行**，一次一个 ✓。
+    // 【S5–S7 接线 · 第 ③ 段】真正把 AP 叫起来 —— **串行**，一次一个。
     //
-    // **为什么必须串行**：跳板页里只有**一个**参数块 ✗ —— 所有 AP 都从**同一个**向量醒来，
-    // 靠参数块里的 `info_struct` 区分身份 ✓。所以"写参数块 → 发 IPI → 等它醒来
-    // → 再写下一个"的顺序是**协议的一部分**，不是实现细节 ✓。
-    // 参考实现正是这样：`smp_start_ap()` 每个 AP 调一次（`common/sys/smp.c:44-120`）✓。
+    // **为什么必须串行**：跳板页里只有**一个**参数块 —— 所有 AP 都从**同一个**向量醒来，
+    // 靠参数块里的 `info_struct` 区分身份。所以"写参数块 → 发 IPI → 等它醒来
+    // → 再写下一个"的顺序是**协议的一部分**，不是实现细节。
+    // 参考实现正是这样：`smp_start_ap()` 每个 AP 调一次（`common/sys/smp.c:44-120`）。
     //
-    // 【缺陷修正】上一版在**这里**就把所有 AP 的参数块写进**同一页** ✗ —— 后一个覆盖前一个，
-    // 于是所有 AP 都会按**最后一个**的参数块启动 ✗（都去读同一个 `goto_address`）。
-    // 搬运与写参数块因此拆成 `install()` / `stage_frame()` 两步 ✓。
+    // 【缺陷修正】上一版在**这里**就把所有 AP 的参数块写进**同一页**—— 后一个覆盖前一个，
+    // 于是所有 AP 都会按**最后一个**的参数块启动（都去读同一个 `goto_address`）。
+    // 搬运与写参数块因此拆成 `install()` / `stage_frame()` 两步。
     let bsp = <crate::PlatformImpl as arch::platform::Platform>::bsp_lapic_id();
     // SAFETY: 仍在 boot services 期间；`frames` 分配低页、`stall` 是固件延时、
-    // `responses` 里的 `MpInfo` 已由上面的 `set_smp_cpus` 登记好 ✓。
+    // `responses` 里的 `MpInfo` 已由上面的 `set_smp_cpus` 登记好。
     let started =
         unsafe {
             start_aps(
@@ -401,21 +401,21 @@ unsafe fn register_madt_cpus(
                 cr3_top,
             )
         };
-    // **只报真正起来了的 AP 数** ✓ —— 报了没起来的，内核会去用它启动不了的 AP ✗。
+    // **只报真正起来了的 AP 数**—— 报了没起来的，内核会去用它启动不了的 AP。
     responses.set_started_aps(registered, started);
     report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: started={started}\n"));
 }
 
 /// 启动所有非 BSP 的 `enabled` AP，返回**真正醒来**的数量。
 ///
-/// **串行**（一次一个 ✓），因为跳板页里只有**一个**参数块 ✗ —— 顺序是协议的一部分 ✓。
-/// 对照 brxLimine `common/sys/smp.c:44-120`（`smp_start_ap` 每个 AP 调一次 ✓）。
+/// **串行**（一次一个），因为跳板页里只有**一个**参数块 —— 顺序是协议的一部分。
+/// 对照 brxLimine `common/sys/smp.c:44-120`（`smp_start_ap` 每个 AP 调一次）。
 ///
-/// 返回的是**真的醒了几个**，不是"发了几个 IPI" ✗ —— 内核只会去用它启动得了的 AP ✓。
+/// 返回的是**真的醒了几个**，不是"发了几个 IPI" —— 内核只会去用它启动得了的 AP。
 ///
 /// # Safety
 /// 仍在 boot services 期间；`frames` 来自固件分配器、`stall` 是固件延时；
-/// `responses` 里的 `MpInfo` 已由 `set_smp_cpus` 登记好 ✓。
+/// `responses` 里的 `MpInfo` 已由 `set_smp_cpus` 登记好。
 #[cfg(target_os = "uefi")]
 unsafe fn start_aps(
     frames: &mut EfiFrameAllocator,
@@ -424,11 +424,11 @@ unsafe fn start_aps(
     responses: &crate::responses::Responses,
     cpus: &[utils::acpi::MadtCpu],
     bsp: u32,
-    // `set_smp_cpus` 登记到的 CPU 数 —— 用来判断登记下标有没有越界 ✓。
+    // `set_smp_cpus` 登记到的 CPU 数 —— 用来判断登记下标有没有越界。
     registered: usize,
     cr3_top: u64,
 ) -> usize {
-    // 低页：跳板代码 + GDT + GDTR 描述符 + 参数块，**全部在一页里** ✓。
+    // 低页：跳板代码 + GDT + GDTR 描述符 + 参数块，**全部在一页里**。
     let max = current::ap::AP_LOW_LIMIT - current::ap::AP_PAGE_SIZE as u64;
     let Some(trampoline_frame) = frames.allocate_zeroed_below(max) else {
         report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: 低页分配失败\n"));
@@ -438,8 +438,8 @@ unsafe fn start_aps(
         report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: 低页帧无地址\n"));
         return 0;
     };
-    // 临时栈**独立一页** ✓：放在跳板页里的话，栈会向**代码**生长 ✗
-    // （参考实现单独分配 8192 字节，`smp.c:56-59` ✓）。
+    // 临时栈**独立一页**：放在跳板页里的话，栈会向**代码**生长
+    // （参考实现单独分配 8192 字节，`smp.c:56-59`）。
     let Some(stack_frame) = frames.allocate_zeroed_below(max) else {
         report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: 临时栈分配失败\n"));
         return 0;
@@ -467,18 +467,18 @@ unsafe fn start_aps(
         vector.0
     ));
 
-    // **访问方式必须与固件当前实际模式一致** ✗（用 x2APIC 的 MSR 去访问一个 xAPIC 模式的
-    // LAPIC 不会报错，只会**什么都不发生** ✗）。本内核不支持 x2APIC，故第一个参数是 `false` ✓。
-    // 内核不支持 x2APIC → `false` ✓；模式判定与位域解析都在实现层 ✓。
-    // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在 ✓。
+    // **访问方式必须与固件当前实际模式一致**（用 x2APIC 的 MSR 去访问一个 xAPIC 模式的
+    // LAPIC 不会报错，只会**什么都不发生**）。本内核不支持 x2APIC，故第一个参数是 `false`。
+    // 内核不支持 x2APIC → `false`；模式判定与位域解析都在实现层。
+    // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在。
     let access = unsafe { current::lapic::firmware_access(false) };
 
-    // 【为什么把决策抽出去】这里原先有 5 处**静默** `continue` ✗ —— 于是一次真机失败
-    // 在串口上只留下 `started=0`，**分不清**"全被跳过了"与"发了 IPI 但 AP 不醒" ✗
+    // 【为什么把决策抽出去】这里原先有 5 处**静默** `continue` —— 于是一次真机失败
+    // 在串口上只留下 `started=0`，**分不清**"全被跳过了"与"发了 IPI 但 AP 不醒"
     // （第 108 轮的真机就是这个症状）。现在处置由 `responses::ap_plan` 算出（纯逻辑、
-    // 宿主可测 ✓），并且**每一个跳过都带原因打出来** ✓。
+    // 宿主可测），并且**每一个跳过都带原因打出来**。
     //
-    // 先把固件给的原样打出来 ✓ —— `apic_id` 全是 0 这类事只有这样才看得见 ✗。
+    // 先把固件给的原样打出来 —— `apic_id` 全是 0 这类事只有这样才看得见。
     for (index, cpu) in cpus.iter().enumerate() {
         report_fmt::<crate::PlatformImpl>(format_args!(
             "[liftoff] ap: cpu[{index}] processor_id={} apic_id={:#x} enabled={}\n",
@@ -527,8 +527,8 @@ unsafe fn start_aps(
             ));
             continue;
         };
-        // `MpInfo` 的**物理**地址（跳板自己加 HHDM ✓）。
-        // **经映射抽象算，不做裸减法** ✗ —— `RESPONSES` 在低地址恒等映射下，减法会回绕 ✗。
+        // `MpInfo` 的**物理**地址（跳板自己加 HHDM）。
+        // **经映射抽象算，不做裸减法**—— `RESPONSES` 在低地址恒等映射下，减法会回绕。
         let info_phys = arch::hhdm::phys_of_pointer(direct, info as *const _ as u64).as_u64();
         let input = current::ap::ApTrampolineInput {
             hhdm: HHDM_OFFSET,
@@ -536,7 +536,7 @@ unsafe fn start_aps(
             info_struct: info_phys,
             temp_stack_top,
             gdtr: base + current::ap::AP_GDTR_OFFSET as u64,
-            // 保守：跳板里不开 CR0.WP ✓ —— 交接后 CR0 完全由内核掌控 ✓。
+            // 保守：跳板里不开 CR0.WP —— 交接后 CR0 完全由内核掌控。
             write_protect: false,
         };
         let block = match current::ap::prepare(&input) {
@@ -554,31 +554,31 @@ unsafe fn start_aps(
             ));
             continue;
         }
-        // 参数块写好了（`booted_flag` 也已归零 ✓）—— **现在**才允许这个 AP 醒来 ✓。
-        // SAFETY: 仍在 boot services 期间，`access` 取自固件当前的 APIC 模式 ✓。
+        // 参数块写好了（`booted_flag` 也已归零）—— **现在**才允许这个 AP 醒来。
+        // SAFETY: 仍在 boot services 期间，`access` 取自固件当前的 APIC 模式。
         unsafe { wake_ap(access, cpu.apic_id, vector, stall) };
-        // 轮询 `booted_flag`：**必须易失读** ✓（否则优化器会把它提到循环外 ✗），
-        // 且**必须有界** ✓（参考实现 100 × 10 ms = 1 秒，`smp.c:112-117` ✓）。
+        // 轮询 `booted_flag`：**必须易失读**（否则优化器会把它提到循环外），
+        // 且**必须有界**（参考实现 100 × 10 ms = 1 秒，`smp.c:112-117`）。
         let flag_at = current::ap::AP_FRAME_OFFSET
             + core::mem::offset_of!(current::ap::ApTrampoline, booted_flag);
         let stage_at = current::ap::AP_FRAME_OFFSET
             + core::mem::offset_of!(current::ap::ApTrampoline, stage);
         let mut booted = false;
         for _ in 0..current::lapic::AP_BOOT_POLLS {
-            // SAFETY: 参数块在刚分配的低页内、页对齐，读一个字节 ✓。
+            // SAFETY: 参数块在刚分配的低页内、页对齐，读一个字节。
             let flag = unsafe { core::ptr::read_volatile(low.as_ptr().add(flag_at)) };
             if flag == 1 {
                 booted = true;
                 break;
             }
-            // SAFETY: `stall` 来自固件启动服务，调用点仍在 boot services 期间 ✓。
+            // SAFETY: `stall` 来自固件启动服务，调用点仍在 boot services 期间。
             unsafe { stall(current::lapic::AP_BOOT_STALL_US) };
         }
         if booted {
             started += 1;
         } else {
-            // 读回**进度标记** ✓：`0` = IPI 根本没送到；`N` = AP 跑了、停在跳板的第 N 步 ✗。
-            // 没有这一个字节，"没送到"与"崩在跳板里"在串口上**完全一样** ✗。
+            // 读回**进度标记**：`0` = IPI 根本没送到；`N` = AP 跑了、停在跳板的第 N 步。
+            // 没有这一个字节，"没送到"与"崩在跳板里"在串口上**完全一样**。
             // SAFETY: 与 `booted_flag` 同一页内、页对齐，读一个字节。
             let stage = unsafe { core::ptr::read_volatile(low.as_ptr().add(stage_at)) };
             report_fmt::<crate::PlatformImpl>(format_args!(
@@ -592,13 +592,13 @@ unsafe fn start_aps(
 
 /// 给一个 AP 发 INIT + SIPI ×2。
 ///
-/// 顺序**不能改** ✓（对照 brxLimine `common/sys/smp.c:83-106`）：
+/// 顺序**不能改**（对照 brxLimine `common/sys/smp.c:83-106`）：
 /// 1. INIT assert（`0x4500`）→ 固件延时 10 ms；
-/// 2. INIT deassert（`0x0500`）→ 固件延时 10 ms（**有意与参考实现不同**，见 `lapic.rs` 的说明 ✓）；
-/// 3. SIPI ×2（Intel SDM Vol 3 §8.4.4.1 建议发两次 ✓），两次之间 200 µs。
+/// 2. INIT deassert（`0x0500`）→ 固件延时 10 ms（**有意与参考实现不同**，见 `lapic.rs` 的说明）；
+/// 3. SIPI ×2（Intel SDM Vol 3 §8.4.4.1 建议发两次），两次之间 200 µs。
 ///
 /// # Safety
-/// `access` 必须与固件当前实际模式一致 ✗；仍在 boot services 期间 ✓。
+/// `access` 必须与固件当前实际模式一致；仍在 boot services 期间。
 #[cfg(target_os = "uefi")]
 unsafe fn wake_ap(
     access: current::lapic::ApicAccess,
@@ -623,7 +623,7 @@ unsafe fn wake_ap(
         }
     };
     send(current::lapic::DeliveryMode::Init, 0, true);
-    // SAFETY: 固件延时，调用点仍在 boot services 期间 ✓。
+    // SAFETY: 固件延时，调用点仍在 boot services 期间。
     unsafe { stall(current::lapic::AP_INIT_STALL_US) };
     send(current::lapic::DeliveryMode::Init, 0, false);
     // SAFETY: 同上。
@@ -768,7 +768,7 @@ pub unsafe fn handoff(
     image_handle: Handle,
     map_key: &mut Option<usize>,
 ) -> Result<usize, Error> {
-    // 三步留痕是真机专用（`out` 指令在宿主用户态是特权指令 ✗）。
+    // 三步留痕是真机专用（`out` 指令在宿主用户态是特权指令）。
     #[cfg(target_os = "uefi")]
     #[cfg(target_os = "uefi")]
     for byte in b"[liftoff] h: mmap\n" as &[u8] {
@@ -2473,9 +2473,9 @@ pub enum BringUpError {
 ///
 /// 引导阶段单线程调用一次；激活页表后不再返回。
 pub unsafe fn bring_up(
-    // **可变**：AP 接线需要在 `apply` 之后向固件要一页**低内存**（< 1 MiB ✗ 实模式寻址的硬约束 ✓），
-    // 而低页分配是 `allocate_zeroed_below(&mut self, …)` ✓ —— 不可变引用下**无法调用** ✗。
-    // 调用方是裸指针（`&mut *boot_services` ✓），所以这里改 `&mut` 不需要可变绑定 ✓。
+    // **可变**：AP 接线需要在 `apply` 之后向固件要一页**低内存**（< 1 MiB 实模式寻址的硬约束），
+    // 而低页分配是 `allocate_zeroed_below(&mut self, …)` —— 不可变引用下**无法调用**。
+    // 调用方是裸指针（`&mut *boot_services`），所以这里改 `&mut` 不需要可变绑定。
     table: &mut BootServicesTable,
     image_handle: Handle,
     c: BringUp<'_, '_>,
@@ -2583,18 +2583,18 @@ pub unsafe fn bring_up(
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys as *mut u8, bytes.len()) };
         Ok(())
     };
-    // 【D3 测量 · **单位标定**】`GetNextMonotonicCount` 的单位**不能猜** ✗ ——
-    // 用**已知时长**的 `Stall` 把它**测出来** ✓：停 10 毫秒，量计数差 ✓。
-    // 这样"计数 → 时间"的换算是**实测**的，不是假设的 ✓。
-    // 【D3 测量】固件的单调计数**已两次真机证伪** ✗（停 10 毫秒只涨 1），改用 **TSC** ✓，
-    // 并**用已知 10 毫秒的 `Stall` 实测标定频率** ✓。结果留在作用域里，供后面算耗时 ✓。
+    // 【D3 测量 · **单位标定**】`GetNextMonotonicCount` 的单位**不能猜**——
+    // 用**已知时长**的 `Stall` 把它**测出来**：停 10 毫秒，量计数差。
+    // 这样"计数 → 时间"的换算是**实测**的，不是假设的。
+    // 【D3 测量】固件的单调计数**已两次真机证伪**（停 10 毫秒只涨 1），改用 **TSC**，
+    // 并**用已知 10 毫秒的 `Stall` 实测标定频率**。结果留在作用域里，供后面算耗时。
     //
-    // 宿主构建没有 `rdtsc` ✓ → 用 `(0, None)` 占位并**跳过打印** ✓，**不编造** ✓。
+    // 宿主构建没有 `rdtsc` → 用 `(0, None)` 占位并**跳过打印**，**不编造**。
     #[cfg(target_os = "uefi")]
     let (boot_start, tsc_hz): (u64, Option<u64>) = {
-        // SAFETY: `rdtsc` 无副作用 ✓；仍在 boot services 期间（`Stall` 可用 ✓）。
+        // SAFETY: `rdtsc` 无副作用；仍在 boot services 期间（`Stall` 可用）。
         let t0 = unsafe { current::features::read_tsc() };
-        // SAFETY: 固件延时 10 毫秒 ✓。
+        // SAFETY: 固件延时 10 毫秒。
         unsafe { (table.stall)(10_000) };
         // SAFETY: 同上。
         let t1 = unsafe { current::features::read_tsc() };
@@ -2602,7 +2602,7 @@ pub unsafe fn bring_up(
         let hz = current::features::hz_from_ticks(ticks, 10_000);
         match hz {
             Some(hz) => report_fmt::<crate::PlatformImpl>(format_args!(
-                "[liftoff] TSC 标定：{} Hz（停 10 毫秒实测，{} 个计数 ✓）\n",
+                "[liftoff] TSC 标定：{} Hz（停 10 毫秒实测，{} 个计数）\n",
                 hz, ticks
             )),
             None => report_fmt::<crate::PlatformImpl>(format_args!(
@@ -2611,8 +2611,8 @@ pub unsafe fn bring_up(
         }
         (t0, hz)
     };
-    // 宿主构建里这两项**只用于占位** ✗ —— 打印分支是 UEFI 门控的 ✓，所以它们在本构建里
-    // 不会被读 ✓。用下划线前缀如实表达"**故意不用**" ✓，而不是留 4 个警告 ✗。
+    // 宿主构建里这两项**只用于占位**—— 打印分支是 UEFI 门控的，所以它们在本构建里
+    // 不会被读。用下划线前缀如实表达"**故意不用**"，而不是留 4 个警告。
     #[cfg(not(target_os = "uefi"))]
     let (_boot_start, _tsc_hz): (u64, Option<u64>) = (0, None);
     for byte in b"[liftoff] step: applying plan\n" as &[u8] {
@@ -2652,11 +2652,11 @@ pub unsafe fn bring_up(
         crate::PlatformImpl::write_byte(*byte);
     }
     // 激活已移到 Exit 之后（enter_kernel 内）—— 此处只保留页表构建结果。
-    // 【D3 测量】用**标定出的频率**算耗时 ✓。**跨度如实标注** ✗ —— 起点是上面的 TSC 标定点，
-    // **不是**进程入口 ✓（"引导总耗时"要到入口点才算，那需要另取一个起点 ✓）。
+    // 【D3 测量】用**标定出的频率**算耗时。**跨度如实标注**—— 起点是上面的 TSC 标定点，
+    // **不是**进程入口（"引导总耗时"要到入口点才算，那需要另取一个起点）。
     #[cfg(target_os = "uefi")]
     if let Some(hz) = tsc_hz {
-        // SAFETY: `rdtsc` 无副作用 ✓；仍在 boot services 期间 ✓。
+        // SAFETY: `rdtsc` 无副作用；仍在 boot services 期间。
         let end = unsafe { current::features::read_tsc() };
         let ticks = firmware_current::current::monotonic_delta(boot_start, end);
         if let Some(micros) = current::features::micros_from_ticks(ticks, hz) {
@@ -2814,7 +2814,7 @@ pub unsafe fn bring_up(
     //
     // **`&mut *c.responses` 是重借用**：`c` 是**按值传入的不可变绑定**，而
     // `c.responses` 的类型是 `&mut Responses` —— 所以直接写 `&mut c.responses` 会被拒绝
-    // （要求 `c` 可变），而重借用走的是那个已有的 `&mut` ✓。这一点我前两次都没看清。
+    // （要求 `c` 可变），而重借用走的是那个已有的 `&mut`。这一点我前两次都没看清。
     //
     // 只在 UEFI 目标上做：宿主测试里 `rsdp` 是假地址，解引用会崩。
     #[cfg(target_os = "uefi")]
@@ -2822,12 +2822,12 @@ pub unsafe fn bring_up(
         // SAFETY: `rsdp` 来自固件配置表、指向 RAM；RAM 在**当前生效的固件页表**下恒等映射
         // （本函数已在用同一映射写内核目标物理地址）。只读，且长度取自表自己的字段。
         unsafe {
-            // 页表根物理地址：与 BSP 的 spinup 用**同一个根帧** ✓（AP 应当用同一套页表 ✓）。
+            // 页表根物理地址：与 BSP 的 spinup 用**同一个根帧**（AP 应当用同一套页表）。
     let cr3_top = root.start_address().expect("根帧必有地址").as_u64();
-    // `&mut *table` 是**重借用** ✓ —— `table` 是 `&mut`，直接传会被**移动** ✗。
-    // `frames` 是**值**（`EfiFrameAllocator`）✓ —— 直接 `&mut frames` ✓（`&mut *frames` 会报"无法解引用" ✗）。
-    // `frames` 在更早处**已被移动** ✗（`EfiFrameAllocator` 不实现 `Copy` ✓）→ 不能复用 ✓。
-    // 但它只是**固件指针的包装** ✓，而 `table.allocate_pages` 仍可用 ✓ → 构造一个新的 ✓。
+    // `&mut *table` 是**重借用**—— `table` 是 `&mut`，直接传会被**移动**。
+    // `frames` 是**值**（`EfiFrameAllocator`） —— 直接 `&mut frames`（`&mut *frames` 会报"无法解引用"）。
+    // `frames` 在更早处**已被移动**（`EfiFrameAllocator` 不实现 `Copy`）→ 不能复用。
+    // 但它只是**固件指针的包装**，而 `table.allocate_pages` 仍可用 → 构造一个新的。
     let mut low_frames = EfiFrameAllocator::new(table.allocate_pages);
     register_madt_cpus(
         &mut low_frames,
@@ -2837,16 +2837,16 @@ pub unsafe fn bring_up(
         rsdp as u64,
         cr3_top,
     );
-    // **放在调用之后** ✓ —— 低页分配发生在 `register_madt_cpus` **内部** ✗，
-    // 放在它之前只会得到 0（第 153 轮真机实测就是 0 ✓：**数字没错，是我问得太早** ✗）。
-    // **精确标注**：这是**低页分配器**交付的帧数 ✓，**不是**引导器总占用 ✗ ——
-    // 报成"总占用"就是虚报 ✓（运行期内存还需要主分配器的计数 ✓）。
+    // **放在调用之后**—— 低页分配发生在 `register_madt_cpus` **内部**，
+    // 放在它之前只会得到 0（第 153 轮真机实测就是 0：**数字没错，是我问得太早**）。
+    // **精确标注**：这是**低页分配器**交付的帧数，**不是**引导器总占用 ——
+    // 报成"总占用"就是虚报（运行期内存还需要主分配器的计数）。
     report_fmt::<crate::PlatformImpl>(format_args!(
         "[liftoff] 低页分配器已交付 {} 帧\n",
         low_frames.allocated()
     ));
-    // **主分配器**（页表帧等）✓ —— 与低页计数**分开报** ✓：两者是不同实例 ✓，
-    // 合并成一个"总数"就把两个口径混在一起了 ✗。`None` 时**如实说"不报"** ✓，不编造 0 ✗。
+    // **主分配器**（页表帧等） —— 与低页计数**分开报**：两者是不同实例，
+    // 合并成一个"总数"就把两个口径混在一起了。`None` 时**如实说"不报"**，不编造 0。
     match page_table.allocated_frames() {
         Some(frames) => report_fmt::<crate::PlatformImpl>(format_args!(
             "[liftoff] 主分配器已交付 {frames} 帧（页表帧等）\n"
@@ -2864,14 +2864,14 @@ pub unsafe fn bring_up(
     //
     // `*mut` 来自协议 ABI（Limine 用 C 的 `char *`）；这两个静态字符串**只读**，
     // 内核按协议只应读取它们。
-    // **必须是 HHDM 地址** ✓ —— 对照 brxLimine `limine.c:1012-1013`：
+    // **必须是 HHDM 地址**—— 对照 brxLimine `limine.c:1012-1013`：
     // `bootloader_info_response->name = reported_addr("Limine")` /
     // `->version = reported_addr(LIMINE_VERSION)`，而
-    // `reported_addr(addr) = addr + direct_map_offset` ✓。
+    // `reported_addr(addr) = addr + direct_map_offset`。
     //
-    // 【E5 缺陷修正】我们此前把**映像里的指针**原样交出去 ✗ —— 内核经 HHDM 去读，
-    // 拿到的是无效地址（或读到 0）✗，串口实测 `[init] kernel version = 0x000` 与此吻合 ✓。
-    // 两个字符串都在引导器映像里，映像被恒等映射也在 HHDM 里 ✓，所以换算成立 ✓。
+    // 【E5 缺陷修正】我们此前把**映像里的指针**原样交出去 —— 内核经 HHDM 去读，
+    // 拿到的是无效地址（或读到 0），串口实测 `[init] kernel version = 0x000` 与此吻合。
+    // 两个字符串都在引导器映像里，映像被恒等映射也在 HHDM 里，所以换算成立。
     c.responses.set_bootloader_info(
         (HHDM_OFFSET.wrapping_add(BOOTLOADER_NAME.as_ptr() as u64)) as *mut core::ffi::c_char,
         (HHDM_OFFSET.wrapping_add(BOOTLOADER_VERSION.as_ptr() as u64)) as *mut core::ffi::c_char,
@@ -3056,9 +3056,9 @@ mod build_plan_tests {
         assert!(count >= 3, "至少要有内核/HHDM/恒等三类映射，实得 {count}");
         let must_stay = [
             MustStay { start: kernel_virt, len: kernel_len },
-            // **从 `IDENTITY_LOW_FLOOR` 起** ✓：页零**有意不映射**（空指针解引用必须**故障**，
-            // 而不是静默读写物理 0）✗ —— 所以要求"覆盖 `0`"会与那条不变量**直接冲突** ✗。
-            // 这一行是**旧行为留在测试里的残留** ✓，随规划器的改动一起更正 ✓。
+            // **从 `IDENTITY_LOW_FLOOR` 起**：页零**有意不映射**（空指针解引用必须**故障**，
+            // 而不是静默读写物理 0） —— 所以要求"覆盖 `0`"会与那条不变量**直接冲突**。
+            // 这一行是**旧行为留在测试里的残留**，随规划器的改动一起更正。
             MustStay {
                 start: mm::plan::IDENTITY_LOW_FLOOR,
                 len: 0x80_0000 - mm::plan::IDENTITY_LOW_FLOOR,

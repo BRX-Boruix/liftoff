@@ -9,31 +9,30 @@
 
 use core::ffi::c_void;
 
-/// 启动计划缓冲的容量 —— 与 `register_madt_cpus` 里 `MADT` 解析缓冲**同一口径** ✓
-/// （一次 `MADT` 能描述的 CPU 上限）。两处共用这一个常量，避免各写一个 64 ✗。
+/// 启动计划缓冲的容量 —— 与 `register_madt_cpus` 里 `MADT` 解析缓冲**同一口径**/// （一次 `MADT` 能描述的 CPU 上限）。两处共用这一个常量，避免各写一个 64。
 pub const AP_PLAN_CAPACITY: usize = 64;
 
 /// 一个 CPU 在 AP 启动计划里的**处置**。
 ///
-/// **为什么要有它**：`start_aps` 里原先有 5 处静默 `continue` ✗ —— 于是一次真机失败在
-/// 串口上只留下 `started=0`，**分不清**"全被跳过了"与"发了 IPI 但 AP 不醒" ✗。
-/// 把处置做成纯逻辑：既能宿主测试，又保证**每一个跳过都有原因** ✓。
+/// **为什么要有它**：`start_aps` 里原先有 5 处静默 `continue` —— 于是一次真机失败在
+/// 串口上只留下 `started=0`，**分不清**"全被跳过了"与"发了 IPI 但 AP 不醒"。
+/// 把处置做成纯逻辑：既能宿主测试，又保证**每一个跳过都有原因**。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ApPlan {
-    /// 固件说这个 CPU 没使能（`MADT` 里 `enabled = false`）—— **不占 `MpInfo` 槽位** ✓。
+    /// 固件说这个 CPU 没使能（`MADT` 里 `enabled = false`）—— **不占 `MpInfo` 槽位**。
     Disabled,
-    /// 这是 BSP 自己，不启动（`MADT` 也列它 ✓）。
+    /// 这是 BSP 自己，不启动（`MADT` 也列它）。
     Bsp { slot: usize },
-    /// 要启动它；`slot` 是它在 `MpInfo` 数组里的**登记下标** ✓。
+    /// 要启动它；`slot` 是它在 `MpInfo` 数组里的**登记下标**。
     Start { slot: usize },
-    /// 登记下标越界 —— 与 `set_smp_cpus` 的口径不一致 ✗，**报出来，不静默用** ✓。
+    /// 登记下标越界 —— 与 `set_smp_cpus` 的口径不一致，**报出来，不静默用**。
     NoSlot { slot: usize },
 }
 
-/// 为每个 CPU 算出处置，返回写入的项数 —— **纯逻辑、宿主可测** ✓。
+/// 为每个 CPU 算出处置，返回写入的项数 —— **纯逻辑、宿主可测**。
 ///
-/// `registered` 是 `set_smp_cpus` 的返回值：`slot >= registered` 说明两边口径不一致 ✓。
-/// **登记下标 ≠ 列表下标** ✗：`set_smp_cpus` 只登记 `enabled` 的 CPU ✓，BSP 也占一个槽 ✓。
+/// `registered` 是 `set_smp_cpus` 的返回值：`slot >= registered` 说明两边口径不一致。
+/// **登记下标 ≠ 列表下标**：`set_smp_cpus` 只登记 `enabled` 的 CPU，BSP 也占一个槽。
 pub fn ap_plan(
     cpus: &[utils::acpi::MadtCpu],
     bsp: u32,
@@ -262,14 +261,14 @@ impl Responses {
         registered
     }
 
-    /// 只更新**实际启动的 AP 数**（即 `cpu_count`），**不动已登记的 `MpInfo`** ✓。
+    /// 只更新**实际启动的 AP 数**（即 `cpu_count`），**不动已登记的 `MpInfo`**。
     ///
-    /// **为什么不复用 `set_smp_cpus`**：那会**逐个重写** `MpInfo`（含 `goto_address`）✗ ——
-    /// 而此时 AP **正在轮询 `goto_address`** ✓，重写是没必要的并发写 ✗；`reserved`（内核填的
-    /// AP 栈）更不该被引导器碰 ✗。所以启动完成后只改计数 ✓。
+    /// **为什么不复用 `set_smp_cpus`**：那会**逐个重写** `MpInfo`（含 `goto_address`） ——
+    /// 而此时 AP **正在轮询 `goto_address`**，重写是没必要的并发写；`reserved`（内核填的
+    /// AP 栈）更不该被引导器碰。所以启动完成后只改计数。
     ///
     /// `registered` 是 `set_smp_cpus` 的返回值 —— 用它把 `started_aps` **夹**到可用 AP 数
-    /// 以内 ✓（调用方声称起了比存在的更多的核时，不把 `cpu_count` 报成不可能的值 ✗）。
+    /// 以内（调用方声称起了比存在的更多的核时，不把 `cpu_count` 报成不可能的值）。
     pub fn set_started_aps(&mut self, registered: usize, started_aps: usize) {
         if registered == 0 {
             self.mp.cpu_count = 0;
@@ -1120,9 +1119,9 @@ mod ap_plan_tests {
 
     #[test]
     fn disabled_cpus_do_not_consume_an_info_slot() {
-        // **这就是那个真实缺陷**：登记下标 ≠ 列表下标 ✓ —— `set_smp_cpus` 只登记
-        // `enabled` 的 CPU ✗。MADT 里只要有一个 disabled 项排在被启动的 AP 前面，
-        // 用列表下标就会把**别人的参数块**交给它 ✗。
+        // **这就是那个真实缺陷**：登记下标 ≠ 列表下标 —— `set_smp_cpus` 只登记
+        // `enabled` 的 CPU。MADT 里只要有一个 disabled 项排在被启动的 AP 前面，
+        // 用列表下标就会把**别人的参数块**交给它。
         let cpus = [cpu(0, true), cpu(9, false), cpu(1, true)];
         let mut out = [ApPlan::Disabled; 4];
         let n = ap_plan(&cpus, 0, 2, &mut out);
@@ -1134,9 +1133,9 @@ mod ap_plan_tests {
 
     #[test]
     fn a_cpu_whose_apic_id_equals_the_bsp_is_not_started() {
-        // 【当前真机症状的候选】若固件给的 apic_id **全是 0**，则每一个都会被判成 BSP ✗
-        // → 一条 IPI 都不发 → 串口上只有 `started=0` ✓。这条测试把这个行为钉住，
-        // 好让日志能区分"全被判成 BSP"与"真的都是 BSP" ✓。
+        // 【当前真机症状的候选】若固件给的 apic_id **全是 0**，则每一个都会被判成 BSP
+        // → 一条 IPI 都不发 → 串口上只有 `started=0`。这条测试把这个行为钉住，
+        // 好让日志能区分"全被判成 BSP"与"真的都是 BSP"。
         let cpus = [cpu(0, true), cpu(0, true), cpu(0, true)];
         let mut out = [ApPlan::Disabled; 4];
         let n = ap_plan(&cpus, 0, 3, &mut out);
@@ -1148,7 +1147,7 @@ mod ap_plan_tests {
 
     #[test]
     fn a_slot_beyond_what_was_registered_is_reported_not_silently_used() {
-        // `set_smp_cpus` 与这里的口径一旦不一致，就**报出来** ✗，不要静默用越界槽位。
+        // `set_smp_cpus` 与这里的口径一旦不一致，就**报出来**，不要静默用越界槽位。
         let cpus = [cpu(0, true), cpu(1, true)];
         let mut out = [ApPlan::Disabled; 4];
         let n = ap_plan(&cpus, 0, 1, &mut out);

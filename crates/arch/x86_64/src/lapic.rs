@@ -149,35 +149,35 @@ pub const fn icr_busy(icr: u64) -> bool {
 
 /// 等待投递完成的自旋上限（对照 brxLimine `lapic.c:300`：一百万次 + `pause`）。
 ///
-/// **必须有界** ✗：无界自旋在硬件异常时会把引导器挂死，而串口上什么都不显示。
+/// **必须有界**：无界自旋在硬件异常时会把引导器挂死，而串口上什么都不显示。
 pub const ICR_WAIT_SPINS: u32 = 1_000_000;
 
 /// INIT assert 的 ICR 值（对照 brxLimine `smp.c:85` 的 `0x4500`）。
 ///
-/// **由 `icr_value` 派生并由测试绑定** ✓（S13 单点 ✓）—— 不手写魔数 ✗。
+/// **由 `icr_value` 派生并由测试绑定**（S13 单点）—— 不手写魔数。
 pub const IPI_INIT_ASSERT: u64 = 0x4500;
 /// INIT **deassert** 的 ICR 值。
 ///
-/// 【引用修正】我上一版把它写成"对照 `smp.c:96` 的 `0x0500`"——**那是错的** ✗：
-/// `smp.c:96` 是 SIPI 那一条，而整个 `common/sys/smp.c` 里**根本没有** `0x0500` ✓
-/// （已逐行核实 ✓）。参考实现只写 `0x4500` 就 `stall(10000)`（`smp.c:89,91`）——
-/// 它**不发** deassert ✓。
+/// 【引用修正】我上一版把它写成"对照 `smp.c:96` 的 `0x0500`"——**那是错的**：
+/// `smp.c:96` 是 SIPI 那一条，而整个 `common/sys/smp.c` 里**根本没有** `0x0500`
+/// （已逐行核实）。参考实现只写 `0x4500` 就 `stall(10000)`（`smp.c:89,91`）——
+/// 它**不发** deassert。
 ///
 /// 我们仍然发它：Intel SDM Vol 3 §10.6.1 的 INIT 电平语义要求 assert 之后 deassert；
-/// 而多写一次是**无害**的（电平位不生效时它与 assert 同形，等于多一次 INIT ✓）。
-/// 这是**有意与参考实现不同**的一处，记录在此 ✓。
+/// 而多写一次是**无害**的（电平位不生效时它与 assert 同形，等于多一次 INIT）。
+/// 这是**有意与参考实现不同**的一处，记录在此。
 pub const IPI_INIT_DEASSERT: u64 = 0x0500;
-/// SIPI 的 ICR 基础值（投递模式 Startup + assert）；向量按位或进去 ✓。
+/// SIPI 的 ICR 基础值（投递模式 Startup + assert）；向量按位或进去。
 pub const IPI_SIPI_BASE: u64 = 0x4600;
 
-/// INIT 之后等待的固件延时（微秒）。参考实现 `stall(10000)` = 10 ms ✓。
+/// INIT 之后等待的固件延时（微秒）。参考实现 `stall(10000)` = 10 ms。
 pub const AP_INIT_STALL_US: usize = 10_000;
-/// 两次 SIPI 之间等待的固件延时（微秒）。参考实现 `stall(200)` ✓。
+/// 两次 SIPI 之间等待的固件延时（微秒）。参考实现 `stall(200)`。
 pub const AP_SIPI_STALL_US: usize = 200;
-/// 等 AP 写 `booted_flag` 的**轮询次数**。参考实现 100 次（`smp.c:112`）✓。
+/// 等 AP 写 `booted_flag` 的**轮询次数**。参考实现 100 次（`smp.c:112`）。
 pub const AP_BOOT_POLLS: u32 = 100;
-/// 每次轮询之间的固件延时（微秒）。参考实现 `stall(10000)` = 10 ms ✓。
-/// 于是总超时 = 100 × 10 ms = **1 秒** ✓ —— **有界**，绝不无限自旋 ✗。
+/// 每次轮询之间的固件延时（微秒）。参考实现 `stall(10000)` = 10 ms。
+/// 于是总超时 = 100 × 10 ms = **1 秒**—— **有界**，绝不无限自旋。
 pub const AP_BOOT_STALL_US: usize = 10_000;
 
 /// `IA32_APIC_BASE` MSR（`0x1B`）—— xAPIC/x2APIC 的模式开关就在这里。
@@ -289,7 +289,7 @@ pub fn icr_value(
 /// 读一个 32 位 MMIO 寄存器。
 ///
 /// # Safety
-/// `address` 必须是**已映射**的 MMIO（LAPIC 在低 4 GiB 恒等映射内 ✓），且为 4 字节对齐。
+/// `address` 必须是**已映射**的 MMIO（LAPIC 在低 4 GiB 恒等映射内），且为 4 字节对齐。
 #[cfg(target_os = "uefi")]
 pub unsafe fn mmio_read32(address: u64) -> u32 {
     // SAFETY: 由调用方保证（见函数文档）。
@@ -298,20 +298,20 @@ pub unsafe fn mmio_read32(address: u64) -> u32 {
 
 /// 固件当前配置的本地 APIC 状态（诊断与选路用）。
 ///
-/// **为什么要有它**：中性层此前**自己读 MSR `0x1B` 并解析位域** ✗ —— 那既把 MSR 编号
-/// 泄漏进中性层（ADR-007），也让"哪些位是什么意思"有了**第二个出处** ✗（S13 单点）。
+/// **为什么要有它**：中性层此前**自己读 MSR `0x1B` 并解析位域**—— 那既把 MSR 编号
+/// 泄漏进中性层（ADR-007），也让"哪些位是什么意思"有了**第二个出处**（S13 单点）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ApicState {
     /// `IA32_APIC_BASE` 的原始值（诊断打印用）。
     pub base: u64,
-    /// 是否**真的**启用了 x2APIC（**两位都要看** ✓）。
+    /// 是否**真的**启用了 x2APIC（**两位都要看**）。
     pub x2apic: bool,
     /// APIC 全局使能位（bit 11）。
     pub global_enable: bool,
 }
 
 impl ApicState {
-    /// 由 `IA32_APIC_BASE` 的原始值解析 —— **纯逻辑、宿主可测** ✓。
+    /// 由 `IA32_APIC_BASE` 的原始值解析 —— **纯逻辑、宿主可测**。
     #[inline]
     pub const fn from_base(base: u64) -> Self {
         Self {
@@ -325,7 +325,7 @@ impl ApicState {
 /// 读固件当前的本地 APIC 状态。
 ///
 /// # Safety
-/// 读 MSR `IA32_APIC_BASE` —— 该 MSR 在 x86-64 上**必然存在** ✓，故无故障风险 ✓。
+/// 读 MSR `IA32_APIC_BASE` —— 该 MSR 在 x86-64 上**必然存在**，故无故障风险。
 #[cfg(target_os = "uefi")]
 pub unsafe fn firmware_apic_state() -> ApicState {
     // SAFETY: 见函数文档。
@@ -334,7 +334,7 @@ pub unsafe fn firmware_apic_state() -> ApicState {
 
 /// 固件当前要求的 APIC 访问方式（结合"内核是否支持 x2APIC"）。
 ///
-/// **中性层据此发 IPI** ✓ —— 它不必知道 MSR 编号，也不必解析位域 ✗。
+/// **中性层据此发 IPI**—— 它不必知道 MSR 编号，也不必解析位域。
 ///
 /// # Safety
 /// 同 [`firmware_apic_state`]。
@@ -344,10 +344,10 @@ pub unsafe fn firmware_access(kernel_supports_x2apic: bool) -> ApicAccess {
     select_access(kernel_supports_x2apic, state.x2apic)
 }
 
-/// 从 `LAPIC_ID` 寄存器的**原始 32 位值**里取出 APIC 标识（高 8 位）✓。
+/// 从 `LAPIC_ID` 寄存器的**原始 32 位值**里取出 APIC 标识（高 8 位）。
 ///
-/// **纯逻辑、宿主可测** ✓ —— 移位写错不会崩，只会得到一个"看起来像标识"的错值 ✗，
-/// 所以把它单独拎出来钉住 ✓。
+/// **纯逻辑、宿主可测**—— 移位写错不会崩，只会得到一个"看起来像标识"的错值，
+/// 所以把它单独拎出来钉住。
 #[inline]
 pub const fn lapic_id_from_register(register: u32) -> u32 {
     register >> 24
@@ -355,12 +355,12 @@ pub const fn lapic_id_from_register(register: u32) -> u32 {
 
 /// 经 **MMIO** 读本地 APIC 的标识。
 ///
-/// **为什么它在实现层而不是 `boot`**：这是对**设备寄存器**的指针运算 + 易失读 ✓ ——
-/// 让它留在中性层就是**跨层直连** ✗（S14 / ADR-007）。中性层只说"要 APIC 标识" ✓。
+/// **为什么它在实现层而不是 `boot`**：这是对**设备寄存器**的指针运算 + 易失读 ——
+/// 让它留在中性层就是**跨层直连**（S14 / ADR-007）。中性层只说"要 APIC 标识"。
 ///
 /// # Safety
 /// 调用方必须保证 LAPIC 的 MMIO **已被映射**。**未映射时是取数故障（复位）**，
-/// 不是返回错误 ✗ —— 无法把它变成 `Option` 而不撒谎 ✓。
+/// 不是返回错误 —— 无法把它变成 `Option` 而不撒谎。
 #[cfg(target_os = "uefi")]
 pub unsafe fn read_id_via_mmio() -> u32 {
     // SAFETY: 由调用方保证 MMIO 已映射（见函数文档）。
@@ -415,7 +415,7 @@ unsafe fn apply_write(write: RegisterWrite) {
 #[cfg(target_os = "uefi")]
 unsafe fn read_icr(access: ApicAccess) -> u64 {
     match access {
-        // xAPIC：投递状态在 ICR **低半**（ICR0）里 ✓。
+        // xAPIC：投递状态在 ICR **低半**（ICR0）里。
         ApicAccess::Xapic { base } => unsafe { mmio_read32(base + LAPIC_ICR_LOW as u64) as u64 },
         ApicAccess::X2apic => unsafe { rdmsr(X2APIC_MSR_ICR) },
     }
@@ -423,11 +423,11 @@ unsafe fn read_icr(access: ApicAccess) -> u64 {
 
 /// 发一个 IPI 并**等到它被投递**（轮询 ICR 的投递状态位）。
 ///
-/// 顺序由 [`icr_writes`] 保证 ✓（xAPIC 必须先写高半 —— 写低半才触发发送 ✓）。
+/// 顺序由 [`icr_writes`] 保证（xAPIC 必须先写高半 —— 写低半才触发发送）。
 ///
 /// # Safety
-/// 同 [`apply_write`]；且 `access` 必须与固件当前实际模式一致 ✗（用 x2APIC 的 MSR 去访问
-/// 一个 xAPIC 模式的 LAPIC 不会报错，只会**什么都不发生** ✗）。
+/// 同 [`apply_write`]；且 `access` 必须与固件当前实际模式一致（用 x2APIC 的 MSR 去访问
+/// 一个 xAPIC 模式的 LAPIC 不会报错，只会**什么都不发生**）。
 #[cfg(target_os = "uefi")]
 pub unsafe fn send_ipi(access: ApicAccess, value: u64) {
     let sequence = icr_writes(access, value);
@@ -449,8 +449,8 @@ mod tests {
 
     #[test]
     fn apic_state_reads_the_two_documented_bits() {
-        // **两个位都要看** ✓ —— 只看 bit 10 会把"固件把 APIC 整体关着、而 bit 10 残留为 1"
-        // 误判成"已启用 x2APIC" ✗，于是按 x2APIC 去访问会得到一个"看起来能读、实际无效"的结果 ✗。
+        // **两个位都要看**—— 只看 bit 10 会把"固件把 APIC 整体关着、而 bit 10 残留为 1"
+        // 误判成"已启用 x2APIC"，于是按 x2APIC 去访问会得到一个"看起来能读、实际无效"的结果。
         let both = ApicState::from_base(APIC_BASE_ENABLE | APIC_BASE_X2APIC | 0xFEE0_0000);
         assert!(both.global_enable, "bit 11 已置位");
         assert!(both.x2apic, "bit 11 与 bit 10 都置位才算启用 x2APIC");
@@ -466,12 +466,12 @@ mod tests {
 
     #[test]
     fn the_apic_id_is_the_top_byte_of_the_register() {
-        // 【为什么值得单独测】移位数写错不会崩，只会给出一个**看起来像标识**的错值 ✗ ——
-        // 而它会被拿去和 CPUID 的结果比对，于是"比对了但比的是错的东西" ✗。
+        // 【为什么值得单独测】移位数写错不会崩，只会给出一个**看起来像标识**的错值 ——
+        // 而它会被拿去和 CPUID 的结果比对，于是"比对了但比的是错的东西"。
         assert_eq!(lapic_id_from_register(0x0A00_0000), 0x0A);
         assert_eq!(lapic_id_from_register(0x0000_0000), 0x00);
         assert_eq!(lapic_id_from_register(0xFF00_0000), 0xFF);
-        // 低 24 位是**其他字段**（保留位/型号等）—— 绝不能被当成标识 ✓。
+        // 低 24 位是**其他字段**（保留位/型号等）—— 绝不能被当成标识。
         assert_eq!(lapic_id_from_register(0x0000_FFFF), 0x00, "低 24 位不是标识");
     }
 
@@ -623,9 +623,9 @@ mod tests {
 
     #[test]
     fn the_ipi_constants_are_exactly_what_the_encoder_produces() {
-        // **把常量绑到编码器上** ✓（S13 单点 ✓）—— 常量是手写的十六进制，
-        // 而"手写魔数"正是本会话反复出错的地方 ✗。这里让编码器当裁判 ✓。
-        // 目的地取 0：这两个常量只描述**投递模式 + assert**，与目的地无关 ✓。
+        // **把常量绑到编码器上**（S13 单点）—— 常量是手写的十六进制，
+        // 而"手写魔数"正是本会话反复出错的地方。这里让编码器当裁判。
+        // 目的地取 0：这两个常量只描述**投递模式 + assert**，与目的地无关。
         assert_eq!(
             IPI_INIT_ASSERT,
             icr_value(ApicMode::X2apic, ApicId(0), DeliveryMode::Init, 0, true).expect("合法"),
@@ -645,11 +645,11 @@ mod tests {
 
     #[test]
     fn the_delivery_status_bit_is_the_one_the_reference_polls() {
-        // brxLimine `lapic.c:301` 轮询的是 `ICR0 & (1 << 12)` ✓。
+        // brxLimine `lapic.c:301` 轮询的是 `ICR0 & (1 << 12)`。
         assert_eq!(ICR_DELIVERY_STATUS, 1 << 12);
         assert!(icr_busy(1 << 12), "置位即投递中");
         assert!(!icr_busy(0), "清零即已送达");
-        // 其他位不得被误判成投递中 ✓。
+        // 其他位不得被误判成投递中。
         assert!(!icr_busy(0x4500), "0x4500 不含 bit 12");
     }
 
