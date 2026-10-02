@@ -367,12 +367,12 @@ unsafe fn register_madt_cpus(
     // （与上一轮那个 MMIO 探针不同）。它决定 S4 是否真的需要**去改**这个 MSR：
     // 若固件已经开了 x2APIC 而内核不支持，就必须退回 xAPIC（brxLimine 的做法）。
     // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在。
-    let apic_base = unsafe { current::lapic::rdmsr(current::lapic::IA32_APIC_BASE) };
+    // **经实现层解析位域** ✓ —— 中性层不读 MSR、不解释 bit ✗（S13 单点 / ADR-007）。
+    // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在 ✓。
+    let apic = unsafe { current::lapic::firmware_apic_state() };
     report_fmt::<crate::PlatformImpl>(format_args!(
         "[liftoff] apic_base={:#x} x2apic={} global_enable={}\n",
-        apic_base,
-        current::lapic::x2apic_enabled(apic_base),
-        apic_base & current::lapic::APIC_BASE_ENABLE != 0
+        apic.base, apic.x2apic, apic.global_enable
     ));
 
     // 【S5–S7 接线 · 第 ③ 段】真正把 AP 叫起来 —— **串行**，一次一个 ✓。
@@ -469,12 +469,9 @@ unsafe fn start_aps(
 
     // **访问方式必须与固件当前实际模式一致** ✗（用 x2APIC 的 MSR 去访问一个 xAPIC 模式的
     // LAPIC 不会报错，只会**什么都不发生** ✗）。本内核不支持 x2APIC，故第一个参数是 `false` ✓。
-    let access = current::lapic::select_access(
-        false,
-        current::lapic::x2apic_enabled(unsafe {
-            current::lapic::rdmsr(current::lapic::IA32_APIC_BASE)
-        }),
-    );
+    // 内核不支持 x2APIC → `false` ✓；模式判定与位域解析都在实现层 ✓。
+    // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在 ✓。
+    let access = unsafe { current::lapic::firmware_access(false) };
 
     // 【为什么把决策抽出去】这里原先有 5 处**静默** `continue` ✗ —— 于是一次真机失败
     // 在串口上只留下 `started=0`，**分不清**"全被跳过了"与"发了 IPI 但 AP 不醒" ✗

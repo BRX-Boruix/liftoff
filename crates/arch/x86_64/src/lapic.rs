@@ -296,6 +296,54 @@ pub unsafe fn mmio_read32(address: u64) -> u32 {
     unsafe { core::ptr::read_volatile(address as *const u32) }
 }
 
+/// 固件当前配置的本地 APIC 状态（诊断与选路用）。
+///
+/// **为什么要有它**：中性层此前**自己读 MSR `0x1B` 并解析位域** ✗ —— 那既把 MSR 编号
+/// 泄漏进中性层（ADR-007），也让"哪些位是什么意思"有了**第二个出处** ✗（S13 单点）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ApicState {
+    /// `IA32_APIC_BASE` 的原始值（诊断打印用）。
+    pub base: u64,
+    /// 是否**真的**启用了 x2APIC（**两位都要看** ✓）。
+    pub x2apic: bool,
+    /// APIC 全局使能位（bit 11）。
+    pub global_enable: bool,
+}
+
+impl ApicState {
+    /// 由 `IA32_APIC_BASE` 的原始值解析 —— **纯逻辑、宿主可测** ✓。
+    #[inline]
+    pub const fn from_base(base: u64) -> Self {
+        Self {
+            base,
+            x2apic: x2apic_enabled(base),
+            global_enable: base & APIC_BASE_ENABLE != 0,
+        }
+    }
+}
+
+/// 读固件当前的本地 APIC 状态。
+///
+/// # Safety
+/// 读 MSR `IA32_APIC_BASE` —— 该 MSR 在 x86-64 上**必然存在** ✓，故无故障风险 ✓。
+#[cfg(target_os = "uefi")]
+pub unsafe fn firmware_apic_state() -> ApicState {
+    // SAFETY: 见函数文档。
+    ApicState::from_base(unsafe { rdmsr(IA32_APIC_BASE) })
+}
+
+/// 固件当前要求的 APIC 访问方式（结合"内核是否支持 x2APIC"）。
+///
+/// **中性层据此发 IPI** ✓ —— 它不必知道 MSR 编号，也不必解析位域 ✗。
+///
+/// # Safety
+/// 同 [`firmware_apic_state`]。
+#[cfg(target_os = "uefi")]
+pub unsafe fn firmware_access(kernel_supports_x2apic: bool) -> ApicAccess {
+    let state = unsafe { firmware_apic_state() };
+    select_access(kernel_supports_x2apic, state.x2apic)
+}
+
 /// 从 `LAPIC_ID` 寄存器的**原始 32 位值**里取出 APIC 标识（高 8 位）✓。
 ///
 /// **纯逻辑、宿主可测** ✓ —— 移位写错不会崩，只会得到一个"看起来像标识"的错值 ✗，
@@ -398,6 +446,23 @@ pub unsafe fn send_ipi(access: ApicAccess, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apic_state_reads_the_two_documented_bits() {
+        // **两个位都要看** ✓ —— 只看 bit 10 会把"固件把 APIC 整体关着、而 bit 10 残留为 1"
+        // 误判成"已启用 x2APIC" ✗，于是按 x2APIC 去访问会得到一个"看起来能读、实际无效"的结果 ✗。
+        let both = ApicState::from_base(APIC_BASE_ENABLE | APIC_BASE_X2APIC | 0xFEE0_0000);
+        assert!(both.global_enable, "bit 11 已置位");
+        assert!(both.x2apic, "bit 11 与 bit 10 都置位才算启用 x2APIC");
+        assert_eq!(both.base, APIC_BASE_ENABLE | APIC_BASE_X2APIC | 0xFEE0_0000, "原始值要原样保留");
+        let only_bit10 = ApicState::from_base(APIC_BASE_X2APIC | 0xFEE0_0000);
+        assert!(!only_bit10.global_enable);
+        assert!(!only_bit10.x2apic, "bit 11 没置位时 bit 10 不生效");
+        // 本机真机实测值：0xfee00900 = 基址 0xFEE00000 | 全局使能(0x800) | BSP 标志(0x100)。
+        let real = ApicState::from_base(0xfee0_0900);
+        assert!(real.global_enable);
+        assert!(!real.x2apic, "本机是 xAPIC");
+    }
 
     #[test]
     fn the_apic_id_is_the_top_byte_of_the_register() {
