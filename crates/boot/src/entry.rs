@@ -251,6 +251,8 @@ unsafe fn register_madt_cpus(
     // **固件延时**：INIT 之后要等 10 ms、SIPI 之间要等 200 µs ✓ —— 忙等自旋的时长
     // 取决于 CPU 速度 ✗，而 AP 醒来所需的时间与 CPU 速度无关 ✓。
     stall: Stall,
+    // 引导器的直接映射区间 —— 用来把指针换算成**物理**地址 ✓（不做裸减法 ✗）。
+    direct: DirectMap,
     responses: &mut crate::responses::Responses,
     rsdp_address: u64,
     cr3_top: u64,
@@ -388,7 +390,18 @@ unsafe fn register_madt_cpus(
     // SAFETY: 仍在 boot services 期间；`frames` 分配低页、`stall` 是固件延时、
     // `responses` 里的 `MpInfo` 已由上面的 `set_smp_cpus` 登记好 ✓。
     let started =
-        unsafe { start_aps(&mut *frames, stall, &*responses, &list[..usable], bsp, registered, cr3_top) };
+        unsafe {
+            start_aps(
+                &mut *frames,
+                stall,
+                direct,
+                &*responses,
+                &list[..usable],
+                bsp,
+                registered,
+                cr3_top,
+            )
+        };
     // **只报真正起来了的 AP 数** ✓ —— 报了没起来的，内核会去用它启动不了的 AP ✗。
     responses.set_started_aps(registered, started);
     report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: started={started}\n"));
@@ -408,6 +421,7 @@ unsafe fn register_madt_cpus(
 unsafe fn start_aps(
     frames: &mut EfiFrameAllocator,
     stall: Stall,
+    direct: DirectMap,
     responses: &crate::responses::Responses,
     cpus: &[utils::acpi::MadtCpu],
     bsp: u32,
@@ -518,7 +532,8 @@ unsafe fn start_aps(
             continue;
         };
         // `MpInfo` 的**物理**地址（跳板自己加 HHDM ✓）。
-        let info_phys = (info as *const _ as u64).wrapping_sub(HHDM_OFFSET);
+        // **经映射抽象算，不做裸减法** ✗ —— `RESPONSES` 在低地址恒等映射下，减法会回绕 ✗。
+        let info_phys = arch::hhdm::phys_of_pointer(direct, info as *const _ as u64).as_u64();
         let input = current::ap::ApTrampolineInput {
             hhdm: HHDM_OFFSET,
             cr3_top,
@@ -2772,7 +2787,14 @@ pub unsafe fn bring_up(
     // `frames` 在更早处**已被移动** ✗（`EfiFrameAllocator` 不实现 `Copy` ✓）→ 不能复用 ✓。
     // 但它只是**固件指针的包装** ✓，而 `table.allocate_pages` 仍可用 ✓ → 构造一个新的 ✓。
     let mut low_frames = EfiFrameAllocator::new(table.allocate_pages);
-    register_madt_cpus(&mut low_frames, table.stall, &mut *c.responses, rsdp as u64, cr3_top);
+    register_madt_cpus(
+        &mut low_frames,
+        table.stall,
+        direct,
+        &mut *c.responses,
+        rsdp as u64,
+        cr3_top,
+    );
         }
     }
     // **引导器自述**：`BootloaderInfoResponse` 的 name/version 此前一直是 NULL ——
