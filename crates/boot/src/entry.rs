@@ -167,11 +167,8 @@ pub fn start_with<P: Platform>(
         bring_up(&*boot_services, image_handle, c, |entry| <P as Platform>::jump_to(entry))
     };
     if let Err(stage) = result {
-        // 失败时把环节写出来：真跑时这是最有用的信息。
-        let text = stage_text(stage);
-        for byte in text {
-            P::write_byte(*byte);
-        }
+        // 失败时把**环节与具体原因**都写出来：真跑时这是最有用的信息。
+        report_failure::<P>(&stage);
         return Err(Error::Io);
     }
     Ok(Outcome::Ready)
@@ -184,8 +181,64 @@ fn report<P: Platform>(text: &[u8]) {
     }
 }
 
+/// 把失败**连具体原因**一起写到诊断通道。
+///
+/// **为什么不能只打环节**：`BringUpError` 的 12 个环节里有 10 个携带具体错误，而此前
+/// 它们**全都只打一个通用标记** —— "卡在哪一步"可见、"**为什么**"不可见。定位混合
+/// 粒度失败时，正是把 `MapError` 的值打出来才一步锁定根因；当时只有 `apply` 因为一处
+/// 特例会打印值，其余环节同样携带载荷却都不打印。这里**单点**补齐（S13/S15），
+/// 避免同类问题在别处重演。
+fn report_failure<P: Platform>(stage: &BringUpError) {
+    report::<P>(stage_text(stage));
+    // 无载荷的环节（RootFrame / DirectMap）到此为止。
+    match stage {
+        BringUpError::Discover(e) => report_cause::<P>(e),
+        BringUpError::Media(e) => report_cause::<P>(e),
+        BringUpError::Kernel(e) => report_cause::<P>(e),
+        BringUpError::Plan(e) => report_cause::<P>(e),
+        BringUpError::MemoryMapLoad(e) => report_cause::<P>(e),
+        BringUpError::MemoryMapRanges(e) => report_cause::<P>(e),
+        BringUpError::Apply(e) => report_cause::<P>(e),
+        BringUpError::Copy(e) => report_cause::<P>(e),
+        BringUpError::Responses(e) => report_cause::<P>(e),
+        BringUpError::Handoff(e) => report_cause::<P>(e),
+        BringUpError::RootFrame | BringUpError::DirectMap => {}
+    }
+}
+
+/// 把任意错误渲成一行（**固定缓冲，不分配**）。
+///
+/// 缓冲溢出即截断（`fmt` 返回 `Err` 被忽略）—— 诊断输出不该因为消息长就 panic。
+///
+/// **这里用 `Debug` 而不是 `Display`，是有意的临时选择**：`MediaError`、
+/// `KernelPlanError`、`PlanBuildError`、`HandoffError` 四个类型**根本没有 `Display`**
+/// —— 它们无法用人类可读的形式说出自己。给它们补 `Display` 是独立的一步（已记入台账），
+/// 在补上之前先用 `Debug`，让**每一个**失败至少能报出名字，而不是只报环节。
+fn report_cause<P: Platform>(err: &impl core::fmt::Debug) {
+    struct Buf {
+        bytes: [u8; 128],
+        len: usize,
+    }
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            for &byte in text.as_bytes() {
+                if self.len >= self.bytes.len() {
+                    return Err(core::fmt::Error);
+                }
+                self.bytes[self.len] = byte;
+                self.len += 1;
+            }
+            Ok(())
+        }
+    }
+    use core::fmt::Write;
+    let mut buf = Buf { bytes: [0; 128], len: 0 };
+    let _ = write!(buf, "[liftoff]   cause: {:?}\n", err);
+    report::<P>(&buf.bytes[..buf.len]);
+}
+
 /// 失败环节的短文本（真跑时从串口就能看出卡在哪一步）。
-fn stage_text(stage: BringUpError) -> &'static [u8] {
+fn stage_text(stage: &BringUpError) -> &'static [u8] {
     match stage {
         BringUpError::Discover(_) => b"[liftoff] stage: discover\n",
         BringUpError::Media(_) => b"[liftoff] stage: media\n",
@@ -709,6 +762,86 @@ pub fn check_before_entry(
         Ok(()) => Ok(entry),
         Err(TakeoverError::Uncovered { address }) => Err(EntryError::NotCovered { address }),
         Err(TakeoverError::EmptyRange) => Err(EntryError::EmptySpan),
+    }
+}
+
+#[cfg(test)]
+mod report_failure_tests {
+    use super::{BringUpError, report_failure};
+    use arch::paging::MapError;
+    use arch::platform::{InterruptState, Platform};
+    use std::string::String;
+    use std::sync::Mutex;
+    use std::vec::Vec;
+
+    /// 记录输出的替身平台。
+    static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    struct Sink;
+
+    impl Platform for Sink {
+        fn init() {}
+
+        fn name() -> &'static str {
+            "sink"
+        }
+
+        unsafe fn jump_to(_entry: u64) -> ! {
+            panic!("测试替身不应被调用")
+        }
+
+        fn halt() -> ! {
+            panic!("测试替身不应被调用")
+        }
+
+        fn write_byte(byte: u8) {
+            OUT.lock().unwrap_or_else(|e| e.into_inner()).push(byte);
+        }
+
+        fn bsp_lapic_id() -> u32 {
+            0
+        }
+
+        fn disable_interrupts() -> InterruptState {
+            InterruptState::from_enabled(false)
+        }
+
+        fn restore_interrupts(_state: InterruptState) {}
+    }
+
+    fn capture(stage: &BringUpError) -> String {
+        OUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        report_failure::<Sink>(stage);
+        let bytes = OUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(bytes).expect("诊断输出应是 UTF-8")
+    }
+
+    #[test]
+    fn a_failure_reports_both_the_stage_and_the_cause() {
+        // **这条测试守着一次三次真机失败的教训。** 此前每个环节只打一个通用标记：
+        // "卡在哪一步"可见、"为什么"不可见。定位混合粒度问题时，只有 `apply` 因为
+        // 一处特例会打印具体错误值 —— 正是那个值一步锁定了根因。
+        let text = capture(&BringUpError::Apply(MapError::UnsupportedGranularity));
+        assert!(text.contains("stage: apply plan"), "必须打环节: {text}");
+        assert!(text.contains("cause:"), "必须打具体原因: {text}");
+        assert!(text.contains("UnsupportedGranularity"), "原因必须点名到具体变体: {text}");
+    }
+
+    #[test]
+    fn a_payloadless_failure_still_reports_its_stage() {
+        let text = capture(&BringUpError::RootFrame);
+        assert!(text.contains("stage: root frame"), "无载荷环节也要报: {text}");
+        assert!(!text.contains("cause:"), "无载荷时不得伪造原因: {text}");
+    }
+
+    #[test]
+    fn a_long_message_is_truncated_rather_than_panicking() {
+        // 固定缓冲溢出必须**截断**，不能让诊断本身成为故障源。
+        let text = capture(&BringUpError::Plan(super::PlanBuildError::Plan(
+            mm::plan::PlanError::AddressOverflow,
+        )));
+        assert!(text.contains("stage: plan"), "环节必须仍然可见: {text}");
+        assert!(text.len() < 300, "输出必须被固定缓冲限制住，实得 {} 字节", text.len());
     }
 }
 
@@ -1649,26 +1782,6 @@ pub fn build_plan(request: &PlanRequest<'_>, out: &mut [Mapping]) -> Result<usiz
     Ok(total)
 }
 
-/// 把 `MapError` 渲染成可读文本并打到串口（诊断用）。
-///
-/// `MapError` 已实现 `Display`；这里用 `core::fmt::Write` 渲进一个**固定缓冲**，
-/// 不引入分配。仅在 UEFI 目标上存在 —— 宿主测试不需要它，且 `write_byte` 在宿主
-/// 实现里是特权指令，误调会让测试进程崩掉。
-#[cfg(target_os = "uefi")]
-fn report_map_error(err: arch::paging::MapError) {
-    struct Sink;
-    impl core::fmt::Write for Sink {
-        fn write_str(&mut self, text: &str) -> core::fmt::Result {
-            for byte in text.bytes() {
-                crate::PlatformImpl::write_byte(byte);
-            }
-            Ok(())
-        }
-    }
-    use core::fmt::Write;
-    let _ = write!(Sink, "[liftoff] apply error: {}\n", err);
-}
-
 /// 交接所需的**全部调用方缓冲**（引导器不做隐藏分配：每个缓冲都由调用方给）。
 pub struct BringUp<'a, 'b> {
     /// 内核映像读出目标（约 25 MB，来自固件页）。
@@ -1853,10 +1966,7 @@ pub unsafe fn bring_up(
     // `0x1000` 起、不会碰它，所以必须在这里显式解除，才算真正与 Limine 一致
     // （`limine.c:200-203` 从 `0x1000` 起）。
     if let Err(err) = mm::apply::apply(&mut page_table, &c.plan[..plan_count]) {
-        // **把具体错误打出来。** 此前只打一个阶段标记（`stage: apply plan`），看不到
-        // 是哪一种 `MapError` —— 定位混合粒度失败时正是在这一步卡住的。
-        #[cfg(target_os = "uefi")]
-        report_map_error(err);
+        // 具体是哪一种 `MapError` 由 `report_failure` 统一打出（不再需要特例）。
         return Err(BringUpError::Apply(err));
     }
     page_table
