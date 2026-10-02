@@ -19,6 +19,7 @@ dependencies = [
  "limine",
  "loader",
  "mm",
+ "utils",
 ]
 
 [[package]]

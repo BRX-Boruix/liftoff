@@ -27,3 +27,4 @@ driver = { path = "../driver" }
 fs = { path = "../fs" }
 mm = { path = "../mm" }
 loader = { path = "../loader" }
+utils = { path = "../utils" }

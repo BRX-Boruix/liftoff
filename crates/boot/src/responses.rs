@@ -37,6 +37,12 @@ pub const MAX_FRAMEBUFFERS: usize = 4;
 /// 最多登记的模块数。
 pub const MAX_MODULES: usize = 16;
 
+/// 最多登记的 CPU 数。
+///
+/// 取 256：远超任何现实机器的插槽数，而 `256 * size_of::<MpInfo>()` 只有 8 KiB，
+/// 对引导器是零成本。**超出即拒绝登记**（不静默丢），见 `set_smp_cpus`。
+pub const MAX_CPUS: usize = 256;
+
 /// 协议响应容器。
 pub struct Responses {
     hhdm: HhdmResponse,
@@ -57,10 +63,10 @@ pub struct Responses {
     module: ModuleResponse,
     modules: [*mut File; MAX_MODULES],
     mp: MpResponse,
-    /// BSP 的 `MpInfo`（`mp.cpus` 指向它的地址，故必须留在容器内）。
-    mp_info: MpInfo,
+    /// 每个 CPU 的 `MpInfo`（`mp.cpus` 指向 `mp_cpu_ptrs`，后者指向这里，故必须留在容器内）。
+    mp_infos: [MpInfo; MAX_CPUS],
     /// CPU 指针数组（`mp.cpus` 指向它）。
-    mp_cpu_ptrs: [*mut MpInfo; 1],
+    mp_cpu_ptrs: [*mut MpInfo; MAX_CPUS],
 }
 
 impl Responses {
@@ -120,14 +126,14 @@ impl Responses {
                 cpu_count: 0,
                 cpus: core::ptr::null_mut(),
             },
-            mp_info: MpInfo {
+            mp_infos: [MpInfo {
                 processor_id: 0,
                 lapic_id: 0,
                 reserved: 0,
                 goto_address: None,
                 extra_argument: 0,
-            },
-            mp_cpu_ptrs: [core::ptr::null_mut(); 1],
+            }; MAX_CPUS],
+            mp_cpu_ptrs: [core::ptr::null_mut(); MAX_CPUS],
         }
     }
 
@@ -155,21 +161,59 @@ impl Responses {
         self.mp.flags |= flags;
     }
 
+    /// 只登记 BSP（单核情形）—— 等价于「MADT 里只有 BSP、一个 AP 都没启动」。
     pub fn set_smp(&mut self, bsp_lapic_id: u32) {
-        self.mp_info = MpInfo {
-            processor_id: 0,
-            lapic_id: bsp_lapic_id,
-            reserved: 0,
-            goto_address: None,
-            extra_argument: 0,
-        };
-        let info: *mut MpInfo = &mut self.mp_info;
-        self.mp_cpu_ptrs = [info];
+        let bsp = utils::acpi::MadtCpu { processor_id: 0, apic_id: bsp_lapic_id, enabled: true };
+        self.set_smp_cpus(core::slice::from_ref(&bsp), 0);
+    }
+
+    /// 登记 MADT 里的 CPU，并声明**实际启动了几个 AP**；返回登记到的 CPU 数。
+    ///
+    /// `cpu_count` = 1（BSP）+ 实际启动的 AP 数 —— **只报真正起来的 CPU**。
+    /// 把没启动的 CPU 也报给内核是**更糟**的做法：内核会去用它启动不了的 AP
+    /// （真机实测 `cpu_count = 0` 会让内核卡死在紧循环，故 BSP 必须计入）。
+    ///
+    /// 三条不变量：
+    /// 1. 只登记固件声明为 `enabled` 的 CPU —— 对标 brxLimine，它只尝试启动 enabled 的 AP。
+    /// 2. 超过 `MAX_CPUS` 的部分**拒绝登记**（不静默截断成"看起来成功"）。
+    /// 3. `started_aps` **夹到**可用 AP 数以内 —— 调用方声称起了比存在的更多的核时，
+    ///    不把 `cpu_count` 报成不可能的值。
+    ///
+    /// 约定：`cpus[0]` 是 BSP（MADT 的枚举顺序即此），空切片表示"没有可用 CPU"，
+    /// 此时 `cpu_count = 0`（如实反映，而不是假报一个 BSP）。
+    pub fn set_smp_cpus(&mut self, cpus: &[utils::acpi::MadtCpu], started_aps: usize) -> usize {
+        let mut registered = 0usize;
+        for cpu in cpus {
+            if !cpu.enabled || registered >= MAX_CPUS {
+                continue;
+            }
+            self.mp_infos[registered] = MpInfo {
+                processor_id: cpu.processor_id,
+                lapic_id: cpu.apic_id,
+                reserved: 0,
+                goto_address: None,
+                extra_argument: 0,
+            };
+            self.mp_cpu_ptrs[registered] = &mut self.mp_infos[registered];
+            registered += 1;
+        }
+        let aps = registered.saturating_sub(1);
+        let started = started_aps.min(aps);
         self.mp.revision = 0;
-        self.mp.flags = 0;
-        self.mp.bsp_lapic_id = bsp_lapic_id;
-        self.mp.cpu_count = 1;
+        self.mp.bsp_lapic_id = if registered == 0 { 0 } else { self.mp_infos[0].lapic_id };
+        self.mp.cpu_count = if registered == 0 { 0 } else { (1 + started) as u64 };
         self.mp.cpus = self.mp_cpu_ptrs.as_mut_ptr();
+        registered
+    }
+
+    /// 当前报告给内核的 CPU 数。
+    pub fn mp_cpu_count(&self) -> u64 {
+        self.mp.cpu_count
+    }
+
+    /// 第 `index` 个 CPU 的描述；越界返回 `None`。
+    pub fn mp_info_at(&self, index: usize) -> Option<&MpInfo> {
+        self.mp_infos.get(index)
     }
 
     /// 设置 HHDM 偏移。
@@ -286,6 +330,56 @@ impl Responses {
 /// 此前的证据只是「内核能启动」—— 那证明的是"至少用到的那些填对了"，不是"声明集被完整
 /// 覆盖"。E5 排查时正是靠一次性的 Python 对齐才发现 7/7 全覆盖，但那个结论没有任何东西
 /// 守着：将来内核多声明一个请求，我们会**静默不应答**，而内核可能只是降级而不是报错。
+#[cfg(test)]
+mod smp_tests {
+    use super::Responses;
+    use limine::mp::MpInfo;
+    use utils::acpi::MadtCpu;
+
+    fn cpu(processor_id: u32, apic_id: u32) -> MadtCpu {
+        MadtCpu { processor_id, apic_id, enabled: true }
+    }
+
+    #[test]
+    fn only_started_aps_are_reported_to_the_kernel() {
+        // **这是安全属性，不是格式问题。** 把没启动的 CPU 也报给内核，内核会去用它
+        // 启动不了的 AP —— 我自己在 `set_smp` 的注释里把那种做法记为「更糟」。
+        // 所以 `cpu_count` 必须 = 1（BSP）+ **实际启动**的 AP 数。
+        let mut r = Responses::new();
+        let cpus = [cpu(0, 0), cpu(1, 1), cpu(2, 2), cpu(3, 3)];
+        r.set_smp_cpus(&cpus, 0);
+        assert_eq!(r.mp_cpu_count(), 1, "一个 AP 都没起来时只能报 BSP");
+        r.set_smp_cpus(&cpus, 2);
+        assert_eq!(r.mp_cpu_count(), 3, "起来 2 个 AP 就是 1+2");
+    }
+
+    #[test]
+    fn each_reported_cpu_has_its_own_entry_with_the_right_apic_id() {
+        let mut r = Responses::new();
+        let cpus = [cpu(0, 7), cpu(1, 9)];
+        r.set_smp_cpus(&cpus, 1);
+        assert_eq!(r.mp_cpu_count(), 2);
+        // 指针数组必须逐项指向**不同的** `MpInfo` —— 指向同一份，内核会把一个 CPU 看成两个。
+        let a = r.mp_info_at(0).expect("第 0 项");
+        let b = r.mp_info_at(1).expect("第 1 项");
+        assert_ne!(a as *const MpInfo, b as *const MpInfo, "每项必须是独立的 MpInfo");
+        assert_eq!(a.lapic_id, 7);
+        assert_eq!(b.lapic_id, 9);
+        assert_eq!(a.processor_id, 0);
+        assert_eq!(b.processor_id, 1);
+        assert!(a.goto_address.is_none(), "goto_address 由内核填，引导器不得预设");
+    }
+
+    #[test]
+    fn claiming_more_started_aps_than_exist_is_rejected() {
+        // 声称起了 9 个而表里只有 2 个 —— 不得把 `cpu_count` 报成 10。
+        let mut r = Responses::new();
+        let cpus = [cpu(0, 0), cpu(1, 1)];
+        r.set_smp_cpus(&cpus, 9);
+        assert_eq!(r.mp_cpu_count(), 2, "不得超过表里声明的 CPU 数");
+    }
+}
+
 #[cfg(test)]
 mod request_coverage_tests {
     use super::Responses;
