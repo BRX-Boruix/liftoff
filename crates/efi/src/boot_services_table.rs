@@ -16,6 +16,11 @@ pub type ExitBootServices = unsafe extern "efiapi" fn(image_handle: Handle, map_
 
 /// `AllocatePages` 的类型参数（UEFI 规范）：任意地址分配。
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
+/// `AllocateMaxAddress`：`memory` 传入时是**允许的最高地址**，返回的页不高于它。
+///
+/// 需要它是因为**实模式只有 20 位寻址** ✗ —— AP 跳板必须落在 1 MiB 以下，
+/// 否则 AP 醒来取不到第一条指令（表现为"发了 IPI 但 AP 不醒"）。
+pub const ALLOCATE_MAX_ADDRESS: u32 = 2;
 /// 内存类型：引导器数据。
 pub const EFI_LOADER_CODE: u32 = 1;
 pub const EFI_LOADER_DATA: u32 = 2;
@@ -144,6 +149,39 @@ impl EfiFrameAllocator {
     }
 }
 
+impl EfiFrameAllocator {
+    /// 取一帧，**不高于** `max_address`（UEFI `AllocateMaxAddress` 语义）。
+    ///
+    /// 与 [`FrameAllocator::allocate_zeroed`] 同样自己清零（固件不保证零化 ✓），
+    /// 并且**再验一次**固件交回的地址确实不高于上界 ✓ —— 固件理当遵守，但
+    /// 越界的一页会让 AP 在实模式下取不到指令 ✗，宁可拒绝也不要一个"看起来成功"。
+    ///
+    /// `max_address` 是**允许的最高起始地址** ✓（调用方从 `AP_LOW_LIMIT - AP_PAGE_SIZE`
+    /// 这类**推导**得出 ✓，不手写 ✗）。
+    pub fn allocate_zeroed_below(&mut self, max_address: u64) -> Option<PhysFrame> {
+        let mut address: u64 = max_address;
+        // SAFETY: 由固件填写 `address`；其余参数按 UEFI 契约给出。
+        let status = unsafe {
+            (self.allocate_pages)(ALLOCATE_MAX_ADDRESS, EFI_LOADER_DATA, 1, &mut address)
+        };
+        if status_to_error(status).is_some() {
+            return None;
+        }
+        if address % PAGE_SIZE != 0 {
+            return None;
+        }
+        // 上界复核。**只比起始地址** ✓ —— 我第一版写成 `address + PAGE_SIZE > max + PAGE_SIZE`，
+        // 而 `max = u64::MAX` 时右边**溢出成 `None`** ✗，`?` 于是把合法分配也拒了 ✗。
+        // 这是本会话反复出现的"手算边界"同一个坑 ✓：能不加减就不加减 ✓。
+        if address > max_address {
+            return None;
+        }
+        // SAFETY: 固件刚分配的、页对齐的 4KiB 页，引导阶段该物理地址可直接访问。
+        unsafe { core::ptr::write_bytes(address as *mut u8, 0, 4096) };
+        Some(PhysFrame::containing(PhysAddr::new(address)))
+    }
+}
+
 impl FrameAllocator for EfiFrameAllocator {
     fn allocate_zeroed(&mut self) -> Option<PhysFrame> {
         let mut address: u64 = 0;
@@ -166,10 +204,13 @@ impl FrameAllocator for EfiFrameAllocator {
 
 #[cfg(test)]
 mod efi_frame_allocator_tests {
-    use super::{ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, EfiFrameAllocator};
+    use super::{ALLOCATE_ANY_PAGES, ALLOCATE_MAX_ADDRESS, EFI_LOADER_DATA, EfiFrameAllocator};
     use arch::paging::FrameAllocator;
     use crate::types::{Status, SUCCESS, DEVICE_ERROR};
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// 假固件看到的**上界入参**（`AllocateMaxAddress` 语义：入参即上界）。
+    static SEEN_MAX: AtomicU64 = AtomicU64::new(0);
 
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     static SEEN_TYPE: AtomicUsize = AtomicUsize::new(0);
@@ -189,6 +230,8 @@ mod efi_frame_allocator_tests {
     ) -> Status {
         CALLS.fetch_add(1, Ordering::SeqCst);
         SEEN_TYPE.store(allocate_type as usize, Ordering::SeqCst);
+        // SAFETY: 入参指针按 UEFI 契约有效。
+        SEEN_MAX.store(unsafe { *memory }, Ordering::SeqCst);
         SEEN_MEMTYPE.store(memory_type as usize, Ordering::SeqCst);
         SEEN_PAGES.store(pages, Ordering::SeqCst);
         if FAIL.load(Ordering::SeqCst) != 0 {
@@ -203,6 +246,41 @@ mod efi_frame_allocator_tests {
         assert_eq!(base % 4096, 0, "测试夹具必须页对齐");
         unsafe { *memory = base + MISALIGN.load(Ordering::SeqCst) as u64 };
         SUCCESS
+    }
+
+    #[test]
+    fn a_bounded_allocation_asks_with_the_max_address_type_and_passes_the_bound_through() {
+        // **断言完整值，不手算区间** ✓（本会话反复栽在"手算边界"上 ✗）。
+        CALLS.store(0, Ordering::SeqCst);
+        FAIL.store(0, Ordering::SeqCst);
+        MISALIGN.store(0, Ordering::SeqCst);
+        let mut allocator = EfiFrameAllocator::new(fake_alloc);
+        // 上界取 `u64::MAX`：只为验证**参数确实被透传**，与具体数值无关。
+        let frame = allocator.allocate_zeroed_below(u64::MAX).expect("上界足够大");
+        assert_eq!(SEEN_TYPE.load(Ordering::SeqCst), ALLOCATE_MAX_ADDRESS as usize);
+        assert_eq!(SEEN_MAX.load(Ordering::SeqCst), u64::MAX, "上界必须原样透传给固件");
+        assert_eq!(SEEN_PAGES.load(Ordering::SeqCst), 1, "一帧 = 一个 4KiB 页");
+        assert_eq!(SEEN_MEMTYPE.load(Ordering::SeqCst), EFI_LOADER_DATA as usize);
+        // 与无上界那条同样必须**已清零** ✓。
+        let base = frame.start_address().expect("帧地址可算").as_u64();
+        // SAFETY: 固件刚交出的页，测试期间可读。
+        let byte = unsafe { core::ptr::read_volatile(base as *const u8) };
+        assert_eq!(byte, 0, "交付的帧必须已清零");
+    }
+
+    #[test]
+    fn a_frame_the_firmware_returns_above_the_bound_is_rejected() {
+        // **这是本方法的全部意义**：越界的一页会让 AP 在实模式下取不到指令 ✗。
+        // 夹具交回的是宿主上一块**高地址**缓冲 ✓ —— 用一个很小的上界就能逼出拒绝 ✓。
+        CALLS.store(0, Ordering::SeqCst);
+        FAIL.store(0, Ordering::SeqCst);
+        MISALIGN.store(0, Ordering::SeqCst);
+        let mut allocator = EfiFrameAllocator::new(fake_alloc);
+        // 0xFF000 = 1 MiB - 4 KiB：跳板页的**推导**上界（整页都要 < 1 MiB ✓）。
+        assert!(
+            allocator.allocate_zeroed_below(0x000F_F000).is_none(),
+            "固件交出越界地址时必须拒绝，而不是当作成功"
+        );
     }
 
     #[test]
