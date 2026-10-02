@@ -320,7 +320,9 @@ unsafe fn register_madt_cpus(
         return;
     }
 
-    let mut list = [utils::acpi::MadtCpu { processor_id: 0, apic_id: 0, enabled: false }; 64];
+    // 容量与启动计划缓冲**共用同一个常量** ✓（不再各写一个 64 ✗）。
+    let mut list = [utils::acpi::MadtCpu { processor_id: 0, apic_id: 0, enabled: false };
+        crate::responses::AP_PLAN_CAPACITY];
     let Ok(total) = utils::acpi::cpus(&madt[..madt_len], &mut list) else {
         report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] madt: 解析失败\n"));
         return;
@@ -386,7 +388,7 @@ unsafe fn register_madt_cpus(
     // SAFETY: 仍在 boot services 期间；`frames` 分配低页、`stall` 是固件延时、
     // `responses` 里的 `MpInfo` 已由上面的 `set_smp_cpus` 登记好 ✓。
     let started =
-        unsafe { start_aps(&mut *frames, stall, &*responses, &list[..usable], bsp, cr3_top) };
+        unsafe { start_aps(&mut *frames, stall, &*responses, &list[..usable], bsp, registered, cr3_top) };
     // **只报真正起来了的 AP 数** ✓ —— 报了没起来的，内核会去用它启动不了的 AP ✗。
     responses.set_started_aps(registered, started);
     report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: started={started}\n"));
@@ -409,6 +411,8 @@ unsafe fn start_aps(
     responses: &crate::responses::Responses,
     cpus: &[utils::acpi::MadtCpu],
     bsp: u32,
+    // `set_smp_cpus` 登记到的 CPU 数 —— 用来判断登记下标有没有越界 ✓。
+    registered: usize,
     cr3_top: u64,
 ) -> usize {
     // 低页：跳板代码 + GDT + GDTR 描述符 + 参数块，**全部在一页里** ✓。
@@ -459,21 +463,58 @@ unsafe fn start_aps(
         }),
     );
 
+    // 【为什么把决策抽出去】这里原先有 5 处**静默** `continue` ✗ —— 于是一次真机失败
+    // 在串口上只留下 `started=0`，**分不清**"全被跳过了"与"发了 IPI 但 AP 不醒" ✗
+    // （第 108 轮的真机就是这个症状）。现在处置由 `responses::ap_plan` 算出（纯逻辑、
+    // 宿主可测 ✓），并且**每一个跳过都带原因打出来** ✓。
+    //
+    // 先把固件给的原样打出来 ✓ —— `apic_id` 全是 0 这类事只有这样才看得见 ✗。
+    for (index, cpu) in cpus.iter().enumerate() {
+        report_fmt::<crate::PlatformImpl>(format_args!(
+            "[liftoff] ap: cpu[{index}] processor_id={} apic_id={:#x} enabled={}\n",
+            cpu.processor_id, cpu.apic_id, cpu.enabled
+        ));
+    }
+
+    let mut plan = [crate::responses::ApPlan::Disabled; crate::responses::AP_PLAN_CAPACITY];
+    let planned = crate::responses::ap_plan(cpus, bsp, registered, &mut plan);
+    if planned < cpus.len() {
+        report_fmt::<crate::PlatformImpl>(format_args!(
+            "[liftoff] ap: 警告：MADT 报了 {} 个 CPU，计划缓冲只放得下 {planned} 个\n",
+            cpus.len()
+        ));
+    }
+
     let mut started = 0usize;
-    // **登记下标 ≠ CPU 列表下标** ✗：`set_smp_cpus` 只登记 `enabled` 的 CPU ✓，
-    // 所以第 i 个 `MpInfo` 对应列表里**第 i 个 enabled 项** ✓。BSP 也占一个 enabled 槽 ✓。
-    let mut enabled_index = 0usize;
-    for cpu in cpus {
-        if !cpu.enabled {
+    for (index, step) in plan[..planned].iter().enumerate() {
+        let slot = match *step {
+            crate::responses::ApPlan::Disabled => {
+                report_fmt::<crate::PlatformImpl>(format_args!(
+                    "[liftoff] ap: cpu[{index}] 跳过：固件标记为未使能\n"
+                ));
+                continue;
+            }
+            crate::responses::ApPlan::Bsp { slot } => {
+                report_fmt::<crate::PlatformImpl>(format_args!(
+                    "[liftoff] ap: cpu[{index}] 跳过：就是 BSP 自己（slot={slot}）\n"
+                ));
+                continue;
+            }
+            crate::responses::ApPlan::NoSlot { slot } => {
+                report_fmt::<crate::PlatformImpl>(format_args!(
+                    "[liftoff] ap: cpu[{index}] 跳过：登记下标 {slot} 越界（口径不一致）\n"
+                ));
+                continue;
+            }
+            crate::responses::ApPlan::Start { slot } => slot,
+        };
+        let Some(cpu) = cpus.get(index) else {
             continue;
-        }
-        let slot = enabled_index;
-        enabled_index += 1;
-        // BSP 不启动（MADT 也列它 ✓）。
-        if cpu.apic_id == bsp {
-            continue;
-        }
+        };
         let Some(info) = responses.mp_info_at(slot) else {
+            report_fmt::<crate::PlatformImpl>(format_args!(
+                "[liftoff] ap: cpu[{index}] 跳过：没有 slot={slot} 的 MpInfo\n"
+            ));
             continue;
         };
         // `MpInfo` 的**物理**地址（跳板自己加 HHDM ✓）。
@@ -487,10 +528,19 @@ unsafe fn start_aps(
             // 保守：跳板里不开 CR0.WP ✓ —— 交接后 CR0 完全由内核掌控 ✓。
             write_protect: false,
         };
-        let Ok(block) = current::ap::prepare(&input) else {
-            continue;
+        let block = match current::ap::prepare(&input) {
+            Ok(block) => block,
+            Err(error) => {
+                report_fmt::<crate::PlatformImpl>(format_args!(
+                    "[liftoff] ap: cpu[{index}] 跳过：参数块填不出来: {error}\n"
+                ));
+                continue;
+            }
         };
-        if current::ap::stage_frame(&block, low).is_err() {
+        if let Err(error) = current::ap::stage_frame(&block, low) {
+            report_fmt::<crate::PlatformImpl>(format_args!(
+                "[liftoff] ap: cpu[{index}] 跳过：参数块写不进低页: {error}\n"
+            ));
             continue;
         }
         // 参数块写好了（`booted_flag` 也已归零 ✓）—— **现在**才允许这个 AP 醒来 ✓。

@@ -8,6 +8,62 @@
 //! 具体数值由上层用 `firmware` 抽象取来后经 setter 填入。
 
 use core::ffi::c_void;
+
+/// 启动计划缓冲的容量 —— 与 `register_madt_cpus` 里 `MADT` 解析缓冲**同一口径** ✓
+/// （一次 `MADT` 能描述的 CPU 上限）。两处共用这一个常量，避免各写一个 64 ✗。
+pub const AP_PLAN_CAPACITY: usize = 64;
+
+/// 一个 CPU 在 AP 启动计划里的**处置**。
+///
+/// **为什么要有它**：`start_aps` 里原先有 5 处静默 `continue` ✗ —— 于是一次真机失败在
+/// 串口上只留下 `started=0`，**分不清**"全被跳过了"与"发了 IPI 但 AP 不醒" ✗。
+/// 把处置做成纯逻辑：既能宿主测试，又保证**每一个跳过都有原因** ✓。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApPlan {
+    /// 固件说这个 CPU 没使能（`MADT` 里 `enabled = false`）—— **不占 `MpInfo` 槽位** ✓。
+    Disabled,
+    /// 这是 BSP 自己，不启动（`MADT` 也列它 ✓）。
+    Bsp { slot: usize },
+    /// 要启动它；`slot` 是它在 `MpInfo` 数组里的**登记下标** ✓。
+    Start { slot: usize },
+    /// 登记下标越界 —— 与 `set_smp_cpus` 的口径不一致 ✗，**报出来，不静默用** ✓。
+    NoSlot { slot: usize },
+}
+
+/// 为每个 CPU 算出处置，返回写入的项数 —— **纯逻辑、宿主可测** ✓。
+///
+/// `registered` 是 `set_smp_cpus` 的返回值：`slot >= registered` 说明两边口径不一致 ✓。
+/// **登记下标 ≠ 列表下标** ✗：`set_smp_cpus` 只登记 `enabled` 的 CPU ✓，BSP 也占一个槽 ✓。
+pub fn ap_plan(
+    cpus: &[utils::acpi::MadtCpu],
+    bsp: u32,
+    registered: usize,
+    out: &mut [ApPlan],
+) -> usize {
+    let mut enabled_index = 0usize;
+    let mut written = 0usize;
+    for cpu in cpus {
+        if written >= out.len() {
+            break;
+        }
+        if !cpu.enabled {
+            out[written] = ApPlan::Disabled;
+            written += 1;
+            continue;
+        }
+        let slot = enabled_index;
+        enabled_index += 1;
+        out[written] = if slot >= registered {
+            ApPlan::NoSlot { slot }
+        } else if cpu.apic_id == bsp {
+            ApPlan::Bsp { slot }
+        } else {
+            ApPlan::Start { slot }
+        };
+        written += 1;
+    }
+    written
+}
 use firmware::error::Error;
 use firmware::graphics::FramebufferInfo;
 use firmware::memory::{MemoryEntry, MemoryMapSource};
@@ -1051,4 +1107,59 @@ pub fn mark_kernel_memory(
         }
     }
     Some(written)
+}
+
+#[cfg(test)]
+mod ap_plan_tests {
+    use super::{ApPlan, ap_plan};
+    use utils::acpi::MadtCpu;
+
+    fn cpu(apic_id: u32, enabled: bool) -> MadtCpu {
+        MadtCpu { processor_id: apic_id, apic_id, enabled }
+    }
+
+    #[test]
+    fn disabled_cpus_do_not_consume_an_info_slot() {
+        // **这就是那个真实缺陷**：登记下标 ≠ 列表下标 ✓ —— `set_smp_cpus` 只登记
+        // `enabled` 的 CPU ✗。MADT 里只要有一个 disabled 项排在被启动的 AP 前面，
+        // 用列表下标就会把**别人的参数块**交给它 ✗。
+        let cpus = [cpu(0, true), cpu(9, false), cpu(1, true)];
+        let mut out = [ApPlan::Disabled; 4];
+        let n = ap_plan(&cpus, 0, 2, &mut out);
+        assert_eq!(n, 3);
+        assert_eq!(out[0], ApPlan::Bsp { slot: 0 });
+        assert_eq!(out[1], ApPlan::Disabled);
+        assert_eq!(out[2], ApPlan::Start { slot: 1 }, "第二个 enabled 项是 slot 1，不是 2");
+    }
+
+    #[test]
+    fn a_cpu_whose_apic_id_equals_the_bsp_is_not_started() {
+        // 【当前真机症状的候选】若固件给的 apic_id **全是 0**，则每一个都会被判成 BSP ✗
+        // → 一条 IPI 都不发 → 串口上只有 `started=0` ✓。这条测试把这个行为钉住，
+        // 好让日志能区分"全被判成 BSP"与"真的都是 BSP" ✓。
+        let cpus = [cpu(0, true), cpu(0, true), cpu(0, true)];
+        let mut out = [ApPlan::Disabled; 4];
+        let n = ap_plan(&cpus, 0, 3, &mut out);
+        assert_eq!(n, 3);
+        assert_eq!(out[0], ApPlan::Bsp { slot: 0 });
+        assert_eq!(out[1], ApPlan::Bsp { slot: 1 });
+        assert_eq!(out[2], ApPlan::Bsp { slot: 2 });
+    }
+
+    #[test]
+    fn a_slot_beyond_what_was_registered_is_reported_not_silently_used() {
+        // `set_smp_cpus` 与这里的口径一旦不一致，就**报出来** ✗，不要静默用越界槽位。
+        let cpus = [cpu(0, true), cpu(1, true)];
+        let mut out = [ApPlan::Disabled; 4];
+        let n = ap_plan(&cpus, 0, 1, &mut out);
+        assert_eq!(n, 2);
+        assert_eq!(out[1], ApPlan::NoSlot { slot: 1 });
+    }
+
+    #[test]
+    fn the_output_buffer_bounds_the_plan() {
+        let cpus = [cpu(0, true), cpu(1, true), cpu(2, true)];
+        let mut out = [ApPlan::Disabled; 2];
+        assert_eq!(ap_plan(&cpus, 0, 3, &mut out), 2, "不能写出缓冲区之外");
+    }
 }
