@@ -1,5 +1,10 @@
 # liftoff
 
+> **Deprecated (2026-10-02)**: liftoff is no longer developed, and BORUIX no longer supports it.
+> The UEFI boot path is unmaintained; BORUIX keeps only brxLimine (BIOS) boot. The supporting
+> tooling and docs have moved to the `liftoff/` directory of the
+> [archive](https://github.com/BRX-Boruix/archive) repository; this repository is kept for reference.
+
 BORUIX's UEFI bootloader: it loads the kernel and hands over to it following the Limine protocol.
 
 [中文](README.md)

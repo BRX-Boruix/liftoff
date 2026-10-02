@@ -1,5 +1,9 @@
 # liftoff
 
+> **已弃用（2026-10-02）**：liftoff 已停止开发，BORUIX 不再支持它。UEFI 引导链不再维护，
+> BORUIX 只保留 brxLimine（BIOS）引导。配套的工具与文档已移入
+> [archive](https://github.com/BRX-Boruix/archive) 仓库的 `liftoff/`，本仓库代码保留供参考。
+
 BORUIX 的 UEFI 引导程序：按 Limine 协议加载内核并交接给内核。
 
 [English](README.en.md)
