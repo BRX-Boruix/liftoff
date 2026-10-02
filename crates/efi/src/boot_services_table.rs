@@ -14,6 +14,9 @@ use core::ffi::c_void;
 /// `ExitBootServices` 的签名。
 pub type ExitBootServices = unsafe extern "efiapi" fn(image_handle: Handle, map_key: usize) -> Status;
 
+/// `EFI_BOOT_SERVICES.Stall`：微秒级延时。
+pub type Stall = unsafe extern "efiapi" fn(microseconds: usize) -> Status;
+
 /// `AllocatePages` 的类型参数（UEFI 规范）：任意地址分配。
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
 /// `AllocateMaxAddress`：`memory` 传入时是**允许的最高地址**，返回的页不高于它。
@@ -108,12 +111,32 @@ pub struct BootServicesTable {
     pub unload_image: *mut c_void,
     /// 退出引导服务。
     pub exit_boot_services: ExitBootServices,
+    /// 单调计数（未使用）。
+    pub get_next_monotonic_count: *mut c_void,
+    /// **微秒级延时**。
+    ///
+    /// 用于 IPI 之间**必须的等待**：INIT 之后要等约 **10 ms** 才发 SIPI ✗ ——
+    /// 太早发 AP 会错过它（表现为"发了 IPI 但 AP 不醒"，串口上什么都没有 ✗）。
+    ///
+    /// 用固件的 `Stall` 而不是忙等自旋 ✓：延时**准确**，而忙等的时长取决于 CPU 速度 ✗。
+    /// **可用性**：AP 启动发生在 `ExitBootServices` **之前**（Exit 在 `enter_kernel` 里 ✓），
+    /// 所以引导服务仍然有效 ✓。
+    pub stall: Stall,
 }
 
 #[cfg(test)]
 mod tests {
     use super::BootServicesTable;
     use core::mem::offset_of;
+
+    #[test]
+    fn the_stall_offset_matches_the_spec() {
+        // **断言完整值** ✓（本会话反复栽在"手算区间"上 ✗）。
+        // 推导：hdr(24) + 之后每个指针 8 字节；`Stall` 紧跟 `GetNextMonotonicCount`。
+        assert_eq!(offset_of!(BootServicesTable, exit_boot_services), 232);
+        assert_eq!(offset_of!(BootServicesTable, get_next_monotonic_count), 240);
+        assert_eq!(offset_of!(BootServicesTable, stall), 248);
+    }
 
     #[test]
     fn memory_and_exit_offsets_match_the_spec() {
