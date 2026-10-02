@@ -339,6 +339,119 @@ pub fn stage(
     Ok(SipiVector((base >> 12) as u8))
 }
 
+// ===================== AP 跳板汇编（S5–S7） =====================
+//
+// **这一段必须留在生产代码里** ✗：上一版它被夹在 `#[cfg(test)] mod tests` 内部，
+// 于是 UEFI 产物里根本不存在 —— 而 `cargo test` 与 UEFI 构建**双双退出 0**（假绿，见台账第 312 轮）。
+//
+// 三个已知缺陷（前两个上一版就死在这里，第三个我这次也踩了一次）：
+// 1. **语法**：上一版是 NASM 语法 ✗。`global_asm!` 用 LLVM 集成汇编器 ✓，
+//    且**在 x86 上默认 Intel 语法** ✓（与 `spinup.rs` 一致 ✓）—— 写 AT&T（`%eax`）会报
+//    "unknown token in expression" ✗。
+// 2. **语义**：实模式远跳转的操作数**恰好 6 字节**（4 偏移 + 2 选择子 ✓）。
+//    上一版写成 `dd 0` + `dd 0x18` = 8 字节 ✗，选择子会从错误位置取 ✓。
+// 3. **标签差值**：`asm_check.py` 记录过一个真实故障 —— 把标签差值写成裸标签，
+//    汇编器把它当成 **RIP 相对内存读取** ✗。所以地址一律经 `lea` 或 `add` 立即数 ✓。
+
+/// GDT 在本页内的偏移。接线方把 `spinup::build_gdt()` 拷到这里，
+/// 并把它作为 `stage()` 的 `gdt_base` ✓（**GDT 必须在低内存**：进保护模式时还没有分页 ✗）。
+pub const AP_GDT_OFFSET: usize = 0x900;
+
+/// 跳板用到的 GDT 字节数（9 个描述符，与 `build_gdt()` 一致 ✓）。
+pub const AP_GDT_BYTES: usize = 9 * 8;
+
+#[cfg(target_os = "uefi")]
+core::arch::global_asm!(
+    ".section .text",
+    ".global ap_trampoline_start",
+    ".global ap_trampoline_end",
+    ".set AP_MODE32_OFF, ap_mode32 - ap_trampoline_start",
+    ".set AP_MODE64_OFF, ap_mode64 - ap_trampoline_start",
+    ".code16",
+    "ap_trampoline_start:",
+    "    cli",
+    "    xor ebx, ebx",
+    "    mov bx, cs",
+    "    shl ebx, 4",
+    "    lgdt [ebx + 0x880]",
+    "    mov eax, cr0",
+    "    or eax, 1",
+    "    mov cr0, eax",
+    "    .byte 0x66, 0xea",
+    "    .long AP_MODE32_OFF",
+    "    .word 0x18",
+    ".code32",
+    "ap_mode32:",
+    "    mov ax, 0x20",
+    "    mov ds, ax",
+    "    mov es, ax",
+    "    mov ss, ax",
+    "    mov fs, ax",
+    "    mov gs, ax",
+    "    mov esp, [ebx + 0x818]",
+    "    mov eax, [ebx + 0x810]",
+    "    mov cr3, eax",
+    "    mov eax, cr4",
+    "    or eax, 0x20",
+    "    mov cr4, eax",
+    "    mov ecx, 0xc0000080",
+    "    rdmsr",
+    "    or eax, 0x100",
+    "    or eax, 0x800",
+    "    wrmsr",
+    "    mov eax, cr0",
+    "    or eax, 0x80000000",
+    "    mov cr0, eax",
+    "    lea eax, [ebx + AP_MODE64_OFF]",
+    "    push 0x28",
+    "    push eax",
+    "    retf",
+    ".code64",
+    "ap_mode64:",
+    "    mov ax, 0x30",
+    "    mov ds, ax",
+    "    mov es, ax",
+    "    mov ss, ax",
+    "    mov fs, ax",
+    "    mov gs, ax",
+    "    mov eax, 1",
+    "    xchg [rbx + 8], eax",
+    "    mov edi, [rbx + 20]",
+    "    mov rax, [rbx]",
+    "    add rdi, rax",
+    "1:",
+    "    mov rax, [rdi + 16]",
+    "    test rax, rax",
+    "    jnz 2f",
+    "    pause",
+    "    jmp 1b",
+    "2:",
+    "    mov rbx, cr3",
+    "    mov cr3, rbx",
+    "    mov rsp, [rdi + 8]",
+    "    push 0x30",
+    "    push rsp",
+    "    push 0x2",
+    "    push 0x28",
+    "    push rax",
+    "    iretq",
+    "ap_trampoline_end:",
+);
+
+/// 跳板字节（**只在 UEFI 目标上存在** —— 宿主测试用合成字节测 `stage()` ✓）。
+#[cfg(target_os = "uefi")]
+pub fn trampoline_bytes() -> &'static [u8] {
+    unsafe extern "C" {
+        static ap_trampoline_start: u8;
+        static ap_trampoline_end: u8;
+    }
+    // SAFETY: 两个符号由上面的 `global_asm!` 定义，且 start < end ✓。
+    let start = &raw const ap_trampoline_start as *const u8;
+    let end = &raw const ap_trampoline_end as *const u8;
+    let len = (end as usize).wrapping_sub(start as usize);
+    // SAFETY: 同一段只读代码 ✓。
+    unsafe { core::slice::from_raw_parts(start, len) }
+}
 #[cfg(test)]
 mod staging_tests {
     use super::tests::input;
