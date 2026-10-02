@@ -464,6 +464,21 @@ core::arch::global_asm!(
     ".global ap_trampoline_end",
     ".set AP_MODE32_OFF, ap_mode32 - ap_trampoline_start",
     ".set AP_MODE64_OFF, ap_mode64 - ap_trampoline_start",
+    // ---- 页内布局：**参数块基址只出现一次** ✓，各字段都相对它表达 ✓ ----
+    //
+    // 【真机缺陷】上一版把参数块里的字段写成**裸偏移**（`[rbx + 8]`）✗，而同一条汇编里
+    // `esp`/`cr3` 那两条又带了 `0x800` ✓ —— **两种口径混用** ✗。后果：`info_struct` 读成
+    // 页内偏移 20 处的垃圾 → AP 取到错误的 `MpInfo` → 三重故障 → **整机复位循环** ✗；
+    // `booted_flag` 也写到错误位置 ✗。所以这里让 `AP_FRAME` 只写一次，字段一律相对它 ✓。
+    ".set AP_FRAME, 0x800",
+    // 下面每个数字都必须等于 `ApTrampoline` 里对应字段的偏移 ✓（宿主测试钉住结构那一侧 ✓）。
+    ".set AP_F_HHDM, AP_FRAME + 0",
+    ".set AP_F_BOOTED, AP_FRAME + 8",
+    ".set AP_F_STAGE, AP_FRAME + 9",
+    ".set AP_F_CR3, AP_FRAME + 16",
+    ".set AP_F_INFO, AP_FRAME + 20",
+    ".set AP_F_STACK_LO, AP_FRAME + 24",
+    ".set AP_GDTR, AP_FRAME + 0x80",
     ".code16",
     "ap_trampoline_start:",
     "    cli",
@@ -471,8 +486,8 @@ core::arch::global_asm!(
     "    mov bx, cs",
     "    shl ebx, 4",
     // 进度标记 1：实模式已经在执行 —— 这一条被写出来就说明 **IPI 送到了、CS 也对** ✓。
-    "    mov byte ptr [ebx + 9], 1",
-    "    lgdt [ebx + 0x880]",
+    "    mov byte ptr [ebx + AP_F_STAGE], 1",
+    "    lgdt [ebx + AP_GDTR]",
     "    mov eax, cr0",
     "    or eax, 1",
     "    mov cr0, eax",
@@ -482,15 +497,15 @@ core::arch::global_asm!(
     ".code32",
     "ap_mode32:",
     // 进度标记 2：远跳进了保护模式。
-    "    mov byte ptr [ebx + 9], 2",
+    "    mov byte ptr [ebx + AP_F_STAGE], 2",
     "    mov ax, 0x20",
     "    mov ds, ax",
     "    mov es, ax",
     "    mov ss, ax",
     "    mov fs, ax",
     "    mov gs, ax",
-    "    mov esp, [ebx + 0x818]",
-    "    mov eax, [ebx + 0x810]",
+    "    mov esp, [ebx + AP_F_STACK_LO]",
+    "    mov eax, [ebx + AP_F_CR3]",
     "    mov cr3, eax",
     "    mov eax, cr4",
     "    or eax, 0x20",
@@ -504,7 +519,7 @@ core::arch::global_asm!(
     "    or eax, 0x80000000",
     "    mov cr0, eax",
     // 进度标记 3：分页已开（用的是我们自己的页表 ✓）。
-    "    mov byte ptr [ebx + 9], 3",
+    "    mov byte ptr [ebx + AP_F_STAGE], 3",
     "    lea eax, [ebx + AP_MODE64_OFF]",
     "    push 0x28",
     "    push eax",
@@ -512,7 +527,7 @@ core::arch::global_asm!(
     ".code64",
     "ap_mode64:",
     // 进度标记 4：已经在 64 位模式里执行。
-    "    mov byte ptr [ebx + 9], 4",
+    "    mov byte ptr [ebx + AP_F_STAGE], 4",
     "    mov ax, 0x30",
     "    mov ds, ax",
     "    mov es, ax",
@@ -520,11 +535,11 @@ core::arch::global_asm!(
     "    mov fs, ax",
     "    mov gs, ax",
     "    mov eax, 1",
-    "    xchg [rbx + 8], eax",
+    "    xchg [rbx + AP_F_BOOTED], eax",
     // 进度标记 5：`booted_flag` 已写，即将自旋等内核。
-    "    mov byte ptr [rbx + 9], 5",
-    "    mov edi, [rbx + 20]",
-    "    mov rax, [rbx]",
+    "    mov byte ptr [rbx + AP_F_STAGE], 5",
+    "    mov edi, [rbx + AP_F_INFO]",
+    "    mov rax, [rbx + AP_F_HHDM]",
     "    add rdi, rax",
     "1:",
     "    mov rax, [rdi + 16]",
