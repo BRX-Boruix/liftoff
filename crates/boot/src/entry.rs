@@ -2482,6 +2482,13 @@ pub unsafe fn bring_up(
     enter: impl FnOnce(u64) -> !,
 ) -> Result<(), BringUpError> {
     crate::PlatformImpl::write_byte(b'1');
+    // D3 测量：**引导计时起点**。放在这里而不是后面那个标定点，是因为"引导总耗时"
+    // 必须覆盖从 bring_up 入口开始的全部工作（发现设备、读内核、规划、拷贝、换表）。
+    // 宿主构建没有 rdtsc，用 0 占位；打印分支是目标门控的，宿主不会读到它。
+    #[cfg(target_os = "uefi")]
+    let entry_tsc = unsafe { current::features::read_tsc() };
+    #[cfg(not(target_os = "uefi"))]
+    let _entry_tsc: u64 = 0;
     // 1) 发现块设备（存储由类型自己持有，入口不需要认识 BlockIo）。
     // SAFETY: 由调用方保证引导阶段单线程、只调一次。
     let mut devices =
@@ -2663,6 +2670,19 @@ pub unsafe fn bring_up(
             report_fmt::<crate::PlatformImpl>(format_args!(
                 "[liftoff] 标定点→换表完成：{} 微秒（{} 个计数 @ {} Hz）\n",
                 micros, ticks, hz
+            ));
+        }
+    }
+    // D3 测量：**引导总耗时**（bring_up 入口 → 换表完成）。与下面那条"标定点→换表完成"
+    // 是两个不同的跨度，各自如实标注，不混为一个数。
+    #[cfg(target_os = "uefi")]
+    if let Some(hz) = tsc_hz {
+        let end = unsafe { current::features::read_tsc() };
+        let ticks = firmware_current::current::monotonic_delta(entry_tsc, end);
+        if let Some(micros) = current::features::micros_from_ticks(ticks, hz) {
+            report_fmt::<crate::PlatformImpl>(format_args!(
+                "[liftoff] 引导总耗时（bring_up 入口→换表完成）= {} 微秒\n",
+                micros
             ));
         }
     }
