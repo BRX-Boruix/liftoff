@@ -73,6 +73,85 @@ impl core::fmt::Display for ApicError {
     }
 }
 
+/// xAPIC 的 LAPIC ID 寄存器偏移。
+pub const LAPIC_ID: u32 = 0x020;
+/// xAPIC 的 ICR **低半**（写它才触发发送）。
+pub const LAPIC_ICR_LOW: u32 = 0x300;
+/// xAPIC 的 ICR **高半**（目的地在这里）。
+pub const LAPIC_ICR_HIGH: u32 = 0x310;
+/// xAPIC 的默认 MMIO 基址（MADT 未给时用）。
+pub const LAPIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
+/// x2APIC 的 ID 寄存器 MSR。
+pub const X2APIC_MSR_ID: u32 = 0x802;
+/// x2APIC 的 ICR MSR。
+pub const X2APIC_MSR_ICR: u32 = 0x830;
+
+/// LAPIC 的访问方式。**两种方式的寄存器位置与位宽都不同**，所以显式建模。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApicAccess {
+    /// xAPIC：MMIO 的两个 32 位寄存器。
+    Xapic { base: u64 },
+    /// x2APIC：一个 64 位 MSR。
+    X2apic,
+}
+
+/// 一次寄存器写入。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegisterWrite {
+    /// 写 32 位 MMIO 寄存器。
+    Mmio32 { address: u64, value: u32 },
+    /// 写 MSR。
+    Msr { index: u32, value: u64 },
+}
+
+/// ICR 的**有序**写入序列。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct IcrSequence {
+    /// 必须先做的写入。
+    pub first: RegisterWrite,
+    /// 之后要做的写入（x2APIC 只有一次）。
+    pub second: Option<RegisterWrite>,
+}
+
+/// 把 ICR 值转成**有序的写入序列**。
+///
+/// **顺序是语义的一部分，不是风格问题。** xAPIC 下 ICR 是两个 MMIO 寄存器，而
+/// **写低半（ICR0）才触发发送** —— 所以必须先写高半（ICR1，含目的地），再写低半。
+/// 反过来写的话，IPI 会带着**上一次留在 ICR1 里的目的地**发出去，即**发给错误的核**；
+/// 真机上表现为静默复位。brxLimine 正是 `ICR1` 然后 `ICR0`（`common/sys/smp.c:88-89`）。
+pub fn icr_writes(access: ApicAccess, value: u64) -> IcrSequence {
+    match access {
+        ApicAccess::Xapic { base } => IcrSequence {
+            // **先写高半**（目的地在该寄存器的 bits 24-31），因为**写低半才触发发送**。
+            first: RegisterWrite::Mmio32 {
+                address: base + LAPIC_ICR_HIGH as u64,
+                value: (value >> 32) as u32,
+            },
+            second: Some(RegisterWrite::Mmio32 {
+                address: base + LAPIC_ICR_LOW as u64,
+                value: value as u32,
+            }),
+        },
+        ApicAccess::X2apic => IcrSequence {
+            first: RegisterWrite::Msr { index: X2APIC_MSR_ICR, value },
+            second: None,
+        },
+    }
+}
+
+/// 选访问方式：固件是否已启用 x2APIC。
+///
+/// **不是"有 x2APIC 就用"**：brxLimine 的语义是「**内核**是否支持 x2APIC」—— 内核不支持时
+/// 它会把固件的 x2APIC 退回 xAPIC（`smp.c:144-153`）。内核是否支持由协议请求的标志告知，
+/// 所以这里把判断显式化成参数，而不是由本模块替内核决定。
+pub fn select_access(kernel_supports_x2apic: bool, firmware_x2apic_enabled: bool) -> ApicAccess {
+    if kernel_supports_x2apic && firmware_x2apic_enabled {
+        ApicAccess::X2apic
+    } else {
+        ApicAccess::Xapic { base: LAPIC_DEFAULT_BASE }
+    }
+}
+
 /// 构造 IPI 命令寄存器（ICR）的 64 位值。
 ///
 /// 返回值可直接写入：x2APIC 写整个 MSR；xAPIC 写低 32 位到 `+0x300`、高 32 位到 `+0x310`
@@ -177,6 +256,49 @@ mod tests {
         let all = icr_value(ApicMode::X2apic, ApicId::ALL_BUT_SELF, DeliveryMode::Init, 0, true)
             .expect("合法");
         assert_eq!((all >> ICR_X2APIC_DEST_SHIFT) & 0xFFFF_FFFF, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn xapic_writes_the_high_half_first_because_the_low_half_triggers() {
+        // **顺序是语义**：写 ICR0（低半）才触发发送。先写低半的话，IPI 会带着上一次
+        // 留在 ICR1 里的目的地发出去 —— 发给错误的核，真机上是静默复位。
+        let value = (0x12u64 << ICR_XAPIC_DEST_SHIFT) | 0x4500;
+        let seq = icr_writes(ApicAccess::Xapic { base: LAPIC_DEFAULT_BASE }, value);
+        // **这里我又写错了一次断言**（第三次同类）：xAPIC 的 ICR1 里目的地在该寄存器的
+        // **bits 24-31**，所以值应是 `0x12 << 24` 而**不是** `0x12`。
+        // 实现把目的地放在 64 位视图的 bit 56，`>> 32` 之后正好落在 ICR1 的 bit 24 —— 是对的。
+        assert_eq!(
+            seq.first,
+            RegisterWrite::Mmio32 {
+                address: LAPIC_DEFAULT_BASE + 0x310,
+                value: 0x12u32 << 24,
+            },
+            "必须先写高半 ICR1，目的地在其 bits 24-31"
+        );
+        assert_eq!(
+            seq.second,
+            Some(RegisterWrite::Mmio32 { address: LAPIC_DEFAULT_BASE + 0x300, value: 0x4500 }),
+            "再写低半 ICR0，写它才触发发送"
+        );
+    }
+
+    #[test]
+    fn x2apic_writes_the_whole_value_in_one_msr_write() {
+        let value = (0x1234_5678u64 << ICR_X2APIC_DEST_SHIFT) | 0x4500;
+        let seq = icr_writes(ApicAccess::X2apic, value);
+        assert_eq!(seq.first, RegisterWrite::Msr { index: X2APIC_MSR_ICR, value });
+        assert_eq!(seq.second, None, "x2APIC 只需一次写入");
+    }
+
+    #[test]
+    fn the_access_mode_follows_the_kernel_not_the_firmware() {
+        // 固件开了 x2APIC 但**内核不支持** -> 必须用 xAPIC（brxLimine 会把固件的
+        // x2APIC 退回 xAPIC）。反过来，内核支持且固件已开 -> 用 x2APIC。
+        assert_eq!(select_access(false, true), ApicAccess::Xapic { base: LAPIC_DEFAULT_BASE });
+        assert_eq!(select_access(false, false), ApicAccess::Xapic { base: LAPIC_DEFAULT_BASE });
+        assert_eq!(select_access(true, true), ApicAccess::X2apic);
+        // 内核支持但固件没开 -> **不擅自打开**：那需要写 MSR 0x1B，属独立决定（S4）。
+        assert_eq!(select_access(true, false), ApicAccess::Xapic { base: LAPIC_DEFAULT_BASE });
     }
 
     #[test]
