@@ -31,7 +31,16 @@ pub struct MpInfo {
     pub processor_id: u32,
     /// 本地 APIC 标识。
     pub lapic_id: u32,
-    /// 保留。
+    /// **不是"保留"**：AP 跳板在跳进内核入口之前会把它当**栈顶**读
+    /// （brxLimine `smp_trampoline.asm_x86:215` 的 `mov rsp, [rdi + 8]`）。
+    ///
+    /// **由内核填，不是引导器。** 参考实现里引导器**只写** `processor_id` 与 `lapic_id`
+    /// （`common/sys/smp.c:241-242`），`reserved` 留给**内核**在写 `goto_address` 的同时
+    /// 设成该 AP 的栈。**引导器若擅自填它，会覆盖内核的安排。**
+    ///
+    /// 名字来自协议头（那里确实叫 `reserved`），但语义不是保留 —— 这一点我在会话里**差点搞错**
+    /// （见台账第 304 轮）：我只读了"跳板读它"就断言"引导器该写它"，读参考实现写字段的那几行
+    /// 才纠正过来。**名字不可信时以行为为准。**
     pub reserved: u64,
     /// AP 入口（内核填写；空表示未启动）。
     pub goto_address: Option<GotoAddress>,
