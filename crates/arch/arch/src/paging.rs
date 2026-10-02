@@ -82,6 +82,11 @@ pub enum MapError {
     TableNotAccessible,
     /// 参数合法，但实现不支持该页粒度。
     UnsupportedGranularity,
+    /// 该地址**没有映射** —— 对未映射的区间改权限是无意义的请求 ✓。
+    ///
+    /// **必须报错，不能假装成功** ✗：静默返回成功会让调用方以为"权限已设为只读"，
+    /// 而那段地址根本不存在 ✗。
+    Unmapped,
 }
 
 impl core::fmt::Display for MapError {
@@ -95,6 +100,7 @@ impl core::fmt::Display for MapError {
             Self::OutOfMemory => "页帧分配耗尽",
             Self::TableNotAccessible => "页表帧不在直接映射内",
             Self::UnsupportedGranularity => "实现不支持该页粒度",
+            Self::Unmapped => "该地址未映射",
         };
         f.write_str(text)
     }
@@ -208,6 +214,21 @@ pub trait PageTable {
     /// 默认返回 `UnsupportedGranularity`：实现方按自身能力决定是否支持。
     /// **报错是安全的默认**（不像「返回 `None`」会把「没实现」与「未映射」混为
     /// 一谈）—— 调用方拿不到成功就会知道这件事没做成。
+    /// 修改 `[virt, virt+len)` 的**权限**，**不动物理地址** ✓。
+    ///
+    /// **为什么需要它**：`map_range` 只能**新建**映射 —— 要"把一段已有的内存改成
+    /// 只读/可执行"就得重新映射一遍，而重新映射会**再分配页表帧**，还可能改变粒度 ✗。
+    ///
+    /// **落在大页里的区间一律报错，不静默拆分** ✗（与 `unmap` 同一约定 ✓）：
+    /// 静默拆分会让一次"改权限"顺手改掉**别的地址**的映射粒度，而调用方以为只改了权限 ✗。
+    ///
+    /// **未映射的区间报 `Unmapped`** ✗，不静默成功 ✓。
+    ///
+    /// 默认返回 `UnsupportedGranularity`：实现方按自身能力决定是否支持 ✓。
+    fn protect(&mut self, _virt: VirtAddr, _len: u64, _flags: PageFlags) -> Result<(), MapError> {
+        Err(MapError::UnsupportedGranularity)
+    }
+
     fn unmap(&mut self, _virt: VirtAddr, _len: u64) -> Result<(), MapError> {
         Err(MapError::UnsupportedGranularity)
     }

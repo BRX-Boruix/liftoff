@@ -203,6 +203,46 @@ impl<A: FrameAllocator> X86PageTable<A> {
     /// **落在更大粒度映射内时报错**，不擅自拆分：拆分是「建立更细映射」的副作用，
     /// 让 `unmap` 顺手做它会把「解除」变成有分配行为的操作，失败语义立刻复杂化。
     /// 调用方若确实要解除大页区间，先建一条更细的映射（触发拆分）再调本方法。
+    /// 改**一个 4 KiB 页**的权限位，**地址位原样保留** ✓ —— 这是本函数唯一的实质动作。
+    ///
+    /// 落在大页里、或压根没映射，都**报错而不是拆分/假装成功** ✗（与 `unmap` 同一约定 ✓）。
+    fn protect_page(&mut self, v: u64, bits: u64) -> Result<(), MapError> {
+        let pml4 = self.read_entry(self.root, (v >> 39) & 0x1FF)?;
+        if pml4 & PTE_PRESENT == 0 {
+            return Err(MapError::Unmapped);
+        }
+        let pdpt = self.read_entry(
+            PhysFrame::containing(PhysAddr::new(pml4 & FRAME_ADDR_MASK)),
+            (v >> 30) & 0x1FF,
+        )?;
+        if pdpt & PTE_PRESENT == 0 {
+            return Err(MapError::Unmapped);
+        }
+        if pdpt & PTE_HUGE != 0 {
+            // 1 GiB 大页：**拒绝而不是拆分** ✓。
+            return Err(MapError::UnsupportedGranularity);
+        }
+        let pd = self.read_entry(
+            PhysFrame::containing(PhysAddr::new(pdpt & FRAME_ADDR_MASK)),
+            (v >> 21) & 0x1FF,
+        )?;
+        if pd & PTE_PRESENT == 0 {
+            return Err(MapError::Unmapped);
+        }
+        if pd & PTE_HUGE != 0 {
+            // 2 MiB 大页：**拒绝而不是拆分** ✓。
+            return Err(MapError::UnsupportedGranularity);
+        }
+        let pt_frame = PhysFrame::containing(PhysAddr::new(pd & FRAME_ADDR_MASK));
+        let index = (v >> 12) & 0x1FF;
+        let pte = self.read_entry(pt_frame, index)?;
+        if pte & PTE_PRESENT == 0 {
+            return Err(MapError::Unmapped);
+        }
+        // **只换权限位**：地址位从原项里取回 ✓ —— 写错这里就是"改权限顺手改掉了物理地址" ✗。
+        self.write_entry(pt_frame, index, (pte & FRAME_ADDR_MASK) | bits)
+    }
+
     fn unmap_page(&mut self, v: u64) -> Result<(), MapError> {
         let pml4 = self.read_entry(self.root, (v >> 39) & 0x1FF)?;
         if pml4 & PTE_PRESENT == 0 {
@@ -296,6 +336,28 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
             let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF, None)?;
             let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF, Some(HUGE_PAGE_SIZE))?;
             self.write_entry(pd, (v >> 21) & 0x1FF, (p & LARGE_ADDR_MASK) | pte_flags | PTE_HUGE)?;
+        }
+        Ok(())
+    }
+
+    fn protect(&mut self, virt: VirtAddr, len: u64, flags: PageFlags) -> Result<(), MapError> {
+        // 与 `unmap` 同一套校验（同一份语义：按 4 KiB 粒度处理一个区间）✓。
+        if len == 0 {
+            return Err(MapError::Empty);
+        }
+        let start = virt.as_u64();
+        if start % PAGE_SIZE != 0 {
+            return Err(MapError::MisalignedVirt);
+        }
+        if len % PAGE_SIZE != 0 {
+            return Err(MapError::MisalignedLength);
+        }
+        let end = start.checked_add(len).ok_or(MapError::Overflow)?;
+        let bits = pte_bits(flags);
+        let mut v = start;
+        while v < end {
+            self.protect_page(v, bits)?;
+            v += PAGE_SIZE;
         }
         Ok(())
     }
@@ -490,6 +552,71 @@ mod tests {
         assert_ne!(pdpt & 1, 0, "PDPT 项应存在");
         let pd_frame = PhysFrame::containing(PhysAddr::new(pdpt & 0x000F_FFFF_FFFF_F000));
         read_entry(pt, pd_frame, (v >> 21) & 0x1FF)
+    }
+
+    #[test]
+    fn protect_changes_only_the_permission_bits_and_keeps_the_physical_address() {
+        let (mut alloc, dm) = harness(16);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        let v = VirtAddr::new(0x1000_0000);
+        pt.map_range_pages(v, PhysAddr::new(0x2000_0000), PAGE_SIZE, PageFlags::present())
+            .expect("映射成功");
+        let (before_phys, before_flags) = pt.translate(v).expect("已映射");
+        assert!(!before_flags.is_writable(), "初始不可写");
+        assert!(!before_flags.is_executable(), "初始不可执行");
+
+        pt.protect(v, PAGE_SIZE, PageFlags::present().with(PageFlags::writable()).with(PageFlags::executable()))
+            .expect("改权限成功");
+        let (after_phys, after_flags) = pt.translate(v).expect("仍在映射中");
+        assert_eq!(after_phys.as_u64(), before_phys.as_u64(), "**物理地址绝不能变**");
+        assert!(after_flags.is_writable(), "现在应当可写");
+        assert!(after_flags.is_executable(), "现在应当可执行");
+
+        // 反向：权限必须**收得回来**（只能放宽不能收紧的实现在安全上等于没改）。
+        pt.protect(v, PAGE_SIZE, PageFlags::present()).expect("改权限成功");
+        let (again_phys, again_flags) = pt.translate(v).expect("仍在映射中");
+        assert_eq!(again_phys.as_u64(), before_phys.as_u64(), "物理地址仍然不变");
+        assert!(!again_flags.is_writable(), "权限要能收回");
+        assert!(!again_flags.is_executable(), "权限要能收回");
+    }
+
+    #[test]
+    fn protect_rejects_a_range_inside_a_large_page_instead_of_splitting_it() {
+        let (mut alloc, dm) = harness(16);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        let v = VirtAddr::new(0x1000_0000);
+        pt.map_range(v, PhysAddr::new(0x2000_0000), LARGE_PAGE_SIZE, PageFlags::present())
+            .expect("2 MiB 映射");
+        let before = pt.allocator.allocated();
+        assert_eq!(
+            pt.protect(v, PAGE_SIZE, PageFlags::present().with(PageFlags::writable())),
+            Err(MapError::UnsupportedGranularity),
+            "**拒绝而不是静默拆分**"
+        );
+        assert_eq!(pt.allocator.allocated(), before, "被拒绝时**不得分配任何页表帧**");
+    }
+
+    #[test]
+    fn protect_reports_an_unmapped_range_instead_of_pretending() {
+        let (mut alloc, dm) = harness(16);
+        let root = alloc.allocate_zeroed().expect("根表帧");
+        let mut pt = X86PageTable::new(root, dm, alloc);
+        assert_eq!(
+            pt.protect(VirtAddr::new(0x4000_0000), PAGE_SIZE, PageFlags::present()),
+            Err(MapError::Unmapped),
+            "未映射就是未映射，不能假装改成了"
+        );
+        assert_eq!(pt.protect(VirtAddr::new(0), 0, PageFlags::present()), Err(MapError::Empty));
+        assert_eq!(
+            pt.protect(VirtAddr::new(0x1001), PAGE_SIZE, PageFlags::present()),
+            Err(MapError::MisalignedVirt)
+        );
+        assert_eq!(
+            pt.protect(VirtAddr::new(0), PAGE_SIZE + 1, PageFlags::present()),
+            Err(MapError::MisalignedLength)
+        );
     }
 
     #[test]
