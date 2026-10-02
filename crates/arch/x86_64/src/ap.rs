@@ -255,6 +255,17 @@ pub const AP_FRAME_OFFSET: usize = 0x800;
 /// GDTR 的 6 字节描述符在页内的**固定偏移**（紧跟在参数块之后）。
 pub const AP_GDTR_OFFSET: usize = 0x880;
 
+/// GDTR 描述符本身的字节数（limit(2) + base(4)）。
+pub const AP_GDTR_BYTES: usize = 6;
+
+/// 低页基址的**下界**。
+///
+/// **为什么不是 0**：引导器的页表**有意不映射第 0 页**（`bring_up` 里显式
+/// `unmap(0, 0x1000)`，让空指针解引用变成故障而不是静默读写物理 0）✓。
+/// 跳板一旦落在第 0 页，AP 在**打开分页的那一刻**取指就会 `#PF` ✗ ——
+/// 症状又是"AP 不醒、串口上什么都没有"，最难查的那种 ✗。
+pub const AP_LOW_FLOOR: u64 = 0x1000;
+
 /// AP 唤醒位置（SIPI 向量）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SipiVector(pub u8);
@@ -270,6 +281,12 @@ pub enum StageError {
     BufferTooSmall,
     /// 跳板本身大于参数块偏移 —— 会**覆盖参数块** ✗（编译期就该发现，运行期再守一次）。
     TrampolineTooLarge,
+    /// 基址落在**未映射**的低端（第 0 页）—— AP 一开分页就 `#PF` ✗。
+    BelowMappedFloor,
+    /// GDT 为空 —— `lgdt` 之后没有任何可用描述符，装载段寄存器立即 `#GP` ✗。
+    GdtEmpty,
+    /// GDT 与本页布局冲突（压住 GDTR 描述符，或越出本页）。
+    GdtDoesNotFit,
 }
 
 impl core::fmt::Display for StageError {
@@ -279,31 +296,49 @@ impl core::fmt::Display for StageError {
             Self::AboveRealModeLimit => f.write_str("AP 跳板基址加一页越过 1 MiB（实模式取不到）"),
             Self::BufferTooSmall => f.write_str("目标缓冲放不下一页"),
             Self::TrampolineTooLarge => f.write_str("跳板代码大于参数块偏移，会覆盖参数块"),
+            Self::BelowMappedFloor => f.write_str("AP 跳板基址落在未映射的第 0 页"),
+            Self::GdtEmpty => f.write_str("AP 跳板的 GDT 为空"),
+            Self::GdtDoesNotFit => f.write_str("AP 跳板的 GDT 与页内布局冲突"),
         }
     }
 }
 
-/// 把跳板搬进**低内存页**并写好参数块与 GDTR 描述符，返回 **SIPI 向量**。
+/// 把跳板代码、GDT 与 GDTR 描述符写进**低内存页** —— 每个低页**只做一次** ✓，
+/// 返回 **SIPI 向量**。
 ///
 /// **纯逻辑 + 字节操作，宿主可测** ✓ —— 跳板字节由调用方给（真机从链接期符号取 ✓）。
+///
+/// **本函数是页内布局的唯一所有者** ✓（S13/S15）：跳板代码、GDT、GDTR 描述符全在这一页里，
+/// 都由这里写，调用方**不再自己往页里写任何东西** ✗。
+///
+/// 【缺陷修正】上一版把 GDT 交给调用方写、而搬运函数又 `page.fill(0)` **整页清零** ✗ ——
+/// 于是调用方刚写好的 GDT 被**清零** ✗。AP 拿到一张全零的 GDT，`lgdt` 之后装载
+/// CS/DS 立即 `#GP` → 三重故障 ✗，而串口上只会看到"AP 不醒" ✗。
+/// "两边各写一半"的分工本身就是缺陷，所以这里把所有权收回来 ✓。
+///
+/// **绝不在 AP 已启动之后再调** ✗：AP 在 `goto_address` 被内核设置之前**一直停在这一页
+/// 的代码里**自旋（见本文件末尾的 `ap_mode64`）✓ —— 再清零或重写代码，已停下的 AP 会
+/// **执行到 0** ✗。所以每个 AP 只调 `stage_frame` ✓。
 ///
 /// 页内布局（**两侧共用同一组常量** ✓）：
 ///
 /// ```text
 /// +0x000  跳板代码（实模式入口，必须落在页首 —— SIPI 的 cs:ip 指向页首）
-/// +0x800  参数块（ApTrampoline）
+/// +0x800  参数块（ApTrampoline，40 字节）
 /// +0x880  GDTR 的 6 字节描述符
+/// +0x900  GDT 副本（`spinup::build_gdt()`）
 /// ```
-pub fn stage(
+pub fn install(
     trampoline: &[u8],
-    frame: &ApTrampoline,
-    gdt_base: u32,
-    gdt_limit: u16,
+    gdt: &[u64],
     base: u64,
     low: &mut [u8],
 ) -> Result<SipiVector, StageError> {
     if base % AP_PAGE_SIZE as u64 != 0 {
         return Err(StageError::BaseUnaligned);
+    }
+    if base < AP_LOW_FLOOR {
+        return Err(StageError::BelowMappedFloor);
     }
     if base + AP_PAGE_SIZE as u64 > AP_LOW_LIMIT {
         return Err(StageError::AboveRealModeLimit);
@@ -314,14 +349,54 @@ pub fn stage(
     if trampoline.len() > AP_FRAME_OFFSET {
         return Err(StageError::TrampolineTooLarge);
     }
+    if gdt.is_empty() {
+        return Err(StageError::GdtEmpty);
+    }
+    let gdt_bytes = gdt.len() * 8;
+    // GDT 必须落在 GDTR 描述符**之后**，且不越出本页 ✓。
+    if AP_GDTR_OFFSET + AP_GDTR_BYTES > AP_GDT_OFFSET || AP_GDT_OFFSET + gdt_bytes > AP_PAGE_SIZE {
+        return Err(StageError::GdtDoesNotFit);
+    }
     let page = &mut low[..AP_PAGE_SIZE];
+    // 整页清零**只在这里**发生 ✓ —— 此时还没有任何 AP 停在页里 ✓。
     page.fill(0);
     page[..trampoline.len()].copy_from_slice(trampoline);
-    // 参数块：按 `ApTrampoline` 的布局写。用 `to_le_bytes` 逐字段写，
-    // **不依赖结构体在内存里的表示**（避免把 Rust 布局当协议 ✗）。
-    let frame_at = AP_FRAME_OFFSET;
+    for (index, word) in gdt.iter().enumerate() {
+        let at = AP_GDT_OFFSET + index * 8;
+        page[at..at + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    // GDTR 描述符：limit(2) + base(4)。基址是**物理**地址 —— `lgdt` 在实模式下执行，
+    // 那时还没有分页 ✓（`cs<<4` 得到的也是物理地址 ✓）。
+    // 已校验 `base < 1 MiB`，故 `base + 0x900` 必然放进 u32（S19：先论证再截断）。
+    let gdt_base = (base + AP_GDT_OFFSET as u64) as u32;
+    let gdt_limit = (gdt_bytes - 1) as u16;
+    page[AP_GDTR_OFFSET..AP_GDTR_OFFSET + 2].copy_from_slice(&gdt_limit.to_le_bytes());
+    page[AP_GDTR_OFFSET + 2..AP_GDTR_OFFSET + AP_GDTR_BYTES]
+        .copy_from_slice(&gdt_base.to_le_bytes());
+    // SIPI 向量 = 基址 >> 12（必须落在低 8 位）。
+    Ok(SipiVector((base >> 12) as u8))
+}
+
+/// 写**单个 AP** 的参数块 —— 每启动一个 AP 调一次 ✓。
+///
+/// **只动 `[AP_FRAME_OFFSET, AP_FRAME_OFFSET + 40)` 这 40 字节** ✗，代码与 GDT
+/// **一个字节都不碰** ✓ —— 上一个 AP 很可能正停在这一页里自旋 ✓。
+///
+/// 先整块清零再逐字段写：结构体里有**显式 pad**（`pad0`/`pad1`），不先清零就会留着
+/// **上一个 AP 的残留值** ✗。
+///
+/// 返回 `()` 而不是向量：向量由 `install` 决定，每个 AP 用的是**同一个** ✓
+/// （AP 都从页首醒来，身份由参数块里的 `info_struct` 区分 ✓）。
+pub fn stage_frame(frame: &ApTrampoline, low: &mut [u8]) -> Result<(), StageError> {
+    if low.len() < AP_PAGE_SIZE {
+        return Err(StageError::BufferTooSmall);
+    }
+    let end = AP_FRAME_OFFSET + core::mem::size_of::<ApTrampoline>();
+    let page = &mut low[..AP_PAGE_SIZE];
+    page[AP_FRAME_OFFSET..end].fill(0);
+    // 逐字段写：**不依赖结构体在内存里的表示**（避免把 Rust 布局当协议 ✗）。
     let mut put = |off: usize, bytes: &[u8]| {
-        let at = frame_at + off;
+        let at = AP_FRAME_OFFSET + off;
         page[at..at + bytes.len()].copy_from_slice(bytes);
     };
     put(core::mem::offset_of!(ApTrampoline, hhdm), &frame.hhdm.to_le_bytes());
@@ -332,11 +407,7 @@ pub fn stage(
     put(core::mem::offset_of!(ApTrampoline, temp_stack_lo), &frame.temp_stack_lo.to_le_bytes());
     put(core::mem::offset_of!(ApTrampoline, temp_stack_hi), &frame.temp_stack_hi.to_le_bytes());
     put(core::mem::offset_of!(ApTrampoline, gdtr), &frame.gdtr.to_le_bytes());
-    // GDTR 描述符：limit(2) + base(4)。
-    page[AP_GDTR_OFFSET..AP_GDTR_OFFSET + 2].copy_from_slice(&gdt_limit.to_le_bytes());
-    page[AP_GDTR_OFFSET + 2..AP_GDTR_OFFSET + 6].copy_from_slice(&gdt_base.to_le_bytes());
-    // SIPI 向量 = 基址 >> 12（必须落在低 8 位）。
-    Ok(SipiVector((base >> 12) as u8))
+    Ok(())
 }
 
 // ===================== AP 跳板汇编（S5–S7） =====================
@@ -353,12 +424,16 @@ pub fn stage(
 // 3. **标签差值**：`asm_check.py` 记录过一个真实故障 —— 把标签差值写成裸标签，
 //    汇编器把它当成 **RIP 相对内存读取** ✗。所以地址一律经 `lea` 或 `add` 立即数 ✓。
 
-/// GDT 在本页内的偏移。接线方把 `spinup::build_gdt()` 拷到这里，
-/// 并把它作为 `stage()` 的 `gdt_base` ✓（**GDT 必须在低内存**：进保护模式时还没有分页 ✗）。
+/// GDT 在本页内的偏移。
+///
+/// **GDT 必须在低内存**：进保护模式时还没有分页 ✗。它由 `install` 写 ——
+/// 页内布局只有一个所有者 ✓（S13/S15），不再由调用方各写一半 ✗。
 pub const AP_GDT_OFFSET: usize = 0x900;
 
-/// 跳板用到的 GDT 字节数（9 个描述符，与 `build_gdt()` 一致 ✓）。
-pub const AP_GDT_BYTES: usize = 9 * 8;
+// 页内布局的**编译期**不变量 ✓：改常量时立刻失败，而不是等到真机上"AP 不醒" ✗。
+const _: () = assert!(AP_FRAME_OFFSET + core::mem::size_of::<ApTrampoline>() <= AP_GDTR_OFFSET);
+const _: () = assert!(AP_GDTR_OFFSET + AP_GDTR_BYTES <= AP_GDT_OFFSET);
+const _: () = assert!(AP_GDT_OFFSET + 9 * 8 <= AP_PAGE_SIZE);
 
 #[cfg(target_os = "uefi")]
 core::arch::global_asm!(
@@ -438,7 +513,7 @@ core::arch::global_asm!(
     "ap_trampoline_end:",
 );
 
-/// 跳板字节（**只在 UEFI 目标上存在** —— 宿主测试用合成字节测 `stage()` ✓）。
+/// 跳板字节（**只在 UEFI 目标上存在** —— 宿主测试用合成字节测 `install()` ✓）。
 #[cfg(target_os = "uefi")]
 pub fn trampoline_bytes() -> &'static [u8] {
     unsafe extern "C" {
@@ -455,78 +530,209 @@ pub fn trampoline_bytes() -> &'static [u8] {
 #[cfg(test)]
 mod staging_tests {
     use super::tests::input;
-    use super::{AP_FRAME_OFFSET, AP_GDTR_OFFSET, AP_PAGE_SIZE, ApTrampoline, StageError, prepare, stage};
+    use super::{
+        AP_FRAME_OFFSET, AP_GDT_OFFSET, AP_GDTR_BYTES, AP_GDTR_OFFSET, AP_LOW_FLOOR, AP_PAGE_SIZE,
+        ApTrampoline, StageError, install, prepare, stage_frame,
+    };
+
+    /// 参数块的**期望字节**。
+    ///
+    /// **独立写一遍**，不调用被测代码 —— 否则测试只是把实现抄了一遍，永远为真 ✗。
+    fn expected_frame_bytes(f: &ApTrampoline) -> [u8; 40] {
+        let mut out = [0u8; 40];
+        out[core::mem::offset_of!(ApTrampoline, hhdm)..][..8]
+            .copy_from_slice(&f.hhdm.to_le_bytes());
+        out[core::mem::offset_of!(ApTrampoline, booted_flag)] = f.booted_flag;
+        out[core::mem::offset_of!(ApTrampoline, target_mode)..][..4]
+            .copy_from_slice(&f.target_mode.to_le_bytes());
+        out[core::mem::offset_of!(ApTrampoline, cr3)..][..4]
+            .copy_from_slice(&f.cr3.to_le_bytes());
+        out[core::mem::offset_of!(ApTrampoline, info_struct)..][..4]
+            .copy_from_slice(&f.info_struct.to_le_bytes());
+        out[core::mem::offset_of!(ApTrampoline, temp_stack_lo)..][..4]
+            .copy_from_slice(&f.temp_stack_lo.to_le_bytes());
+        out[core::mem::offset_of!(ApTrampoline, temp_stack_hi)..][..4]
+            .copy_from_slice(&f.temp_stack_hi.to_le_bytes());
+        out[core::mem::offset_of!(ApTrampoline, gdtr)..][..4]
+            .copy_from_slice(&f.gdtr.to_le_bytes());
+        out
+    }
+
+    /// 9 个描述符，每个都非零且互不相同 —— 这样"某个描述符没被写"会被看出来 ✓。
+    fn gdt() -> [u64; 9] {
+        let mut out = [0u64; 9];
+        for (index, word) in out.iter_mut().enumerate() {
+            *word = 0x1000_0000_0000_0000 | ((index as u64) << 8) | 0x92;
+        }
+        out
+    }
 
     #[test]
-    fn staging_puts_the_trampoline_at_the_page_start_and_the_frame_at_its_fixed_offset() {
+    fn install_puts_the_trampoline_at_the_page_start_and_stage_frame_at_its_fixed_offset() {
         // **SIPI 只给向量**：AP 从 `vector<<12` 的**页首**开始执行 ✓，而参数块必须能被
         // 按**固定偏移**找到 ✓ —— 所以两者在同一页里的位置都是契约。
         let trampoline = [0xAAu8; 16];
         let frame = prepare(&input()).expect("合法");
         let mut low = std::vec![0u8; AP_PAGE_SIZE];
-        let vector = stage(&trampoline, &frame, 0x1234_5000, 0x2F, 0x8_0000, &mut low)
-            .expect("应当成功");
+        let vector = install(&trampoline, &gdt(), 0x8_0000, &mut low).expect("应当成功");
         assert_eq!(vector.0, 0x80, "SIPI 向量 = 基址 >> 12");
         assert_eq!(&low[..16], &trampoline[..], "跳板必须在**页首**");
-        let at = AP_FRAME_OFFSET + core::mem::offset_of!(ApTrampoline, hhdm);
+        stage_frame(&frame, &mut low).expect("应当成功");
         assert_eq!(
-            u64::from_le_bytes(low[at..at + 8].try_into().expect("8 字节")),
-            frame.hhdm,
-            "HHDM 必须写在固定偏移处"
+            &low[AP_FRAME_OFFSET..AP_FRAME_OFFSET + 40],
+            &expected_frame_bytes(&frame)[..],
+            "参数块必须**逐字节**等于期望值（含显式 pad）"
         );
-        let at = AP_FRAME_OFFSET + core::mem::offset_of!(ApTrampoline, cr3);
-        assert_eq!(u32::from_le_bytes(low[at..at + 4].try_into().expect("4 字节")), 0x1000);
         assert_eq!(low[AP_FRAME_OFFSET + 8], 0, "booted_flag 必须从 0 开始");
-        // GDTR 描述符：limit(2) + base(4)。
-        assert_eq!(u16::from_le_bytes(low[AP_GDTR_OFFSET..AP_GDTR_OFFSET + 2].try_into().unwrap()), 0x2F);
+    }
+
+    #[test]
+    fn install_writes_the_gdt_and_a_descriptor_that_points_at_it() {
+        // 【回归】上一版把 GDT 交给调用方写、而搬运函数**整页清零** ✗ ——
+        // GDT 被清零，AP 装载段寄存器立即 #GP → 三重故障，症状是"AP 不醒" ✗。
+        // 所以这里同时钉两件事：**GDT 的字节**在，且 **GDTR 的基址**指向它 ✓。
+        let gdt = gdt();
+        let mut low = std::vec![0u8; AP_PAGE_SIZE];
+        install(&[0x90u8; 8], &gdt, 0x8_0000, &mut low).expect("应当成功");
+        for (index, word) in gdt.iter().enumerate() {
+            let at = AP_GDT_OFFSET + index * 8;
+            assert_eq!(
+                u64::from_le_bytes(low[at..at + 8].try_into().expect("8 字节")),
+                *word,
+                "第 {index} 个描述符必须原样落在页内"
+            );
+        }
+        // GDTR：limit = 字节数 - 1，base = 物理基址 + GDT 偏移。
         assert_eq!(
-            u32::from_le_bytes(low[AP_GDTR_OFFSET + 2..AP_GDTR_OFFSET + 6].try_into().unwrap()),
-            0x1234_5000
+            u16::from_le_bytes(low[AP_GDTR_OFFSET..AP_GDTR_OFFSET + 2].try_into().unwrap()),
+            (gdt.len() * 8 - 1) as u16
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                low[AP_GDTR_OFFSET + 2..AP_GDTR_OFFSET + AP_GDTR_BYTES]
+                    .try_into()
+                    .unwrap()
+            ),
+            (0x8_0000 + AP_GDT_OFFSET) as u32,
+            "GDTR 的基址必须指向**本页里的 GDT 副本**"
         );
     }
 
     #[test]
-    fn staging_refuses_an_address_the_ap_could_not_reach_in_real_mode() {
+    fn stage_frame_touches_only_the_parameter_block() {
+        // 【回归】AP 启动后会**停在这一页的代码里**自旋（直到内核设置 goto_address）✓。
+        // 于是给**下一个** AP 写参数块时，绝不能碰代码或 GDT ✗ —— 否则上一个 AP
+        // 会执行到 0 ✗。这个测试就是钉这条不变量。
+        let trampoline = [0xCCu8; 32];
+        let gdt = gdt();
+        let mut low = std::vec![0u8; AP_PAGE_SIZE];
+        install(&trampoline, &gdt, 0x8_0000, &mut low).expect("应当成功");
+        let code_before = low[..AP_FRAME_OFFSET].to_vec();
+        let gdt_before = low[AP_GDT_OFFSET..AP_GDT_OFFSET + gdt.len() * 8].to_vec();
+
+        let mut second = input();
+        second.info_struct = 0x9_0000;
+        let frame = prepare(&second).expect("合法");
+        stage_frame(&frame, &mut low).expect("应当成功");
+
+        assert_eq!(low[..AP_FRAME_OFFSET].to_vec(), code_before, "代码一个字节都不能动");
+        assert_eq!(
+            low[AP_GDT_OFFSET..AP_GDT_OFFSET + gdt.len() * 8].to_vec(),
+            gdt_before,
+            "GDT 一个字节都不能动"
+        );
+        assert_eq!(&low[AP_FRAME_OFFSET..AP_FRAME_OFFSET + 40], &expected_frame_bytes(&frame)[..]);
+    }
+
+    #[test]
+    fn stage_frame_leaves_no_stale_bytes_from_the_previous_ap() {
+        // 结构体里有**显式 pad**：不先清零就会留着上一个 AP 的值 ✗。
+        let mut low = std::vec![0u8; AP_PAGE_SIZE];
+        low[AP_FRAME_OFFSET..AP_FRAME_OFFSET + 40].fill(0xFF);
+        let frame = prepare(&input()).expect("合法");
+        stage_frame(&frame, &mut low).expect("应当成功");
+        assert_eq!(
+            &low[AP_FRAME_OFFSET..AP_FRAME_OFFSET + 40],
+            &expected_frame_bytes(&frame)[..],
+            "整块 40 字节都必须被重写，不留 0xFF"
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_base_in_the_unmapped_first_page() {
+        // 第 0 页**有意不映射**（空指针解引用要变成故障）✓ —— 跳板放那里，
+        // AP 一开分页就 #PF ✗。
+        let mut low = std::vec![0u8; AP_PAGE_SIZE];
+        assert_eq!(
+            install(&[0u8; 8], &gdt(), 0, &mut low),
+            Err(StageError::BelowMappedFloor)
+        );
+        assert!(
+            install(&[0u8; 8], &gdt(), AP_LOW_FLOOR, &mut low).is_ok(),
+            "恰好在下界上必须接受"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_address_the_ap_could_not_reach_in_real_mode() {
         // 实模式只有 20 位寻址：基址 + 一页越过 1 MiB，AP 取不到第一条指令 ✗
         // —— 而症状是"发了 IPI 但 AP 不醒、串口上什么都没有"，最难查的那种 ✗。
-        let trampoline = [0u8; 16];
-        let frame = prepare(&input()).expect("合法");
+        let gdt = gdt();
         let mut low = std::vec![0u8; AP_PAGE_SIZE];
-        // **这里我又把边界算错了**：一页结束在**正好 1 MiB** 是合法的 ✓ ——
+        // **这里我又把边界算错过一次**：一页结束在**正好 1 MiB** 是合法的 ✓ ——
         // 它的最后一个字节是 `0xFFFFF`，仍在 20 位寻址范围内 ✓。
         // 所以 `0xF_F000` 必须**接受**，而起点在 1 MiB 的才拒绝。
         assert!(
-            stage(&trampoline, &frame, 0, 0, 0xF_F000, &mut low).is_ok(),
+            install(&[0u8; 8], &gdt, 0xF_F000, &mut low).is_ok(),
             "结束在正好 1 MiB 是合法的：最后一个字节是 0xFFFFF"
         );
         assert_eq!(
-            stage(&trampoline, &frame, 0, 0, 0x10_0000, &mut low),
+            install(&[0u8; 8], &gdt, 0x10_0000, &mut low),
             Err(StageError::AboveRealModeLimit),
             "起点在 1 MiB 就已经取不到"
         );
-        assert_eq!(stage(&trampoline, &frame, 0, 0, 0x8_0001, &mut low), Err(StageError::BaseUnaligned));
+        assert_eq!(
+            install(&[0u8; 8], &gdt, 0x8_0001, &mut low),
+            Err(StageError::BaseUnaligned)
+        );
     }
 
     #[test]
-    fn staging_refuses_a_trampoline_that_would_overflow_into_the_frame() {
+    fn install_refuses_a_trampoline_that_would_overflow_into_the_frame() {
         // 跳板若大于参数块偏移，就会**覆盖参数块** ✗ —— 编译期由下面的断言先拦住，
         // 运行期这里再守一次（链接器布局是外部输入，不能只靠"应该不会"✓）。
         let too_big = std::vec![0u8; AP_FRAME_OFFSET + 1];
-        let frame = prepare(&input()).expect("合法");
         let mut low = std::vec![0u8; AP_PAGE_SIZE];
         assert_eq!(
-            stage(&too_big, &frame, 0, 0, 0x8_0000, &mut low),
+            install(&too_big, &gdt(), 0x8_0000, &mut low),
             Err(StageError::TrampolineTooLarge)
         );
         let mut tiny = std::vec![0u8; 8];
-        assert_eq!(stage(&[], &frame, 0, 0, 0x8_0000, &mut tiny), Err(StageError::BufferTooSmall));
+        assert_eq!(
+            install(&[], &gdt(), 0x8_0000, &mut tiny),
+            Err(StageError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_empty_or_oversized_gdt() {
+        // 空 GDT：`lgdt` 之后没有任何可用描述符，装载 CS/DS 立即 #GP ✗。
+        let mut low = std::vec![0u8; AP_PAGE_SIZE];
+        assert_eq!(install(&[0u8; 8], &[], 0x8_0000, &mut low), Err(StageError::GdtEmpty));
+        // 大到越出本页：宁可报错，绝不静默截断 ✗（300 个描述符 = 2400 字节 > 页尾）。
+        let huge = std::vec![0u64; 300];
+        assert_eq!(
+            install(&[0u8; 8], &huge, 0x8_0000, &mut low),
+            Err(StageError::GdtDoesNotFit)
+        );
     }
 
     #[test]
     fn the_page_layout_leaves_room_for_the_trampoline() {
-        // 页内三段不重叠，且 GDTR 描述符不压在参数块上。
+        // 页内四段**依次不重叠**：代码 < 参数块 < GDTR 描述符 < GDT。
         assert!(AP_FRAME_OFFSET + 40 <= AP_GDTR_OFFSET, "参数块(40B)不得压到 GDTR 描述符");
-        assert!(AP_GDTR_OFFSET + 6 <= AP_PAGE_SIZE, "GDTR 描述符必须在一页之内");
+        assert!(AP_GDTR_OFFSET + AP_GDTR_BYTES <= AP_GDT_OFFSET, "GDTR 描述符不得压到 GDT");
+        assert!(AP_GDT_OFFSET + 9 * 8 <= AP_PAGE_SIZE, "GDT(9 描述符)必须在一页之内");
     }
 
     #[test]

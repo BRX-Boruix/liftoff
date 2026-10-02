@@ -206,6 +206,24 @@ impl Responses {
         registered
     }
 
+    /// 只更新**实际启动的 AP 数**（即 `cpu_count`），**不动已登记的 `MpInfo`** ✓。
+    ///
+    /// **为什么不复用 `set_smp_cpus`**：那会**逐个重写** `MpInfo`（含 `goto_address`）✗ ——
+    /// 而此时 AP **正在轮询 `goto_address`** ✓，重写是没必要的并发写 ✗；`reserved`（内核填的
+    /// AP 栈）更不该被引导器碰 ✗。所以启动完成后只改计数 ✓。
+    ///
+    /// `registered` 是 `set_smp_cpus` 的返回值 —— 用它把 `started_aps` **夹**到可用 AP 数
+    /// 以内 ✓（调用方声称起了比存在的更多的核时，不把 `cpu_count` 报成不可能的值 ✗）。
+    pub fn set_started_aps(&mut self, registered: usize, started_aps: usize) {
+        if registered == 0 {
+            self.mp.cpu_count = 0;
+            return;
+        }
+        let aps = registered.saturating_sub(1);
+        let started = started_aps.min(aps);
+        self.mp.cpu_count = (1 + started) as u64;
+    }
+
     /// 当前报告给内核的 CPU 数。
     pub fn mp_cpu_count(&self) -> u64 {
         self.mp.cpu_count

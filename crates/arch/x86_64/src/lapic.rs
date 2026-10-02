@@ -156,12 +156,29 @@ pub const ICR_WAIT_SPINS: u32 = 1_000_000;
 ///
 /// **由 `icr_value` 派生并由测试绑定** ✓（S13 单点 ✓）—— 不手写魔数 ✗。
 pub const IPI_INIT_ASSERT: u64 = 0x4500;
-/// INIT **deassert** 的 ICR 值（对照 `smp.c:96` 的 `0x0500`）。
+/// INIT **deassert** 的 ICR 值。
 ///
-/// 电平语义：INIT 之后必须发一次 deassert，否则后续 IPI 可能被忽略 ✗。
+/// 【引用修正】我上一版把它写成"对照 `smp.c:96` 的 `0x0500`"——**那是错的** ✗：
+/// `smp.c:96` 是 SIPI 那一条，而整个 `common/sys/smp.c` 里**根本没有** `0x0500` ✓
+/// （已逐行核实 ✓）。参考实现只写 `0x4500` 就 `stall(10000)`（`smp.c:89,91`）——
+/// 它**不发** deassert ✓。
+///
+/// 我们仍然发它：Intel SDM Vol 3 §10.6.1 的 INIT 电平语义要求 assert 之后 deassert；
+/// 而多写一次是**无害**的（电平位不生效时它与 assert 同形，等于多一次 INIT ✓）。
+/// 这是**有意与参考实现不同**的一处，记录在此 ✓。
 pub const IPI_INIT_DEASSERT: u64 = 0x0500;
 /// SIPI 的 ICR 基础值（投递模式 Startup + assert）；向量按位或进去 ✓。
 pub const IPI_SIPI_BASE: u64 = 0x4600;
+
+/// INIT 之后等待的固件延时（微秒）。参考实现 `stall(10000)` = 10 ms ✓。
+pub const AP_INIT_STALL_US: usize = 10_000;
+/// 两次 SIPI 之间等待的固件延时（微秒）。参考实现 `stall(200)` ✓。
+pub const AP_SIPI_STALL_US: usize = 200;
+/// 等 AP 写 `booted_flag` 的**轮询次数**。参考实现 100 次（`smp.c:112`）✓。
+pub const AP_BOOT_POLLS: u32 = 100;
+/// 每次轮询之间的固件延时（微秒）。参考实现 `stall(10000)` = 10 ms ✓。
+/// 于是总超时 = 100 × 10 ms = **1 秒** ✓ —— **有界**，绝不无限自旋 ✗。
+pub const AP_BOOT_STALL_US: usize = 10_000;
 
 /// `IA32_APIC_BASE` MSR（`0x1B`）—— xAPIC/x2APIC 的模式开关就在这里。
 pub const IA32_APIC_BASE: u32 = 0x1B;
