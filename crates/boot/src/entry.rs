@@ -318,6 +318,31 @@ unsafe fn register_madt_cpus(responses: &mut crate::responses::Responses, rsdp_a
         "[liftoff] madt: {} cpus described, {} registered, started_aps=0\n",
         total, registered
     ));
+
+    // 【S3c 第 2 步的探针】读 LAPIC ID（**在激活之前**，靠当前生效的固件页表），
+    // 与 CPUID 得到的 BSP ID 比对。
+    //
+    // **这一问决定路线**：
+    // * 能读到且与 CPUID 一致 → **路线 A 可行**（AP 启动可以留在激活前，**不必动激活时序**）；
+    // * 读不到 → 只能走**路线 B**（提前激活自己的页表）。
+    //
+    // **这一步带着真实风险**：它假设固件的页表映射了 LAPIC 的 MMIO。若没映射，取数故障 →
+    // 复位（串口表现为复位循环）。**那个结果本身就是答案**，所以值得一试。
+    //
+    // 常量走 `current::lapic` 而不是在 `boot` 里写裸地址（S01 / ADR-007）。
+    // SAFETY: 见上 —— 本探针的全部目的就是验证这个假设是否成立。
+    let mmio_id = unsafe {
+        core::ptr::read_volatile(
+            (current::lapic::LAPIC_DEFAULT_BASE + current::lapic::LAPIC_ID as u64) as *const u32,
+        )
+    } >> 24;
+    let cpuid_id = <crate::PlatformImpl as arch::platform::Platform>::bsp_lapic_id();
+    report_fmt::<crate::PlatformImpl>(format_args!(
+        "[liftoff] lapic: mmio_id={:#x} cpuid_id={:#x} {}\n",
+        mmio_id,
+        cpuid_id,
+        if mmio_id == cpuid_id { "MATCH" } else { "MISMATCH" }
+    ));
 }
 
 fn report_fmt<P: Platform>(args: core::fmt::Arguments<'_>) {

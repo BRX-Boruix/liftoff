@@ -29,6 +29,10 @@ pub use x86_64::spinup;
 #[cfg(feature = "impl-x86_64")]
 pub use x86_64::features;
 
+/// LAPIC 寄存器常量与 ICR 编码（S3 的纯逻辑部分）。
+#[cfg(feature = "impl-x86_64")]
+pub use x86_64::lapic;
+
 #[cfg(feature = "impl-mock")]
 pub mod mock {
     //! 宿主测试用实现：不触碰硬件，但状态机行为真实（不是"假数据"）。
