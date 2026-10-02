@@ -606,14 +606,40 @@ core::arch::global_asm!(
     "    pause",
     "    jmp 1b",
     "2:",
+    // 刷 TLB（参考 `smp_trampoline.asm_x86:210-212`）。
     "    mov rbx, cr3",
     "    mov cr3, rbx",
+    // 切到内核给的栈（`MpInfo.reserved`，由**内核**在写 `goto_address` 时设置）。
     "    mov rsp, [rdi + 8]",
+    // **压一个假返回地址，并用它作为入口的 `rsp`**（参考 `:218-223`）。
+    // 这一条不是装饰：SysV ABI 要求**函数入口处 `rsp % 16 == 8`**，
+    // 而 `[rdi + 8]` 是 16 字节对齐的 —— 直接 `push rsp` 会让入口拿到
+    // `rsp % 16 == 0`，内核的 AP 入口一旦用 SSE（`movaps` 之类）就 #GP，
+    // 那个核**静默死掉**，内核于是只报 1 个核在线。
+    // 多核才走这条路，所以单核一直看不出来。
+    "    push 0",
+    "    mov rsi, rsp",
     "    push 0x30",
-    "    push rsp",
+    "    push rsi",
     "    push 0x2",
     "    push 0x28",
     "    push rax",
+    // **清零除 `rdi` 外的通用寄存器**（参考 `:228-242`）：入口应看到干净状态，
+    // 而不是我们跳板留下的 `rbx`（帧基址）之类。注意在 `push rax` **之后**清零。
+    "    xor eax, eax",
+    "    xor ebx, ebx",
+    "    xor ecx, ecx",
+    "    xor edx, edx",
+    "    xor esi, esi",
+    "    xor ebp, ebp",
+    "    xor r8d, r8d",
+    "    xor r9d, r9d",
+    "    xor r10d, r10d",
+    "    xor r11d, r11d",
+    "    xor r12d, r12d",
+    "    xor r13d, r13d",
+    "    xor r14d, r14d",
+    "    xor r15d, r15d",
     "    iretq",
     "ap_trampoline_end:",
 );
