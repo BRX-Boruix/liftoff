@@ -964,10 +964,10 @@ pub enum HandoffError {
 }
 
 impl core::fmt::Display for HandoffError {
-    // 载荷（`ScanError` / `EntryError`）**尚无 `Display`**，故用 `{:?}`。
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Fill(err) => write!(f, "响应填充扫描失败: {err:?}"),
+            // 两个载荷（`ScanError` / `EntryError`）现均实现 `Display`，故用 `{}`。
+            Self::Fill(err) => write!(f, "响应填充扫描失败: {err}"),
             // `EntryError` 现已实现 `Display`，故用 `{}`。
             Self::BeforeEntry(err) => write!(f, "跳转前检查失败: {err}"),
             Self::Exit(err) => write!(f, "退出引导服务失败: {err}"),

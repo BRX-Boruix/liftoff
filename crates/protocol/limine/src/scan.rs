@@ -56,6 +56,41 @@ pub enum ScanError {
     TooManyRequests,
 }
 
+impl core::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // 这些消息会经 `HandoffError::Fill` 一路走到真机串口（`report_failure`）。
+        match self {
+            Self::NoStartMarker => f.write_str("映像里没有请求段起始标记"),
+            Self::UnclosedRegion => f.write_str("起始标记之后没有结束标记"),
+            Self::TooManyRequests => f.write_str("调用方给的命中缓冲太小"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_error_display_tests {
+    use super::ScanError;
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    #[test]
+    fn every_scan_error_has_a_distinct_human_readable_message() {
+        let mut seen: Vec<String> = Vec::new();
+        for err in [
+            ScanError::NoStartMarker,
+            ScanError::UnclosedRegion,
+            ScanError::TooManyRequests,
+        ] {
+            let text = format!("{err}");
+            assert!(!text.is_empty(), "每条错误都必须有消息");
+            assert!(!seen.contains(&text), "消息不得重复: {text}");
+            seen.push(text);
+        }
+        assert_eq!(seen.len(), 3, "必须覆盖全部 3 个变体");
+    }
+}
+
 /// 命中的请求（只记录定位信息，填充由调用方按类型处理）。
 #[derive(Clone, Copy, Debug)]
 pub struct RequestHit {
