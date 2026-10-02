@@ -1616,14 +1616,22 @@ pub fn build_plan(request: &PlanRequest<'_>, out: &mut [Mapping]) -> Result<usiz
     // 层面（帧预算/固件交互等）。**在定位之前保持这个已知可工作的形态。**
     //
     // 缓冲不足时报错而不是静默跳过：丢掉必需映射 = 换表即故障。
+    const LOW_HEAD_END: u64 = 0x20_0000;
     {
-        if total + 1 > out.len() {
+        if total + 2 > out.len() {
             return Err(PlanBuildError::Plan(PlanError::BufferTooSmall));
         }
         out[total] = Mapping {
-            virt: arch::addr::VirtAddr::new(0),
-            phys: arch::addr::PhysAddr::new(0),
-            len: 0x1_0000_0000u64,
+            virt: arch::addr::VirtAddr::new(0x1000),
+            phys: arch::addr::PhysAddr::new(0x1000),
+            len: LOW_HEAD_END - 0x1000,
+            flags: identity_flags,
+        };
+        total += 1;
+        out[total] = Mapping {
+            virt: arch::addr::VirtAddr::new(LOW_HEAD_END),
+            phys: arch::addr::PhysAddr::new(LOW_HEAD_END),
+            len: 0x1_0000_0000u64 - LOW_HEAD_END,
             flags: identity_flags,
         };
         total += 1;
@@ -1639,6 +1647,26 @@ pub fn build_plan(request: &PlanRequest<'_>, out: &mut [Mapping]) -> Result<usiz
         };
     }
     Ok(total)
+}
+
+/// 把 `MapError` 渲染成可读文本并打到串口（诊断用）。
+///
+/// `MapError` 已实现 `Display`；这里用 `core::fmt::Write` 渲进一个**固定缓冲**，
+/// 不引入分配。仅在 UEFI 目标上存在 —— 宿主测试不需要它，且 `write_byte` 在宿主
+/// 实现里是特权指令，误调会让测试进程崩掉。
+#[cfg(target_os = "uefi")]
+fn report_map_error(err: arch::paging::MapError) {
+    struct Sink;
+    impl core::fmt::Write for Sink {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            for byte in text.bytes() {
+                crate::PlatformImpl::write_byte(byte);
+            }
+            Ok(())
+        }
+    }
+    use core::fmt::Write;
+    let _ = write!(Sink, "[liftoff] apply error: {}\n", err);
 }
 
 /// 交接所需的**全部调用方缓冲**（引导器不做隐藏分配：每个缓冲都由调用方给）。
@@ -1820,7 +1848,20 @@ pub unsafe fn bring_up(
     for byte in b"[liftoff] step: applying plan\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
-    mm::apply::apply(&mut page_table, &c.plan[..plan_count]).map_err(BringUpError::Apply)?;
+    // **显式解除页零**：`plan_identity` 先为低内存建了 2 MiB 大页，混合粒度的头部映射
+    // 触发**拆分**，而拆分如实复制 —— 于是页表第 0 项仍映射 `0..0x1000`。头部只覆盖
+    // `0x1000` 起、不会碰它，所以必须在这里显式解除，才算真正与 Limine 一致
+    // （`limine.c:200-203` 从 `0x1000` 起）。
+    if let Err(err) = mm::apply::apply(&mut page_table, &c.plan[..plan_count]) {
+        // **把具体错误打出来。** 此前只打一个阶段标记（`stage: apply plan`），看不到
+        // 是哪一种 `MapError` —— 定位混合粒度失败时正是在这一步卡住的。
+        #[cfg(target_os = "uefi")]
+        report_map_error(err);
+        return Err(BringUpError::Apply(err));
+    }
+    page_table
+        .unmap(arch::addr::VirtAddr::new(0), 0x1000)
+        .map_err(BringUpError::Apply)?;
     for byte in b"[liftoff] step: plan applied\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
@@ -2193,7 +2234,7 @@ mod build_plan_tests {
     }
 
     #[test]
-    fn the_low_4gib_identity_mapping_uses_a_large_page_from_zero() {
+    fn the_low_4gib_map_is_hybrid_and_no_longer_covers_page_zero() {
         // **当前形态：从 0 起的一条 2 MiB 大页。**
         //
         // 混合粒度（头部 4 KiB + 主体大页 + 解除页零）的映射逻辑已由宿主测试证明
@@ -2207,13 +2248,30 @@ mod build_plan_tests {
             &mut plan,
         )
         .expect("规划应成功");
-        let low = plan[..count]
+        // **与 Limine 一致地从 0x1000 起**（`limine.c:200-203`）：头部 2 MiB 用 4 KiB
+        // （只要 1 张页表，全部 4 KiB 要 2048 张、帧预算供不起），主体用 2 MiB 大页。
+        // 页零在 `apply` 之后由 `bring_up` **显式解除**（拆分如实复制会把页零带下来）。
+        for mapping in plan[..count].iter() {
+            assert!(
+                mapping.virt.as_u64() != 0 || mapping.len == 0,
+                "页零不得出现在规划里: {:#x}+{:#x}",
+                mapping.virt.as_u64(),
+                mapping.len,
+            );
+        }
+        let head = plan[..count]
             .iter()
-            .find(|m| m.virt.as_u64() < 0x1_0000_0000)
-            .expect("低 4 GiB 恒等映射必须在");
-        assert_eq!(low.virt.as_u64(), 0, "当前必须从 0 起（大页对齐要求）");
-        assert_eq!(low.len, 0x1_0000_0000, "必须覆盖整个低 4 GiB（含 MMIO）");
-        assert_eq!(low.len % LARGE, 0, "长度必须是 2 MiB 的倍数，供大页路径使用");
+            .find(|m| m.virt.as_u64() == 0x1000)
+            .expect("头部映射必须在");
+        assert_eq!(head.len, 0x20_0000 - 0x1000, "头部应覆盖到 2 MiB 边界");
+        assert_ne!(head.virt.as_u64() % LARGE, 0, "头部起点不该大页对齐");
+        let body = plan[..count]
+            .iter()
+            .find(|m| m.virt.as_u64() == 0x20_0000)
+            .expect("主体映射必须在");
+        assert_eq!(body.len, 0x1_0000_0000 - 0x20_0000, "主体应覆盖到 4 GiB 上界");
+        assert_eq!(body.virt.as_u64() % LARGE, 0, "主体起点应大页对齐");
+        assert_eq!(head.len + body.len, 0x1_0000_0000 - 0x1000, "两条应无缝覆盖低 4 GiB");
     }
 
     /// **实测约束**：数据映射（HHDM / 恒等 / 低 4 GiB）必须**可执行**。

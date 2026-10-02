@@ -215,23 +215,28 @@ impl<A: FrameAllocator> X86PageTable<A> {
         // 回收需要在每一级判断是否全空并改父项，属优化；当前无数据支撑其必要性（S32）。
         self.write_entry(pt, (v >> 12) & 0x1FF, 0)
     }
-    /// 4 KiB 粒度映射。
+
+}
+
+impl<A: FrameAllocator> PageTable for X86PageTable<A> {
+    /// 4 KiB 粒度映射（`PageTable` trait 的实现）。
+    ///
+    /// **必须在 trait impl 里，不能只放固有 impl。** 曾经它只作为固有方法存在，
+    /// 于是宿主测试 `pt.map_range_pages(...)` 命中固有方法、一切正常，而
+    /// `mm::apply::apply`（泛型 `P: PageTable`）命中的是 trait 的**默认实现**
+    /// —— 那个默认返回 `UnsupportedGranularity`，真机因此 `entry failed`。
+    /// **这正是"宿主过、真机不过"的形态：同名方法分居两处，调用点决定了用哪个。**
     ///
     /// 与 `map_range`（2 MiB 大页）并列存在而不是替换它：大页是引导期的主要路径
     /// （表项少、TLB 压力小），4 KiB 用于**不满足大页对齐**的区间 —— 例如 Limine
-    /// 语义下从 `0x1000` 起的低 4 GiB 恒等映射。此前缺这一能力，调用方被迫从
-    /// `0` 起映射，把**页零**也映射了进去（与 Limine 的唯一已知偏差）。
-    ///
-    /// 页表逐 2 MiB 一张挂在 PD 上（PS=0），PTE 逐 4 KiB 填。权限位与 `map_range`
-    /// 完全一致（present / writable / NX），不引入新的语义。
-    pub fn map_range_pages(
+    /// 语义下从 `0x1000` 起的低 4 GiB 恒等映射。
+    fn map_range_pages(
         &mut self,
         virt: VirtAddr,
         phys: PhysAddr,
         len: u64,
         flags: PageFlags,
-    ) -> Result<(), MapError> {
-        // 与 map_range 相同的参数校验，但按 4 KiB 对齐判定。
+    ) -> Result<(), MapError> {        // 与 map_range 相同的参数校验，但按 4 KiB 对齐判定。
         validate_range(virt, phys, len, Alignment::PAGE)?;
         let mut pte_flags = PTE_PRESENT;
         if flags.is_writable() {
@@ -244,9 +249,6 @@ impl<A: FrameAllocator> X86PageTable<A> {
         let mut v = virt.as_u64();
         let mut p = phys.as_u64();
         while remaining > 0 {
-            // 三级下钻：PML4 -> PDPT -> PD ->（本函数创建）PT。
-            // 每张 4 KiB 页表覆盖 2 MiB，挂在 PD 上（PD 项 PS=0）。
-            // PML4 项没有 PS 位 -> None；PDPT 项 PS 表示 1 GiB；PD 项 PS 表示 2 MiB。
             let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF, None)?;
             let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF, Some(HUGE_PAGE_SIZE))?;
             let pt = self.table_or_create(pd, (v >> 21) & 0x1FF, Some(LARGE_PAGE_SIZE))?;
@@ -259,9 +261,7 @@ impl<A: FrameAllocator> X86PageTable<A> {
         }
         Ok(())
     }
-}
 
-impl<A: FrameAllocator> PageTable for X86PageTable<A> {
     fn map_range(
         &mut self,
         virt: VirtAddr,
