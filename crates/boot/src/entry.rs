@@ -1407,10 +1407,10 @@ pub enum KernelPlanError {
 }
 
 impl core::fmt::Display for KernelPlanError {
-    // 载荷（`ElfError`）**尚无 `Display`**，故用 `{:?}`。
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Elf(err) => write!(f, "ELF 解析失败: {err:?}"),
+            // `ElfError` 现已实现 `Display`（`loader` crate），故用 `{}`。
+            Self::Elf(err) => write!(f, "ELF 解析失败: {err}"),
             Self::EntryOutsideSegments => f.write_str("入口不在任何装载段内"),
             Self::EmptySegment => f.write_str("段的虚拟区间长度为 0"),
             Self::Overflow => f.write_str("段区间末端溢出"),

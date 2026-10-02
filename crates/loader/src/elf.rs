@@ -55,6 +55,63 @@ pub enum ElfError {
     BadRelocationTable,
 }
 
+impl core::fmt::Display for ElfError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // 这些消息会经 `KernelPlanError::Elf` 一路走到真机串口（`report_failure`）。
+        match self {
+            Self::ShortImage => f.write_str("映像不足 64 字节，装不下 ELF 头"),
+            Self::NotElf => f.write_str("魔数不是 \\x7FELF"),
+            Self::NotElf64 => f.write_str("不是 64 位 ELF"),
+            Self::NotLittleEndian => f.write_str("不是小端序"),
+            Self::WrongMachine => f.write_str("e_machine 不是 x86-64"),
+            Self::UnsupportedType => f.write_str("e_type 既不是可执行文件也不是 PIE"),
+            Self::BadProgramHeader => f.write_str("e_phentsize 不是 56"),
+            Self::BadSegmentSize => f.write_str("p_filesz 大于 p_memsz（BSS 只能补零，不能缩短）"),
+            Self::SegmentOutOfBounds => f.write_str("程序头表或某个段越出映像范围"),
+            Self::NoLoadSegments => f.write_str("没有任何 PT_LOAD 段"),
+            Self::BufferTooSmall => f.write_str("调用方给的输出缓冲太小"),
+            Self::NoDynamicSegment => f.write_str("ET_DYN 但没有 PT_DYNAMIC 段，无法做重定位"),
+            Self::BadRelocationTable => f.write_str("重定位表不合法，或含不支持的重定位类型"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod elf_error_display_tests {
+    use super::ElfError;
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    #[test]
+    fn every_elf_error_has_a_distinct_human_readable_message() {
+        // 13 个变体，**全部**必须有不重复的消息：两条错误打出同一行文字，
+        // 在真机串口上就等于没有诊断信息。
+        let mut seen: Vec<String> = Vec::new();
+        for err in [
+            ElfError::ShortImage,
+            ElfError::NotElf,
+            ElfError::NotElf64,
+            ElfError::NotLittleEndian,
+            ElfError::WrongMachine,
+            ElfError::UnsupportedType,
+            ElfError::BadProgramHeader,
+            ElfError::BadSegmentSize,
+            ElfError::SegmentOutOfBounds,
+            ElfError::NoLoadSegments,
+            ElfError::BufferTooSmall,
+            ElfError::NoDynamicSegment,
+            ElfError::BadRelocationTable,
+        ] {
+            let text = format!("{err}");
+            assert!(!text.is_empty(), "每条错误都必须有消息");
+            assert!(!seen.contains(&text), "消息不得重复: {text}");
+            seen.push(text);
+        }
+        assert_eq!(seen.len(), 13, "必须覆盖全部 13 个变体");
+    }
+}
+
 /// `PT_DYNAMIC`。
 pub const PT_DYNAMIC: u32 = 2;
 /// 动态表终止项。
