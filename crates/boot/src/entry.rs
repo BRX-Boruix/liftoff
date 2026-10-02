@@ -240,7 +240,13 @@ const MAX_ACPI_TABLE: usize = 64 * 1024;
 /// `BringUp` 与一个跳转闭包，所以 `P` 在它的作用域里**不存在**（这一点我第 295 轮搞错，
 /// 导致编译失败并回退）。
 #[cfg(target_os = "uefi")]
-unsafe fn register_madt_cpus(responses: &mut crate::responses::Responses, rsdp_address: u64) {
+unsafe fn register_madt_cpus(
+    // **不是 `BootServicesTable`** ✗：`allocate_zeroed_below` 是 `EfiFrameAllocator` 的固有方法 ✓。
+    frames: &mut EfiFrameAllocator,
+    responses: &mut crate::responses::Responses,
+    rsdp_address: u64,
+    cr3_top: u64,
+) {
     let mut header = [0u8; 36];
     // SAFETY: RSDP 是固件表、在 RAM 内，36 字节不会越过 RAM 末尾。
     if !unsafe { read_phys(rsdp_address, &mut header) } {
@@ -357,6 +363,87 @@ unsafe fn register_madt_cpus(responses: &mut crate::responses::Responses, rsdp_a
         current::lapic::x2apic_enabled(apic_base),
         apic_base & current::lapic::APIC_BASE_ENABLE != 0
     ));
+
+    // 【S5–S7 接线 · 第 ② 段】把跳板搬进低页、填好参数块。**本轮只做这一段** ✓。
+    //
+    // **必须在 1 MiB 以下** ✓：AP 从实模式醒来，寻址只有 20 位 ✗。
+    // **SIPI 只给向量、不给寄存器** ✗ → 参数块按**固定偏移**找 ✓。
+    let max = current::ap::AP_LOW_LIMIT - current::ap::AP_PAGE_SIZE as u64;
+    let Some(low_frame) = frames.allocate_zeroed_below(max) else {
+        report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: 低页分配失败\n"));
+        return;
+    };
+    // **不 panic** ✓：`start_address()` 返回 `Option<PhysAddr>` ✗ —— 用 `let-else` 优雅退出 ✓
+    // （比 `expect` 好：这一层不该因固件给了个无地址的帧就崩 ✗）。
+    let Some(low_addr) = low_frame.start_address() else {
+        report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: 低页帧无地址\n"));
+        return;
+    };
+    let base = low_addr.as_u64();
+    report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: 低页 base={base:#x}\n"));
+
+    // 恒等映射下可直接写该物理地址 —— 本函数已在用同一映射读固件表 ✓。
+    // SAFETY: 刚分配的一页、页对齐、长度恰为一页，且当前页表恒等映射 RAM。
+    let low =
+        unsafe { core::slice::from_raw_parts_mut(base as *mut u8, current::ap::AP_PAGE_SIZE) };
+
+    // GDT 副本：9×u64 放在页内固定偏移（两侧共用同一常量 ✓）。
+    let gdt = current::spinup::build_gdt();
+    for (index, word) in gdt.iter().enumerate() {
+        let at = current::ap::AP_GDT_OFFSET + index * 8;
+        low[at..at + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    let gdt_base = (base + current::ap::AP_GDT_OFFSET as u64) as u32;
+    let gdt_limit = (current::ap::AP_GDT_BYTES - 1) as u16;
+
+    // **登记下标 ≠ `list` 下标** ✗：`set_smp_cpus` 只登记 `enabled` 的 CPU ✓，
+    // 所以第 i 个 `MpInfo` 对应 `list` 里**第 i 个 enabled 项** ✓。
+    // 因此用一个**只对 enabled 递增**的计数器 ✓，而不是 `list` 的下标 ✗。
+    let bsp = <crate::PlatformImpl as arch::platform::Platform>::bsp_lapic_id();
+    let mut enabled_index = 0usize;
+    let mut staged = 0usize;
+    for cpu in list[..usable].iter() {
+        if !cpu.enabled {
+            continue;
+        }
+        let slot = enabled_index;
+        enabled_index += 1;
+        // BSP 不启动（MADT 也列它 ✓）。
+        if cpu.apic_id == bsp {
+            continue;
+        }
+        let Some(info) = responses.mp_info_at(slot) else {
+            continue;
+        };
+        // `MpInfo` 的**物理**地址（跳板自己加 HHDM ✓）。
+        let info_phys = (info as *const _ as u64).wrapping_sub(HHDM_OFFSET);
+        let input = current::ap::ApTrampolineInput {
+            hhdm: HHDM_OFFSET,
+            cr3_top,
+            info_struct: info_phys,
+            // 临时栈顶 = base + 0x800 向下长（不碰 0x800 的帧 ✓）。
+            temp_stack_top: base + current::ap::AP_FRAME_OFFSET as u64,
+            gdtr: base + current::ap::AP_GDTR_OFFSET as u64,
+            // 保守：跳板里不开 CR0.WP ✓ —— 交接后 CR0 完全由内核掌控 ✓。
+            write_protect: false,
+        };
+        let Ok(frame) = current::ap::prepare(&input) else {
+            continue;
+        };
+        if current::ap::stage(
+            current::ap::trampoline_bytes(),
+            &frame,
+            gdt_base,
+            gdt_limit,
+            base,
+            low,
+        )
+        .is_ok()
+        {
+            staged += 1;
+        }
+    }
+    report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] ap: staged={staged}\n"));
 }
 
 fn report_fmt<P: Platform>(args: core::fmt::Arguments<'_>) {
@@ -2499,7 +2586,14 @@ pub unsafe fn bring_up(
         // SAFETY: `rsdp` 来自固件配置表、指向 RAM；RAM 在**当前生效的固件页表**下恒等映射
         // （本函数已在用同一映射写内核目标物理地址）。只读，且长度取自表自己的字段。
         unsafe {
-            register_madt_cpus(&mut *c.responses, rsdp as u64);
+            // 页表根物理地址：与 BSP 的 spinup 用**同一个根帧** ✓（AP 应当用同一套页表 ✓）。
+    let cr3_top = root.start_address().expect("根帧必有地址").as_u64();
+    // `&mut *table` 是**重借用** ✓ —— `table` 是 `&mut`，直接传会被**移动** ✗。
+    // `frames` 是**值**（`EfiFrameAllocator`）✓ —— 直接 `&mut frames` ✓（`&mut *frames` 会报"无法解引用" ✗）。
+    // `frames` 在更早处**已被移动** ✗（`EfiFrameAllocator` 不实现 `Copy` ✓）→ 不能复用 ✓。
+    // 但它只是**固件指针的包装** ✓，而 `table.allocate_pages` 仍可用 ✓ → 构造一个新的 ✓。
+    let mut low_frames = EfiFrameAllocator::new(table.allocate_pages);
+    register_madt_cpus(&mut low_frames, &mut *c.responses, rsdp as u64, cr3_top);
         }
     }
     // **引导器自述**：`BootloaderInfoResponse` 的 name/version 此前一直是 NULL ——
