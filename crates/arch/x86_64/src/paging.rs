@@ -49,6 +49,24 @@ fn huge_at_level(ps_page_size: Option<u64>, entry: u64) -> Option<u64> {
 /// 把沿途各级页表项折算成**语义权限**：取交集。
 ///
 /// 只报叶项权限是常见错误 —— 会报出一个「可写」的地址，而实际写入被上级拒绝。
+/// 把**语义权限**（[`PageFlags`]）编码成 PTE 位。
+///
+/// **单点**（S13）✓：这段转换此前在 `map_range_pages` 与 `map_range` 里**各写了一遍** ✗ ——
+/// 两处漂移会让**同样的 `PageFlags` 得到不同的权限**，而权限错不会崩，只会静默放宽或收紧 ✗。
+///
+/// `PTE_PRESENT` **恒置** ✓：本函数用于**建立或修改已有映射**；清 present 是 `unmap` 的职责 ✓。
+#[inline]
+fn pte_bits(flags: PageFlags) -> u64 {
+    let mut bits = PTE_PRESENT;
+    if flags.is_writable() {
+        bits |= PTE_WRITABLE;
+    }
+    if !flags.is_executable() {
+        bits |= PTE_NX;
+    }
+    bits
+}
+
 fn effective_flags(levels: &[u64]) -> PageFlags {
     let mut present = true;
     let mut writable = true;
@@ -238,13 +256,7 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
         flags: PageFlags,
     ) -> Result<(), MapError> {        // 与 map_range 相同的参数校验，但按 4 KiB 对齐判定。
         validate_range(virt, phys, len, Alignment::PAGE)?;
-        let mut pte_flags = PTE_PRESENT;
-        if flags.is_writable() {
-            pte_flags |= PTE_WRITABLE;
-        }
-        if !flags.is_executable() {
-            pte_flags |= PTE_NX;
-        }
+        let pte_flags = pte_bits(flags);
         let mut remaining = len;
         let mut v = virt.as_u64();
         let mut p = phys.as_u64();
@@ -276,13 +288,7 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
             return Err(MapError::UnsupportedGranularity);
         }
         let pages = pages_for(len, LARGE_PAGE_SIZE).ok_or(MapError::Overflow)?;
-        let mut pte_flags = PTE_PRESENT;
-        if flags.is_writable() {
-            pte_flags |= PTE_WRITABLE;
-        }
-        if !flags.is_executable() {
-            pte_flags |= PTE_NX;
-        }
+        let pte_flags = pte_bits(flags);
         for page in 0..pages {
             // validate_range 已保证 virt + len 与 phys + len 不溢出，且 page < pages，故两处加法安全。
             let v = virt.as_u64() + page * LARGE_PAGE_SIZE;
@@ -380,6 +386,30 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
 #[cfg(test)]
 mod tests {
     use super::huge_at_level;
+    use super::{PTE_NX, PTE_PRESENT, PTE_WRITABLE, pte_bits};
+
+    #[test]
+    fn the_permission_bits_are_encoded_in_one_place() {
+        // 【S13 缺陷】这份"语义权限 → PTE 位"的转换此前在 `map_range_pages` 与 `map_range`
+        // 里**各写了一遍** ✗ —— 两处一旦漂移，**同样的 `PageFlags` 会得到不同的映射权限** ✗，
+        // 而权限错不会崩，只会让一段内存意外可写或不可执行 ✗。
+        // 现在只此一处，并由本测试钉住 ✓。
+        // `PTE_PRESENT` **恒置** ✓：本函数只用于**建立或修改已有映射** ——
+        // 清 present 是 `unmap` 的职责 ✓（这里如实钉住这个契约，而不是假装它会看 `is_present`）。
+        // **逐位断言，不断言整值** ✓ —— 我第一版写 `pte_bits(none()) == PTE_PRESENT` ✗，
+        // 而 `none()` **不是可执行**，NX 本来就该置上 —— 断言整值会把这个**正确行为**判成失败 ✗。
+        // 逐位断言问的才是"我关心的那一位对不对" ✓。
+        let none = pte_bits(PageFlags::none());
+        assert_eq!(none & PTE_PRESENT, PTE_PRESENT, "present 恒置");
+        assert_eq!(none & PTE_WRITABLE, 0, "none 不可写");
+        assert_eq!(none & PTE_NX, PTE_NX, "none 不是可执行 → NX 置上");
+        let rw = pte_bits(PageFlags::present().with(PageFlags::writable()));
+        assert_eq!(rw & PTE_WRITABLE, PTE_WRITABLE, "要求可写就必须置可写位");
+        assert_eq!(rw & PTE_NX, PTE_NX, "可写不等于可执行：NX 仍在");
+        let rx = pte_bits(PageFlags::present().with(PageFlags::executable()));
+        assert_eq!(rx & PTE_WRITABLE, 0, "没要求可写就不能置可写位");
+        assert_eq!(rx & PTE_NX, 0, "要求可执行就必须清掉 NX");
+    }
 
     #[test]
     fn the_ps_bit_is_only_honoured_at_levels_that_have_one() {
