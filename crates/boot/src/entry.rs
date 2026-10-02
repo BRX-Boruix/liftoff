@@ -211,6 +211,115 @@ fn report_failure<P: Platform>(stage: &BringUpError) {
 /// 缓冲溢出即截断 —— 诊断输出不该因为消息长就 panic。
 ///
 /// **单点**：`report_cause` 与 `report_panic` 都经它输出，缓冲大小与截断策略只在这里。
+/// 从**物理地址**读一段字节（只用于固件给的 ACPI 表）。
+///
+/// # Safety
+///
+/// `address` 必须指向**已映射**的 RAM，且 `[address, address + out.len())` 全部可达。
+/// 调用方负责保证长度来自**表自己的长度字段**并设上限 —— 凭空猜大小会读越过 RAM 末尾，
+/// 真机上表现为静默复位。
+#[cfg(target_os = "uefi")]
+unsafe fn read_phys(address: u64, out: &mut [u8]) -> bool {
+    if address == 0 || out.is_empty() {
+        return false;
+    }
+    // SAFETY: 由调用方保证（见本函数文档）。
+    unsafe {
+        core::ptr::copy_nonoverlapping(address as *const u8, out.as_mut_ptr(), out.len());
+    }
+    true
+}
+
+/// 单个 ACPI 表允许读取的最大长度（防御：长度字段可能是垃圾）。
+#[cfg(target_os = "uefi")]
+const MAX_ACPI_TABLE: usize = 64 * 1024;
+
+/// 从 RSDP 找到 MADT、解析 CPU、登记，并把结果打到串口（S3c 第 1 步，**不启动 AP**）。
+///
+/// 用 `crate::PlatformImpl` 而不是类型参数：**`bring_up` 不泛型于平台** —— 它按值接收
+/// `BringUp` 与一个跳转闭包，所以 `P` 在它的作用域里**不存在**（这一点我第 295 轮搞错，
+/// 导致编译失败并回退）。
+#[cfg(target_os = "uefi")]
+unsafe fn register_madt_cpus(responses: &mut crate::responses::Responses, rsdp_address: u64) {
+    let mut header = [0u8; 36];
+    // SAFETY: RSDP 是固件表、在 RAM 内，36 字节不会越过 RAM 末尾。
+    if !unsafe { read_phys(rsdp_address, &mut header) } {
+        return;
+    }
+    let Ok(root) = utils::acpi::parse_rsdp(&header) else {
+        report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] rsdp: 解析失败\n"));
+        return;
+    };
+
+    // 根表：先读 36 字节头拿长度，再按长度读全（**不猜大小**）。
+    let mut root_header = [0u8; 36];
+    // SAFETY: 同上。
+    if !unsafe { read_phys(root.root, &mut root_header) } {
+        return;
+    }
+    let root_len =
+        u32::from_le_bytes([root_header[4], root_header[5], root_header[6], root_header[7]]) as usize;
+    if root_len < 36 || root_len > MAX_ACPI_TABLE {
+        report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] rsdp: 根表长度不合法 {}\n", root_len));
+        return;
+    }
+    let mut root_table = [0u8; MAX_ACPI_TABLE];
+    // SAFETY: 长度已校验并设上限。
+    if !unsafe { read_phys(root.root, &mut root_table[..root_len]) } {
+        return;
+    }
+
+    let mut found = None;
+    {
+        let mut reader = |address: u64, out: &mut [u8; 4]| {
+            // SAFETY: 表头 4 字节，地址来自根表项。
+            unsafe { read_phys(address, out) }
+        };
+        if let Ok(hit) = utils::acpi::find_table(
+            &root_table[..root_len],
+            root.kind,
+            utils::acpi::MADT_SIGNATURE,
+            &mut reader,
+        ) {
+            found = hit;
+        }
+    }
+    let Some(madt_address) = found else {
+        report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] madt: 未找到\n"));
+        return;
+    };
+
+    let mut madt_header = [0u8; 44];
+    // SAFETY: MADT 固定头 44 字节，地址来自根表项。
+    if !unsafe { read_phys(madt_address, &mut madt_header) } {
+        return;
+    }
+    let madt_len =
+        u32::from_le_bytes([madt_header[4], madt_header[5], madt_header[6], madt_header[7]]) as usize;
+    if madt_len < 44 || madt_len > MAX_ACPI_TABLE {
+        report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] madt: 长度不合法 {}\n", madt_len));
+        return;
+    }
+    let mut madt = [0u8; MAX_ACPI_TABLE];
+    // SAFETY: 长度已校验并设上限。
+    if !unsafe { read_phys(madt_address, &mut madt[..madt_len]) } {
+        return;
+    }
+
+    let mut list = [utils::acpi::MadtCpu { processor_id: 0, apic_id: 0, enabled: false }; 64];
+    let Ok(total) = utils::acpi::cpus(&madt[..madt_len], &mut list) else {
+        report_fmt::<crate::PlatformImpl>(format_args!("[liftoff] madt: 解析失败\n"));
+        return;
+    };
+    let usable = total.min(list.len());
+    // **started_aps = 0**：还没启动任何 AP，所以 `cpu_count` 仍是 1。
+    let registered = responses.set_smp_cpus(&list[..usable], 0);
+    report_fmt::<crate::PlatformImpl>(format_args!(
+        "[liftoff] madt: {} cpus described, {} registered, started_aps=0\n",
+        total, registered
+    ));
+}
+
 fn report_fmt<P: Platform>(args: core::fmt::Arguments<'_>) {
     struct Buf {
         bytes: [u8; 128],
@@ -2333,6 +2442,24 @@ pub unsafe fn bring_up(
         c.responses.set_smp(bsp_lapic_id);
     }
     c.responses.set_hhdm_offset(HHDM_OFFSET);
+    // 【S3c 第 1 步】把**固件的真实 ACPI 数据**接进这条链 —— **还不启动任何 AP**。
+    //
+    // `started_aps = 0`，所以 `cpu_count` 仍是 1，**引导行为应当完全不变**。价值在于：
+    // 让固件真实数据第一次流经 S1 的解析器，且**不发 IPI、不改激活时序** —— 风险最低。
+    //
+    // **`&mut *c.responses` 是重借用**：`c` 是**按值传入的不可变绑定**，而
+    // `c.responses` 的类型是 `&mut Responses` —— 所以直接写 `&mut c.responses` 会被拒绝
+    // （要求 `c` 可变），而重借用走的是那个已有的 `&mut` ✓。这一点我前两次都没看清。
+    //
+    // 只在 UEFI 目标上做：宿主测试里 `rsdp` 是假地址，解引用会崩。
+    #[cfg(target_os = "uefi")]
+    if let Some(rsdp) = c.rsdp {
+        // SAFETY: `rsdp` 来自固件配置表、指向 RAM；RAM 在**当前生效的固件页表**下恒等映射
+        // （本函数已在用同一映射写内核目标物理地址）。只读，且长度取自表自己的字段。
+        unsafe {
+            register_madt_cpus(&mut *c.responses, rsdp as u64);
+        }
+    }
     // **引导器自述**：`BootloaderInfoResponse` 的 name/version 此前一直是 NULL ——
     // `set_bootloader_info` 被定义了却**从未被调用**（死代码，S06），于是内核问
     // "你是谁"时得到的是一片空白（串口实测 `[init] kernel version = 0x000`
