@@ -50,6 +50,13 @@ pub struct ApTrampoline {
     pub gdtr: u32,
     /// 显式尾部补齐：让 `size_of` 恰好等于 40，**不留隐式填充**。
     pub pad1: u32,
+    /// **BSP 的 `IA32_APIC_BASE` 值**，供 AP 对齐自己（参考 `smp_trampoline.asm_x86:70-74`）。
+    ///
+    /// **为什么必须传**：`ChangeLog:1164` 记着「On x86, ensure that the value of
+    /// IA32_APIC_BASE is the same on ...」—— 每个核的 APIC base **必须一致**。
+    /// 若某个 AP 的 APIC base 与 BSP 不同，内核按 MMIO 配置那个核的 LAPIC 时
+    /// 会写到**错误的位置**，那个核起不来，而且**不会报错，只会静默失败**。
+    pub bsp_apic_base: u64,
 }
 
 impl ApTrampoline {
@@ -66,6 +73,7 @@ impl ApTrampoline {
         temp_stack_hi: 0,
         gdtr: 0,
         pad1: 0,
+        bsp_apic_base: 0,
     };
 }
 
@@ -117,6 +125,8 @@ pub struct ApTrampolineInput {
     pub gdtr: u64,
     /// 是否开启写保护（`CR0.WP`）。
     pub write_protect: bool,
+    /// BSP 的 `IA32_APIC_BASE` 值（AP 据此对齐自己）。
+    pub bsp_apic_base: u64,
 }
 
 /// 由输入**填写**参数块（纯逻辑、宿主可测）。
@@ -137,6 +147,8 @@ pub fn prepare(input: &ApTrampolineInput) -> Result<ApTrampoline, ApTrampolineEr
     block.temp_stack_lo = input.temp_stack_top as u32;
     block.temp_stack_hi = (input.temp_stack_top >> 32) as u32;
     block.gdtr = low32(input.gdtr, ApField::Gdtr)?;
+    // 完整 64 位值原样放进参数块：AP 侧要用它整份对齐（含高半）。
+    block.bsp_apic_base = input.bsp_apic_base;
     if input.write_protect {
         block.target_mode |= 1 << 4;
     }
@@ -160,6 +172,7 @@ mod tests {
             temp_stack_top: 0xffff_8000_0003_0000,
             gdtr: 0x3000,
             write_protect: true,
+            bsp_apic_base: 0x0000_0000_0fee_00d0,
         }
     }
 
@@ -228,7 +241,7 @@ mod tests {
         assert_eq!(offset_of!(ApTrampoline, temp_stack_hi), 28);
         assert_eq!(offset_of!(ApTrampoline, gdtr), 32);
         assert_eq!(offset_of!(ApTrampoline, pad1), 36);
-        assert_eq!(size_of::<ApTrampoline>(), 40, "必须是 40：不留隐式填充");
+        assert_eq!(size_of::<ApTrampoline>(), 48, "必须是 40：不留隐式填充");
     }
 
     #[test]
@@ -470,6 +483,8 @@ const _: () = assert!(AP_GDTR_OFFSET + AP_GDTR_BYTES <= AP_GDT_OFFSET);
 const _: () = assert!(AP_GDT_OFFSET + 9 * 8 <= AP_PAGE_SIZE);
 const _: () = assert!(AP_GDTR_OFFSET + AP_GDTR_BYTES <= AP_FARPTR_OFFSET);
 const _: () = assert!(AP_FARPTR_OFFSET + AP_FARPTR_BYTES <= AP_GDT_OFFSET);
+// 汇编按 `AP_F_APIC_LO = AP_FRAME + 40` 读它，所以偏移必须是 40（S15 单点）。
+const _: () = assert!(core::mem::offset_of!(ApTrampoline, bsp_apic_base) == 40);
 
 #[cfg(target_os = "uefi")]
 core::arch::global_asm!(
@@ -492,6 +507,7 @@ core::arch::global_asm!(
     ".set AP_F_CR3, AP_FRAME + 16",
     ".set AP_F_INFO, AP_FRAME + 20",
     ".set AP_F_STACK_LO, AP_FRAME + 24",
+    ".set AP_F_APIC_LO, AP_FRAME + 40",
     ".set AP_GDTR, AP_FRAME + 0x80",
     // 远指针槽：在 GDTR 描述符之后、GDT 之前（编译期断言守住不重叠）。
     ".set AP_FARPTR, AP_FRAME + 0x90",
@@ -527,6 +543,25 @@ core::arch::global_asm!(
     "    mov ss, ax",
     "    mov fs, ax",
     "    mov gs, ax",
+    // **AP 侧对齐 `IA32_APIC_BASE`**（参考 `smp_trampoline.asm_x86:55-74`）。
+    // 三步与参考一致：读自己的值；若自己是 x2APIC 而目标不是，先走**关闭态**
+    // （清 bit 11 与 bit 10 —— 直接切是非法状态转换）；再写入 BSP 的值，
+    // 置 bit 11（xAPIC 全局使能）、清 bit 8（BSP 标志）。
+    "    mov ecx, 0x1b",
+    "    rdmsr",
+    "    test eax, 0x400",
+    "    jz ap_apic_write",
+    "    test dword ptr [ebx + AP_F_APIC_LO], 0x400",
+    "    jnz ap_apic_write",
+    "    btr eax, 11",
+    "    btr eax, 10",
+    "    wrmsr",
+    "ap_apic_write:",
+    "    mov eax, [ebx + AP_F_APIC_LO]",
+    "    mov edx, [ebx + AP_F_APIC_LO + 4]",
+    "    bts eax, 11",
+    "    btr eax, 8",
+    "    wrmsr",
     "    mov esp, [ebx + AP_F_STACK_LO]",
     "    mov eax, [ebx + AP_F_CR3]",
     "    mov cr3, eax",

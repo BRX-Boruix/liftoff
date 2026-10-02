@@ -551,8 +551,16 @@ unsafe fn start_aps(
         // `MpInfo` 的**物理**地址（跳板自己加 HHDM）。
         // **经映射抽象算，不做裸减法**—— `RESPONSES` 在低地址恒等映射下，减法会回绕。
         let info_phys = arch::hhdm::phys_of_pointer(direct, info as *const _ as u64).as_u64();
+        // **BSP 的 `IA32_APIC_BASE`** 要传给 AP 让它对齐自己（参考 `smp_trampoline.asm_x86:70-74`）。
+        // 每个核的 APIC base 必须一致，否则内核配置那个核的 LAPIC 时会写到错误的位置，
+        // 而那是**静默失败**。宿主构建没有 rdmsr，用 0 占位。
+        #[cfg(target_os = "uefi")]
+        let bsp_apic_base = unsafe { current::lapic::rdmsr(current::lapic::IA32_APIC_BASE) };
+        #[cfg(not(target_os = "uefi"))]
+        let bsp_apic_base: u64 = 0;
         let input = current::ap::ApTrampolineInput {
             hhdm: HHDM_OFFSET,
+            bsp_apic_base,
             cr3_top,
             info_struct: info_phys,
             temp_stack_top,
