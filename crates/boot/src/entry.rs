@@ -2495,6 +2495,12 @@ pub unsafe fn bring_up(
         unsafe { UefiBlockDevices::from_boot_services(table.locate_handle, table.handle_protocol) }
             .map_err(BringUpError::Discover)?;
     crate::PlatformImpl::write_byte(b'2');
+    // D3 测量：**内核读取**的起点。频率在标定之后才可用，所以这里只记 TSC，
+    // 换算与打印放到换表完成那一处（那时 `tsc_hz` 已在作用域里）。
+    #[cfg(target_os = "uefi")]
+    let read_start = unsafe { current::features::read_tsc() };
+    #[cfg(not(target_os = "uefi"))]
+    let _read_start: u64 = 0;
     // 2) 从介质读出内核映像。
     let len = crate::media::load_kernel_from_device(
         &mut devices,
@@ -2503,6 +2509,10 @@ pub unsafe fn bring_up(
         c.kernel_out,
     )
     .map_err(BringUpError::Media)?;
+    #[cfg(target_os = "uefi")]
+    let read_end = unsafe { current::features::read_tsc() };
+    #[cfg(not(target_os = "uefi"))]
+    let _read_end: u64 = 0;
     crate::PlatformImpl::write_byte(b'3');
     // 3) 规划内核装载（入口、段、必须保持映射的区间）。
     let info = plan_kernel(&c.kernel_out[..len], c.segments).map_err(BringUpError::Kernel)?;
@@ -2684,6 +2694,23 @@ pub unsafe fn bring_up(
                 "[liftoff] 引导总耗时（bring_up 入口→换表完成）= {} 微秒\n",
                 micros
             ));
+        }
+        // D3 测量：**内核读取吞吐**。读的就是介质上的内核映像，字节数就是 `len`。
+        let read_ticks = firmware_current::current::monotonic_delta(read_start, read_end);
+        if let Some(read_micros) = current::features::micros_from_ticks(read_ticks, hz) {
+            if read_micros == 0 {
+                // 不足 1 微秒就不算吞吐：除零会给一个编造的巨大值。
+                report_fmt::<crate::PlatformImpl>(format_args!(
+                    "[liftoff] 内核读取：{} 字节，耗时不足 1 微秒，不计算吞吐\n",
+                    len
+                ));
+            } else {
+                let bytes_per_second = (len as u64).saturating_mul(1_000_000) / read_micros;
+                report_fmt::<crate::PlatformImpl>(format_args!(
+                    "[liftoff] 内核读取：{} 字节 / {} 微秒 = {} 字节每秒\n",
+                    len, read_micros, bytes_per_second
+                ));
+            }
         }
     }
     for byte in b"[liftoff] step: table ready\n" as &[u8] {
