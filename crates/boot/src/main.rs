@@ -12,11 +12,12 @@ use core::panic::PanicInfo;
 use firmware_current::current::SystemTable;
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
     // 停机前**必须留痕**：否则 panic 与“还在跑/已跳转”在串口上无法区分。
-    for byte in b"[liftoff] panic\n" {
-        PlatformImpl::write_byte(*byte);
-    }
+    //
+    // 但**只说“崩了”不够** —— 此前 `info` 被整个丢弃，于是看不出为什么、在哪里。
+    // 现在把消息与位置一起打出来（渲染逻辑在 `boot` 里，因而**宿主可测**）。
+    boot::entry::report_panic::<PlatformImpl>(Some(&info.message()), info.location());
     PlatformImpl::halt()
 }
 

@@ -206,13 +206,12 @@ fn report_failure<P: Platform>(stage: &BringUpError) {
     }
 }
 
-/// 把任意错误渲成一行（**固定缓冲，不分配**）。
+/// 把一段 `fmt` 输出渲进**固定缓冲**后写到诊断通道（不分配）。
 ///
-/// 缓冲溢出即截断（`fmt` 返回 `Err` 被忽略）—— 诊断输出不该因为消息长就 panic。
+/// 缓冲溢出即截断 —— 诊断输出不该因为消息长就 panic。
 ///
-/// 用 `Display`：这四个顶层类型现已实现它，所以失败能报出**人类可读**的原因。
-/// 其**载荷**里还有 6 个类型没有 `Display`（清单在台账），那些位置暂用 `{:?}`。
-fn report_cause<P: Platform>(err: &impl core::fmt::Display) {
+/// **单点**：`report_cause` 与 `report_panic` 都经它输出，缓冲大小与截断策略只在这里。
+fn report_fmt<P: Platform>(args: core::fmt::Arguments<'_>) {
     struct Buf {
         bytes: [u8; 128],
         len: usize,
@@ -231,8 +230,34 @@ fn report_cause<P: Platform>(err: &impl core::fmt::Display) {
     }
     use core::fmt::Write;
     let mut buf = Buf { bytes: [0; 128], len: 0 };
-    let _ = write!(buf, "[liftoff]   cause: {}\n", err);
+    let _ = buf.write_fmt(args);
     report::<P>(&buf.bytes[..buf.len]);
+}
+
+/// 把一条错误渲成一行。
+fn report_cause<P: Platform>(err: &impl core::fmt::Display) {
+    report_fmt::<P>(format_args!("[liftoff]   cause: {}\n", err));
+}
+
+/// 把 **panic 信息**写到诊断通道：消息 + 位置。
+///
+/// 此前 panic 只打 `[liftoff] panic` —— 能区分「崩了」与「还在跑」，但**说不出为什么、
+/// 在哪里**。与这一轮在修的其他失败同属一类：**失败必须报出自己的名字**。
+///
+/// 参数是**已取出的字段**而不是 `&PanicInfo`：`#[panic_handler]` 位于 `no_std` 二进制
+/// 里、宿主测不了，而这样切分之后本函数**可测**（用 `format_args!` 与 `Location::caller()`）。
+pub fn report_panic<P: Platform>(
+    message: Option<&dyn core::fmt::Display>,
+    location: Option<&core::panic::Location<'_>>,
+) {
+    report::<P>(b"[liftoff] panic");
+    if let Some(text) = message {
+        report_fmt::<P>(format_args!(": {text}"));
+    }
+    if let Some(at) = location {
+        report_fmt::<P>(format_args!(" at {}:{}", at.file(), at.line()));
+    }
+    report::<P>(b"\n");
 }
 
 /// 失败环节的短文本（真跑时从串口就能看出卡在哪一步）。
@@ -779,7 +804,7 @@ pub fn check_before_entry(
 
 #[cfg(test)]
 mod report_failure_tests {
-    use super::{BringUpError, report_failure};
+    use super::{BringUpError, report_failure, report_panic};
     use arch::paging::MapError;
     use arch::platform::{InterruptState, Platform};
     use std::string::String;
@@ -819,6 +844,40 @@ mod report_failure_tests {
         }
 
         fn restore_interrupts(_state: InterruptState) {}
+    }
+
+    fn capture_panic(
+        message: Option<&dyn core::fmt::Display>,
+        location: Option<&core::panic::Location<'_>>,
+    ) -> String {
+        OUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        report_panic::<Sink>(message, location);
+        let bytes = OUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(bytes).expect("诊断输出应是 UTF-8")
+    }
+
+    #[test]
+    fn a_panic_reports_its_message_and_location() {
+        // **panic 此前是唯一说不出自己名字的失败**：只打 `[liftoff] panic`，
+        // 能区分「崩了」与「还在跑」，但说不出为什么、在哪里。
+        static MESSAGE: &str = "下标越界";
+        struct Text(&'static str);
+        impl core::fmt::Display for Text {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        let message = Text(MESSAGE);
+        let text = capture_panic(Some(&message), Some(core::panic::Location::caller()));
+        assert!(text.contains("panic"), "必须标明是 panic: {text}");
+        assert!(text.contains("下标越界"), "必须打出 panic 消息: {text}");
+        assert!(text.contains("entry.rs"), "必须打出位置: {text}");
+    }
+
+    #[test]
+    fn a_panic_without_a_message_still_marks_itself() {
+        let text = capture_panic(None, None);
+        assert!(text.contains("panic"), "即使没有消息也必须留痕: {text}");
     }
 
     fn capture(stage: &BringUpError) -> String {
