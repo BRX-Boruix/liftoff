@@ -2552,6 +2552,35 @@ mod build_plan_tests {
     }
 
     #[test]
+    fn the_low_4gib_map_covers_the_lapic_page() {
+        // **这条测试记录 SMP 工作的一个前提。** LAPIC 在 `0xFEE0_0000`，而启动 AP 必须先能
+        // 读写它 —— 所以「我们自己的页表生效后 LAPIC 是否可达」直接决定 S3c 走哪条路：
+        //
+        // * 覆盖 → 只要自己的页表生效（路线 B：在 `spinup_go` 之前激活）就能读写；
+        // * 不覆盖 → 必须先把 LAPIC 页加进规划。
+        //
+        // 混合粒度下覆盖它的是**主体**那条大页映射（`0x200000..4GiB`）。若将来有人收窄低 4 GiB，
+        // 这里会先红 —— 而不是等到真机上 AP 启动失败。
+        let hhdm = [range(0x1000_0000, LARGE)];
+        let mut plan = [Mapping::EMPTY; 64];
+        let count = build_plan(
+            &request(0x20_0000, 0xffff_ffff_8000_0000, LARGE, &hhdm, &[], LARGE),
+            &mut plan,
+        )
+        .expect("规划应成功");
+        const LAPIC: u64 = 0xFEE0_0000;
+        let covering = plan[..count].iter().find(|m| {
+            let start = m.virt.as_u64();
+            m.len > 0 && start <= LAPIC && LAPIC < start.saturating_add(m.len)
+        });
+        assert!(
+            covering.is_some(),
+            "低 4 GiB 映射必须覆盖 LAPIC 页 {:#x} —— 否则自己的页表生效后也读不到它",
+            LAPIC
+        );
+    }
+
+    #[test]
     fn the_low_4gib_map_is_hybrid_and_no_longer_covers_page_zero() {
         // **当前形态：从 0 起的一条 2 MiB 大页。**
         //
