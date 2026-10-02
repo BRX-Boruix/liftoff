@@ -37,6 +37,15 @@ fn large_mask(page_size: u64) -> u64 {
     !(page_size - 1) & FRAME_ADDR_MASK
 }
 
+/// 本级项是否把 PS 位解释为「这是一个大页」；是则返回该大页大小。
+///
+/// **`ps_page_size` 为 `None` 时永远返回 `None`** —— 那一级没有 PS 位（PML4），
+/// bit 7 是地址的一部分。抽成纯函数是为了能直接测这一档：真机才会踩到它，
+/// 而宿主测试的帧地址恰好让 bit 7 恒为 0。
+fn huge_at_level(ps_page_size: Option<u64>, entry: u64) -> Option<u64> {
+    ps_page_size.filter(|_| entry & PTE_HUGE != 0)
+}
+
 /// 把沿途各级页表项折算成**语义权限**：取交集。
 ///
 /// 只报叶项权限是常见错误 —— 会报出一个「可写」的地址，而实际写入被上级拒绝。
@@ -106,22 +115,30 @@ impl<A: FrameAllocator> X86PageTable<A> {
 
     /// 取（必要时创建或**拆分**）下级页表帧。
     ///
-    /// `child_page_size` 是本级项所代表的**下级页大小**：
-    /// PML4 项 → 1 GiB；PDPT 项 → 2 MiB；PD 项 → 4 KiB。
+    /// `ps_page_size` 是**本级项**用 PS 位表示的大页大小：
+    /// * 检查 **PDPT** 项时是 `Some(1 GiB)`（PS=1 表示 1 GiB 页）
+    /// * 检查 **PD** 项时是 `Some(2 MiB)`
+    /// * 检查 **PML4** 项时是 `None` —— **PML4 项没有 PS 位**，bit 7 属于**地址域**。
     ///
     /// 若该位置已是**更大粒度**的映射（PS=1），这里把它**拆分**成下一级页表并如实
     /// 复制原有映射。**绝不能**把大页项里的地址当作页表帧地址使用 —— 那存的是**页帧
-    /// 基址**，下钻等于往任意物理内存写 PTE（静默内存损坏，真机实测为复位循环）。
+    /// 基址**，下钻等于往任意物理内存写 PTE（静默内存损坏）。
+    ///
+    /// **`None` 这一档是必需的，不是多余的分支**：在 PML4 项上检查 bit 7 会把地址里
+    /// 恰好为 1 的那一位当成「这是大页」，于是对一张普通的页表帧做拆分，造出垃圾映射。
+    /// 宿主测试用的帧地址全是 `0x10000000 + n*0x1000`（bit 7 恒为 0），**测不出这个错**；
+    /// 真机的固件页地址可能带 bit 7 —— 这正是「宿主过、真机不过」的形态。
     fn table_or_create(
         &mut self,
         frame: PhysFrame,
         index: u64,
-        child_page_size: u64,
+        ps_page_size: Option<u64>,
     ) -> Result<PhysFrame, MapError> {
         let entry = self.read_entry(frame, index)?;
         if entry & PTE_PRESENT != 0 {
-            if entry & PTE_HUGE != 0 {
-                return self.split_large(frame, index, entry, child_page_size);
+            if let Some(page_size) = huge_at_level(ps_page_size, entry) {
+                // 拆分后的子项大小 = 本级大页大小 / 每级项数。
+                return self.split_large(frame, index, entry, page_size / ENTRIES_PER_TABLE);
             }
             return Ok(PhysFrame::containing(PhysAddr::new(entry & FRAME_ADDR_MASK)));
         }
@@ -229,9 +246,10 @@ impl<A: FrameAllocator> X86PageTable<A> {
         while remaining > 0 {
             // 三级下钻：PML4 -> PDPT -> PD ->（本函数创建）PT。
             // 每张 4 KiB 页表覆盖 2 MiB，挂在 PD 上（PD 项 PS=0）。
-            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF, HUGE_PAGE_SIZE)?;
-            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF, LARGE_PAGE_SIZE)?;
-            let pt = self.table_or_create(pd, (v >> 21) & 0x1FF, PAGE_SIZE)?;
+            // PML4 项没有 PS 位 -> None；PDPT 项 PS 表示 1 GiB；PD 项 PS 表示 2 MiB。
+            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF, None)?;
+            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF, Some(HUGE_PAGE_SIZE))?;
+            let pt = self.table_or_create(pd, (v >> 21) & 0x1FF, Some(LARGE_PAGE_SIZE))?;
             let pt_index = (v >> 12) & 0x1FF;
             let pte = (p & FRAME_ADDR_MASK) | pte_flags;
             self.write_entry(pt, pt_index, pte)?;
@@ -269,8 +287,8 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
             // validate_range 已保证 virt + len 与 phys + len 不溢出，且 page < pages，故两处加法安全。
             let v = virt.as_u64() + page * LARGE_PAGE_SIZE;
             let p = phys.as_u64() + page * LARGE_PAGE_SIZE;
-            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF, HUGE_PAGE_SIZE)?;
-            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF, LARGE_PAGE_SIZE)?;
+            let pdpt = self.table_or_create(self.root, (v >> 39) & 0x1FF, None)?;
+            let pd = self.table_or_create(pdpt, (v >> 30) & 0x1FF, Some(HUGE_PAGE_SIZE))?;
             self.write_entry(pd, (v >> 21) & 0x1FF, (p & LARGE_ADDR_MASK) | pte_flags | PTE_HUGE)?;
         }
         Ok(())
@@ -361,6 +379,26 @@ impl<A: FrameAllocator> PageTable for X86PageTable<A> {
 
 #[cfg(test)]
 mod tests {
+    use super::huge_at_level;
+
+    #[test]
+    fn the_ps_bit_is_only_honoured_at_levels_that_have_one() {
+        // **这条测试守着一个只在真机才会踩到的错。** PML4 项**没有 PS 位** —— bit 7
+        // 属于地址域，页表帧地址里它可能恰好为 1。若在 PML4 层检查它，就会把普通
+        // 页表帧误判成 1 GiB 大页并拆分，造出垃圾映射。
+        //
+        // 宿主测试的帧地址全是 `0x10000000 + n*0x1000`（bit 7 恒为 0），所以**测不出**
+        // 这个错；这里直接测判定函数本身。
+        assert_eq!(huge_at_level(None, 0x80), None, "PML4 层不得解释 bit 7");
+        assert_eq!(huge_at_level(None, 0x80 | 1), None, "present 也不能让它变成大页");
+        assert_eq!(huge_at_level(Some(0x200000), 1), None, "没置 PS 就不是大页");
+        assert_eq!(
+            huge_at_level(Some(0x200000), 0x80 | 1),
+            Some(0x200000),
+            "PD 层置了 PS 才是 2 MiB 大页",
+        );
+        assert_eq!(huge_at_level(Some(0x4000_0000), 0x80 | 1), Some(0x4000_0000));
+    }
     use super::{FrameAllocator, LARGE_PAGE_SIZE, X86PageTable};
     use arch::addr::{PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr};
     use arch::hhdm::DirectMap;
