@@ -2,5 +2,7 @@
 
 #![no_std]
 
+pub mod acpi;
+
 #[cfg(test)]
 extern crate std;
