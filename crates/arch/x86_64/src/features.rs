@@ -68,11 +68,61 @@ pub fn la57_active() -> bool {
     }
 }
 
+/// 读时间戳计数器（TSC）✓。
+///
+/// **为什么在实现层**：`rdtsc` 是 x86 指令 ✓ —— 让它出现在中性层就是跨层直连 ✗（S14 / ADR-007）✓。
+///
+/// **为什么不用固件的 `GetNextMonotonicCount`**：真机**两次实测**（第 153/154 轮）
+/// **停 10 毫秒只涨 1** ✗ —— OVMF/QEMU 下它不是可用的时间源 ✓。TSC 是**已知会走**的计数器 ✓。
+///
+/// **频率未知** ✗ —— 由调用方用**已知时长**（固件的 `Stall`）实测标定 ✓，见 `hz_from_ticks`。
+#[cfg(target_os = "uefi")]
+#[inline]
+pub unsafe fn read_tsc() -> u64 {
+    // SAFETY: `rdtsc` 在任何 x86-64 上都可执行，且**无副作用** ✓（只是读一个计数器）。
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// 由"**已知时长**内走过的 TSC 数"算出频率（Hz）—— **纯逻辑、宿主可测** ✓。
+///
+/// `micros == 0` 返回 `None` ✗ —— **不返回编造的数** ✓，也不 panic ✓。
+#[inline]
+pub const fn hz_from_ticks(ticks: u64, micros: u64) -> Option<u64> {
+    if micros == 0 {
+        return None;
+    }
+    Some(ticks.saturating_mul(1_000_000) / micros)
+}
+
+/// 由 TSC 数与频率算出**微秒** —— **纯逻辑、宿主可测** ✓。
+///
+/// `hz == 0` 返回 `None` ✗（**不除零、不 panic** ✓）。
+#[inline]
+pub const fn micros_from_ticks(ticks: u64, hz: u64) -> Option<u64> {
+    if hz == 0 {
+        return None;
+    }
+    Some(ticks.saturating_mul(1_000_000) / hz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CPUID_EXT_FEATURES_EDX_NX, CR4_LA57, la57_active_from_cr4, nx_available_from_extended_edx,
+        CPUID_EXT_FEATURES_EDX_NX, CR4_LA57, hz_from_ticks, la57_active_from_cr4,
+        micros_from_ticks, nx_available_from_extended_edx,
     };
+
+    #[test]
+    fn the_tsc_calibration_refuses_to_invent_a_number() {
+        // **零时长得不到频率** ✗ —— 返回 `None` 而不是一个编造的数 ✓（S09）。
+        assert_eq!(hz_from_ticks(1_000_000, 0), None);
+        assert_eq!(micros_from_ticks(1_000_000, 0), None, "不得除零");
+        assert_eq!(hz_from_ticks(1_000, 1), Some(1_000_000_000), "1 微秒 1000 个数 → 1 GHz");
+        assert_eq!(hz_from_ticks(30_000_000, 10_000), Some(3_000_000_000), "10 毫秒 → 3 GHz");
+        assert_eq!(micros_from_ticks(3_000_000, 3_000_000_000), Some(1_000), "3 GHz 下 1 毫秒");
+        // **饱和而不是回绕** ✗ —— 回绕会给出一个极小值，看起来像"极快" ✗。
+        assert_eq!(hz_from_ticks(u64::MAX, 1), Some(u64::MAX));
+    }
 
     #[test]
     fn nx_is_read_from_the_documented_bit() {

@@ -2603,6 +2603,30 @@ pub unsafe fn bring_up(
             firmware_current::current::monotonic_delta(before, after)
         ));
     }
+    // 【D3 测量 · TSC 标定】固件的单调计数**已两次证伪** ✗（停 10 毫秒只涨 1），
+    // 改用 **TSC** ✓ —— 它是**已知会走**的计数器 ✓，但**频率未知** ✗，所以同样**实测标定** ✓。
+    //
+    // **必须按目标门控** ✗：`read_tsc` 只在 UEFI 目标上存在 ✓（`rdtsc` 是特权无关但目标相关的路径），
+    // 宿主构建里没有它 ✗ —— 第一次我漏了这个门控，**宿主测试构建直接编译失败** ✓。
+    #[cfg(target_os = "uefi")]
+    {
+        // SAFETY: `rdtsc` 无副作用 ✓；仍在 boot services 期间（`Stall` 可用 ✓）。
+        let t0 = unsafe { current::features::read_tsc() };
+        // SAFETY: 固件延时 10 毫秒 ✓。
+        unsafe { (table.stall)(10_000) };
+        // SAFETY: 同上。
+        let t1 = unsafe { current::features::read_tsc() };
+        let ticks = firmware_current::current::monotonic_delta(t0, t1);
+        match current::features::hz_from_ticks(ticks, 10_000) {
+            Some(hz) => report_fmt::<crate::PlatformImpl>(format_args!(
+                "[liftoff] TSC 标定：{} Hz（停 10 毫秒实测，{} 个计数 ✓）\n",
+                hz, ticks
+            )),
+            None => report_fmt::<crate::PlatformImpl>(format_args!(
+                "[liftoff] TSC 标定失败（时长为零）\n"
+            )),
+        }
+    }
     for byte in b"[liftoff] step: applying plan\n" as &[u8] {
         crate::PlatformImpl::write_byte(*byte);
     }
