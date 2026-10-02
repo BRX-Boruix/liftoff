@@ -2783,6 +2783,12 @@ pub unsafe fn bring_up(
     // `frames` 在更早处**已被移动** ✗（`EfiFrameAllocator` 不实现 `Copy` ✓）→ 不能复用 ✓。
     // 但它只是**固件指针的包装** ✓，而 `table.allocate_pages` 仍可用 ✓ → 构造一个新的 ✓。
     let mut low_frames = EfiFrameAllocator::new(table.allocate_pages);
+    // **精确标注**：这是**低页分配器**交付的帧数 ✓，**不是**引导器总占用 ✗ ——
+    // 报成"总占用"就是虚报 ✗（台账 §4.1 的运行期内存还需要主分配器的计数 ✓）。
+    report_fmt::<crate::PlatformImpl>(format_args!(
+        "[liftoff] 低页分配器已交付 {} 帧\n",
+        low_frames.allocated()
+    ));
     register_madt_cpus(
         &mut low_frames,
         table.stall,

@@ -175,12 +175,22 @@ mod tests {
 /// 的契约要求零化，故取回后自己清零 —— 页表帧若残留旧数据，会产生**伪映射**（比崩溃更难查）。
 pub struct EfiFrameAllocator {
     allocate_pages: AllocatePages,
+    /// **已成功交付的帧数** ✓ —— 用来回答"引导器运行期到底占了多少内存"（台账 §4.1）✓。
+    ///
+    /// **只数成功交付的** ✓：被拒的（状态错误、未对齐、越界）**不计** ✗ ——
+    /// 否则"占了多少内存"会被虚报 ✗，而虚报的数字比没有数字更坏 ✓。
+    allocated: usize,
 }
 
 impl EfiFrameAllocator {
     /// 以固件的 `AllocatePages` 指针构造。
     pub const fn new(allocate_pages: AllocatePages) -> Self {
-        Self { allocate_pages }
+        Self { allocate_pages, allocated: 0 }
+    }
+
+    /// 已成功交付的帧数 ✓。
+    pub const fn allocated(&self) -> usize {
+        self.allocated
     }
 }
 
@@ -213,6 +223,8 @@ impl EfiFrameAllocator {
         }
         // SAFETY: 固件刚分配的、页对齐的 4KiB 页，引导阶段该物理地址可直接访问。
         unsafe { core::ptr::write_bytes(address as *mut u8, 0, 4096) };
+        // **只在这里计数** ✓ —— 走到这一行就是"真的交出去了" ✓。
+        self.allocated += 1;
         Some(PhysFrame::containing(PhysAddr::new(address)))
     }
 }
@@ -233,6 +245,8 @@ impl FrameAllocator for EfiFrameAllocator {
         }
         // SAFETY: `address` 是固件刚分配的、页对齐的 4KiB 页，引导阶段该物理地址可直接访问。
         unsafe { core::ptr::write_bytes(address as *mut u8, 0, 4096) };
+        // **只在这里计数** ✓ —— 走到这一行就是"真的交出去了" ✓。
+        self.allocated += 1;
         Some(PhysFrame::containing(PhysAddr::new(address)))
     }
 }
@@ -243,6 +257,22 @@ mod efi_frame_allocator_tests {
         ALLOCATE_ADDRESS, ALLOCATE_ANY_PAGES, ALLOCATE_MAX_ADDRESS, EFI_LOADER_CODE,
         EFI_LOADER_DATA, EfiFrameAllocator,
     };
+
+    #[test]
+    fn the_allocator_counts_only_the_frames_it_actually_handed_out() {
+        // **只数成功交付的帧** ✓ —— 被拒的（越界/状态错误/未对齐）不得计入 ✗，
+        // 否则"运行期占了多少内存"会被虚报 ✗（台账 §4.1 要的就是这个数）。
+        CALLS.store(0, Ordering::SeqCst);
+        FAIL.store(0, Ordering::SeqCst);
+        MISALIGN.store(0, Ordering::SeqCst);
+        let mut allocator = EfiFrameAllocator::new(fake_alloc);
+        assert_eq!(allocator.allocated(), 0, "一开始一个都没交出去");
+        let _ = allocator.allocate_zeroed_below(u64::MAX).expect("上界足够大");
+        assert_eq!(allocator.allocated(), 1, "成功一帧就记一帧");
+        // 上界远小于夹具返回的宿主地址 → 必被拒 ✓ → **不得计入** ✓。
+        let _ = allocator.allocate_zeroed_below(0x10);
+        assert_eq!(allocator.allocated(), 1, "被拒的分配不得计入");
+    }
     use arch::paging::FrameAllocator;
     use crate::types::{Status, SUCCESS, DEVICE_ERROR};
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
