@@ -803,6 +803,24 @@ pub fn check_before_entry(
 }
 
 #[cfg(test)]
+mod bootloader_info_tests {
+    use super::{BOOTLOADER_NAME, BOOTLOADER_VERSION};
+
+    #[test]
+    fn the_self_description_is_nul_terminated_and_not_empty() {
+        // Limine 协议要的是 **C 字符串**：缺 NUL 结尾，内核读串就会越界。
+        // 而这两个串此前**根本没有被交付**（`set_bootloader_info` 定义了却没被调用）。
+        assert!(BOOTLOADER_NAME.ends_with(&[0]), "名字必须以 NUL 结尾");
+        assert!(BOOTLOADER_VERSION.ends_with(&[0]), "版本必须以 NUL 结尾");
+        assert!(BOOTLOADER_NAME.len() > 1, "名字不能是空串");
+        assert!(BOOTLOADER_VERSION.len() > 1, "版本不能是空串");
+        // 中间不得出现 NUL，否则内核读到的会是被截断的串。
+        assert!(!BOOTLOADER_NAME[..BOOTLOADER_NAME.len() - 1].contains(&0));
+        assert!(!BOOTLOADER_VERSION[..BOOTLOADER_VERSION.len() - 1].contains(&0));
+    }
+}
+
+#[cfg(test)]
 mod report_failure_tests {
     use super::{BringUpError, report_failure, report_panic};
     use arch::paging::MapError;
@@ -1953,6 +1971,14 @@ pub fn build_plan(request: &PlanRequest<'_>, out: &mut [Mapping]) -> Result<usiz
     Ok(total)
 }
 
+/// 引导器自述用的名字（Limine `BOOTLOADER_INFO`）：**NUL 结尾的 C 字符串**。
+const BOOTLOADER_NAME: &[u8] = b"liftoff\0";
+
+/// 引导器自述用的版本。
+///
+/// 取自 Cargo 包版本 —— **单点**，不手抄：手抄的版本号必然与 `Cargo.toml` 漂移。
+const BOOTLOADER_VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+
 /// 交接所需的**全部调用方缓冲**（引导器不做隐藏分配：每个缓冲都由调用方给）。
 pub struct BringUp<'a, 'b> {
     /// 内核映像读出目标（约 25 MB，来自固件页）。
@@ -2307,6 +2333,17 @@ pub unsafe fn bring_up(
         c.responses.set_smp(bsp_lapic_id);
     }
     c.responses.set_hhdm_offset(HHDM_OFFSET);
+    // **引导器自述**：`BootloaderInfoResponse` 的 name/version 此前一直是 NULL ——
+    // `set_bootloader_info` 被定义了却**从未被调用**（死代码，S06），于是内核问
+    // "你是谁"时得到的是一片空白（串口实测 `[init] kernel version = 0x000`
+    // **很可能就是它**）。这里补上。
+    //
+    // `*mut` 来自协议 ABI（Limine 用 C 的 `char *`）；这两个静态字符串**只读**，
+    // 内核按协议只应读取它们。
+    c.responses.set_bootloader_info(
+        BOOTLOADER_NAME.as_ptr().cast_mut().cast(),
+        BOOTLOADER_VERSION.as_ptr().cast_mut().cast(),
+    );
     // RSDP 只在**真的从配置表找到**时才填；没有就留空 —— 给假指针比不给更糟。
     if let Some(rsdp) = c.rsdp {
         // **HHDM 地址**（对照 brxLimine `limine.c:1104`：`rsdp_response->address = reported_addr(rsdp)`）。
