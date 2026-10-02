@@ -14,7 +14,7 @@
 /// 字段顺序**有意**让 8 字节字段在最前、随后是 4 字节组、末尾显式补齐 ——
 /// 于是**没有隐式填充**，汇编看到的就是这里写的样子 ✓。
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ApTrampoline {
     /// HHDM 偏移。跳板用它把**物理**地址转成可访问的虚拟地址 ✓
     /// （参考实现里 `info_struct`、GDTR 都要经它换算 ✓）。
@@ -61,10 +61,149 @@ impl ApTrampoline {
     };
 }
 
+/// 参数块里**必须放进 u32** 的字段 —— 哪一个放不下就报哪一个，不笼统说"地址太大"。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApField {
+    /// 页表顶层物理地址。
+    Cr3Top,
+    /// 该 AP 的 `MpInfo` 物理地址。
+    InfoStruct,
+    /// 临时栈顶。
+    TempStack,
+    /// GDTR 线性地址。
+    Gdtr,
+}
+
+/// 填写参数块时的失败原因。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApTrampolineError {
+    /// 某个地址**超出 32 位**。
+    ///
+    /// **必须报错，绝不截断** ✗：跳板的参数帧里这些字段是 u32，截断会让 AP 跳到
+    /// **错误的地方** —— 真机上表现为复位，而根因藏在几个数量级之外。
+    AddressTooLarge(ApField),
+}
+
+impl core::fmt::Display for ApTrampolineError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AddressTooLarge(field) => {
+                write!(f, "地址超出 32 位，无法放进跳板参数帧：{field:?}")
+            }
+        }
+    }
+}
+
+/// 填写参数块的输入（**已换算好的物理/线性地址**）。
+#[derive(Clone, Copy, Debug)]
+pub struct ApTrampolineInput {
+    /// HHDM 偏移。
+    pub hhdm: u64,
+    /// 页表顶层**物理**地址。
+    pub cr3_top: u64,
+    /// 该 AP 的 `MpInfo` **物理**地址。
+    pub info_struct: u64,
+    /// 临时栈顶（完整 64 位地址）。
+    pub temp_stack_top: u64,
+    /// GDTR 的**线性**地址。
+    pub gdtr: u64,
+    /// 是否开启写保护（`CR0.WP`）。
+    pub write_protect: bool,
+}
+
+/// 由输入**填写**参数块（纯逻辑、宿主可测）。
+///
+/// 把「地址 → lo/hi 对」这类换算**集中在一处** ✓ —— 散在汇编前的准备代码里最容易写错 ✗，
+/// 而写错的表现是 AP 跳到错误地址（静默复位）。
+///
+/// **放不下的地址一律报错，不截断** ✓。
+pub fn prepare(input: &ApTrampolineInput) -> Result<ApTrampoline, ApTrampolineError> {
+    fn low32(value: u64, field: ApField) -> Result<u32, ApTrampolineError> {
+        u32::try_from(value).map_err(|_| ApTrampolineError::AddressTooLarge(field))
+    }
+    let mut block = ApTrampoline::EMPTY;
+    block.hhdm = input.hhdm;
+    block.cr3 = low32(input.cr3_top, ApField::Cr3Top)?;
+    block.info_struct = low32(input.info_struct, ApField::InfoStruct)?;
+    // 栈是 64 位地址，**有意**拆成 lo/hi —— 高半放不下是正常的，不是错误 ✓。
+    block.temp_stack_lo = input.temp_stack_top as u32;
+    block.temp_stack_hi = (input.temp_stack_top >> 32) as u32;
+    block.gdtr = low32(input.gdtr, ApField::Gdtr)?;
+    if input.write_protect {
+        block.target_mode |= 1 << 4;
+    }
+    // `booted_flag` 保持 0：**只有 AP 自己**能把它置 1 ✓。
+    Ok(block)
+}
+
 #[cfg(test)]
 mod tests {
     use super::ApTrampoline;
     use core::mem::{offset_of, size_of};
+
+    use super::{ApField, ApTrampolineError, ApTrampolineInput, prepare};
+
+    fn input() -> ApTrampolineInput {
+        ApTrampolineInput {
+            hhdm: 0xffff_8000_0000_0000,
+            cr3_top: 0x1000,
+            info_struct: 0x2000,
+            temp_stack_top: 0xffff_8000_0003_0000,
+            gdtr: 0x3000,
+            write_protect: true,
+        }
+    }
+
+    #[test]
+    fn prepare_fills_every_field_and_splits_the_stack_address() {
+        let block = prepare(&input()).expect("地址都放得下");
+        assert_eq!(block.hhdm, 0xffff_8000_0000_0000);
+        assert_eq!(block.cr3, 0x1000);
+        assert_eq!(block.info_struct, 0x2000);
+        assert_eq!(block.gdtr, 0x3000);
+        // 栈是 64 位：**必须拆成 lo/hi** —— 32 位阶段存不下 ✓。
+        assert_eq!(block.temp_stack_lo, 0x0003_0000);
+        assert_eq!(block.temp_stack_hi, 0xffff_8000);
+        assert_ne!(block.target_mode & (1 << 4), 0, "开了写保护");
+        assert_eq!(block.booted_flag, 0, "**只有 AP 自己**能置位，引导器不得预设");
+    }
+
+    #[test]
+    fn an_address_that_does_not_fit_is_rejected_not_truncated() {
+        // **截断是危险的**：AP 会跳到错误地址，真机上是复位，根因藏在几个数量级之外。
+        let mut bad = input();
+        bad.cr3_top = 0x1_0000_0000;
+        assert_eq!(
+            prepare(&bad),
+            Err(ApTrampolineError::AddressTooLarge(ApField::Cr3Top))
+        );
+        let mut bad = input();
+        bad.info_struct = 0x1_0000_0000;
+        assert_eq!(
+            prepare(&bad),
+            Err(ApTrampolineError::AddressTooLarge(ApField::InfoStruct))
+        );
+        let mut bad = input();
+        bad.gdtr = 0x1_0000_0000;
+        assert_eq!(prepare(&bad), Err(ApTrampolineError::AddressTooLarge(ApField::Gdtr)));
+    }
+
+    #[test]
+    fn a_high_stack_address_is_normal_not_an_error() {
+        // 栈**有意**是 64 位：高半放不下是正常的 ✓ —— 与"地址太大"是两回事。
+        let mut high = input();
+        high.temp_stack_top = 0xffff_ffff_ffff_f000;
+        let block = prepare(&high).expect("栈地址高是正常的");
+        assert_eq!(block.temp_stack_lo, 0xffff_f000);
+        assert_eq!(block.temp_stack_hi, 0xffff_ffff);
+    }
+
+    #[test]
+    fn write_protect_off_leaves_the_bit_clear() {
+        let mut off = input();
+        off.write_protect = false;
+        assert_eq!(prepare(&off).expect("合法").target_mode & (1 << 4), 0);
+    }
 
     #[test]
     fn the_parameter_block_layout_is_pinned() {
