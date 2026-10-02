@@ -41,8 +41,150 @@ pub use x86_64::ap;
 pub mod mock {
     //! 宿主测试用实现：不触碰硬件，但状态机行为真实（不是"假数据"）。
 
+    use arch::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
+    use arch::paging::{MapError, PageFlags, PageTable};
     use arch::platform::{InterruptState, Platform};
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+    /// mock 页表的**映射条数上限** —— **有界** ✓，超出如实报 `OutOfMemory` ✗（不静默丢映射）。
+    pub const MOCK_PAGE_TABLE_CAPACITY: usize = 32;
+
+    /// 一条宿主侧映射。
+    ///
+    /// 以**整段**为单位存（而不是逐页）✓：容量才有意义，`translate` 靠页内偏移算 ✓。
+    #[derive(Clone, Copy)]
+    struct Entry {
+        virt: u64,
+        phys: u64,
+        len: u64,
+        /// **2 MiB 大页**（用于"拒绝拆分"的判断 ✓）。
+        large: bool,
+        flags: PageFlags,
+    }
+
+    /// 宿主测试用页表：**不碰真实内存** ✓，但语义按 `PageTable` 的契约 ✓。
+    ///
+    /// **能力范围如实声明** ✓：只支持 **4 KiB** 粒度 ✗；`map_range`（2 MiB）返回
+    /// `UnsupportedGranularity`，**不假装支持** ✗。
+    /// 只支持**整段**操作 —— 只覆盖一段的一部分时返回 `UnsupportedGranularity`，
+    /// **不静默拆分** ✗（与真实现同一约定 ✓）。
+    pub struct MockPageTable {
+        entries: [Option<Entry>; MOCK_PAGE_TABLE_CAPACITY],
+    }
+
+    impl MockPageTable {
+        /// 空页表（仅宿主测试使用）。
+        pub fn new() -> Self {
+            Self { entries: [None; MOCK_PAGE_TABLE_CAPACITY] }
+        }
+
+        fn validate(virt: VirtAddr, phys: PhysAddr, len: u64) -> Result<(), MapError> {
+            if len == 0 {
+                return Err(MapError::Empty);
+            }
+            if virt.as_u64() % PAGE_SIZE != 0 {
+                return Err(MapError::MisalignedVirt);
+            }
+            if phys.as_u64() % PAGE_SIZE != 0 {
+                return Err(MapError::MisalignedPhys);
+            }
+            if len % PAGE_SIZE != 0 {
+                return Err(MapError::MisalignedLength);
+            }
+            virt.as_u64().checked_add(len).ok_or(MapError::Overflow)?;
+            phys.as_u64().checked_add(len).ok_or(MapError::Overflow)?;
+            Ok(())
+        }
+
+        fn index_of(&self, v: u64) -> Option<usize> {
+            self.entries.iter().position(|e| match e {
+                Some(entry) => v >= entry.virt && v < entry.virt + entry.len,
+                None => false,
+            })
+        }
+    }
+
+    impl Default for MockPageTable {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl PageTable for MockPageTable {
+        fn map_range(&mut self, _virt: VirtAddr, _phys: PhysAddr, _len: u64, _flags: PageFlags) -> Result<(), MapError> {
+            // **如实拒绝** ✓：mock 只有 4 KiB 粒度，不假装支持 2 MiB ✗。
+            Err(MapError::UnsupportedGranularity)
+        }
+
+        fn map_range_pages(&mut self, virt: VirtAddr, phys: PhysAddr, len: u64, flags: PageFlags) -> Result<(), MapError> {
+            Self::validate(virt, phys, len)?;
+            let slot = self.entries.iter().position(|e| e.is_none()).ok_or(MapError::OutOfMemory)?;
+            self.entries[slot] = Some(Entry {
+                virt: virt.as_u64(),
+                phys: phys.as_u64(),
+                len,
+                large: false,
+                flags,
+            });
+            Ok(())
+        }
+
+        fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+            let v = virt.as_u64();
+            let entry = self.index_of(v).map(|i| self.entries[i])?;
+            let entry = entry?;
+            Some((PhysAddr::new(entry.phys + (v - entry.virt)), entry.flags))
+        }
+
+        fn unmap(&mut self, virt: VirtAddr, len: u64) -> Result<(), MapError> {
+            Self::validate(virt, PhysAddr::new(0), len)?;
+            let (start, end) = (virt.as_u64(), virt.as_u64() + len);
+            for entry in self.entries.iter_mut() {
+                let Some(e) = *entry else { continue };
+                let (es, ee) = (e.virt, e.virt + e.len);
+                if ee <= start || es >= end {
+                    continue;
+                }
+                // **只允许整段解除** ✓ —— 部分覆盖会改变别的地址的粒度 ✗。
+                if es < start || ee > end {
+                    return Err(MapError::UnsupportedGranularity);
+                }
+                *entry = None;
+            }
+            // **未映射不算错** ✓：解除的目标状态就是"不存在"（与真实现同一约定 ✓）。
+            Ok(())
+        }
+
+        fn protect(&mut self, virt: VirtAddr, len: u64, flags: PageFlags) -> Result<(), MapError> {
+            Self::validate(virt, PhysAddr::new(0), len)?;
+            let (start, end) = (virt.as_u64(), virt.as_u64() + len);
+            let mut touched = false;
+            for entry in self.entries.iter_mut() {
+                let Some(mut e) = *entry else { continue };
+                let (es, ee) = (e.virt, e.virt + e.len);
+                if ee <= start || es >= end {
+                    continue;
+                }
+                if es != start || ee != end {
+                    // **拒绝而不是静默拆分** ✓（与真实现同一约定 ✓）。
+                    return Err(MapError::UnsupportedGranularity);
+                }
+                e.flags = flags;
+                *entry = Some(e);
+                touched = true;
+            }
+            if touched {
+                Ok(())
+            } else {
+                // **未映射必须报错** ✗ —— 假装成功会让调用方以为"权限已设" ✓。
+                Err(MapError::Unmapped)
+            }
+        }
+
+        unsafe fn activate(&self) {
+            // **如实的不动作** ✓：宿主上没有可激活的页表 ✗ —— 不是假装激活成功 ✓。
+        }
+    }
 
     /// 输出记录缓冲的容量。
     ///
@@ -164,8 +306,68 @@ pub use mock::Mock as PlatformImpl;
 
 #[cfg(all(test, feature = "impl-mock"))]
 mod tests {
-    use crate::mock::{Mock, OUTPUT_CAPACITY};
+    use crate::mock::{Mock, MockPageTable, OUTPUT_CAPACITY};
+    use arch::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
+    use arch::paging::{MapError, PageFlags, PageTable};
     use arch::platform::Platform;
+
+    fn mapped(v: u64) -> (MockPageTable, PageFlags) {
+        let mut pt = MockPageTable::new();
+        let flags = PageFlags::present().with(PageFlags::writable());
+        pt.map_range_pages(VirtAddr::new(v), PhysAddr::new(v + 0x1000_0000), PAGE_SIZE, flags)
+            .expect("映射应成功");
+        (pt, flags)
+    }
+
+    #[test]
+    fn mock_page_table_translates_with_the_page_offset_and_the_flags() {
+        let (pt, flags) = mapped(0x4000_0000);
+        let (phys, got) = pt.translate(VirtAddr::new(0x4000_0123)).expect("应命中");
+        assert_eq!(phys.as_u64(), 0x5000_0123, "物理地址要带页内偏移");
+        assert_eq!(got, flags, "权限要原样返回");
+        assert!(pt.translate(VirtAddr::new(0x4000_1000)).is_none(), "未映射就是未映射");
+    }
+
+    #[test]
+    fn mock_page_table_reports_its_own_failure_paths() {
+        let mut pt = MockPageTable::new();
+        let p = PhysAddr::new(0x1000);
+        assert_eq!(pt.map_range_pages(VirtAddr::new(0), p, 0, PageFlags::present()), Err(MapError::Empty));
+        assert_eq!(pt.map_range_pages(VirtAddr::new(1), p, PAGE_SIZE, PageFlags::present()), Err(MapError::MisalignedVirt));
+        assert_eq!(pt.map_range_pages(VirtAddr::new(0), PhysAddr::new(1), PAGE_SIZE, PageFlags::present()), Err(MapError::MisalignedPhys));
+        assert_eq!(pt.map_range_pages(VirtAddr::new(0), p, PAGE_SIZE + 1, PageFlags::present()), Err(MapError::MisalignedLength));
+        // 2 MiB 粒度**如实拒绝** ✓ —— mock 只支持 4 KiB，不假装支持 ✗。
+        assert_eq!(pt.map_range(VirtAddr::new(0), p, PAGE_SIZE, PageFlags::present()), Err(MapError::UnsupportedGranularity));
+    }
+
+    #[test]
+    fn mock_page_table_refuses_to_split_and_reports_unmapped_protect() {
+        let (mut pt, _) = mapped(0x4000_0000);
+        // 未映射改权限**必须报错** ✗，不能假装成功 ✓。
+        assert_eq!(pt.protect(VirtAddr::new(0x8000_0000), PAGE_SIZE, PageFlags::present()), Err(MapError::Unmapped));
+        // **整段覆盖**是允许的 ✓ —— `mapped()` 建的 run 恰好一页，所以这一条**应当成功** ✗。
+        // （我第一版把它写成"必须被拒绝" ✗ —— 那是我把"整段"和"部分"搞混了：
+        //  一页的 run 被整段保护，本来就是合法的整段操作 ✓。）
+        pt.protect(VirtAddr::new(0x4000_0000), PAGE_SIZE, PageFlags::present())
+            .expect("整段覆盖应当允许");
+        // **部分覆盖**才必须拒绝 ✓ —— 建一个**两页**的 run，只保护其中一页。
+        let mut two = MockPageTable::new();
+        two.map_range_pages(
+            VirtAddr::new(0x6000_0000),
+            PhysAddr::new(0x7000_0000),
+            PAGE_SIZE * 2,
+            PageFlags::present(),
+        )
+        .expect("两页映射应成功");
+        assert_eq!(
+            two.protect(VirtAddr::new(0x6000_0000), PAGE_SIZE, PageFlags::present()),
+            Err(MapError::UnsupportedGranularity),
+            "只覆盖两页 run 的一部分时**不得静默拆分** ✗"
+        );
+        // 整段覆盖两页则允许 ✓。
+        two.protect(VirtAddr::new(0x6000_0000), PAGE_SIZE * 2, PageFlags::present())
+            .expect("整段两页应当允许");
+    }
 
     #[test]
     fn mock_records_the_bytes_it_is_given() {
