@@ -471,6 +471,20 @@ unsafe fn start_aps(
     // LAPIC 不会报错，只会**什么都不发生**）。本内核不支持 x2APIC，故第一个参数是 `false`。
     // 内核不支持 x2APIC → `false`；模式判定与位域解析都在实现层。
     // SAFETY: `IA32_APIC_BASE` 在 x86-64 上必然存在。
+    // S4 的另一半：固件若已开 x2APIC 而**内核不支持**，必须先退回 xAPIC。
+    // 对照 brxLimine `common/sys/smp.c:144-153`（它回退不了就 panic）。
+    // 我们不 panic：**如实报出原因，并且一个 AP 都不启动** —— x2APIC 还开着时
+    // 按 xAPIC 发 IPI 不会报错，只会什么都不发生，那正是本会话吃过的那种静默失败。
+    #[cfg(target_os = "uefi")]
+    {
+        // SAFETY: 仍在 boot services 期间，且在任何 AP 启动之前。
+        if let Err(error) = unsafe { current::lapic::revert_firmware_x2apic() } {
+            report_fmt::<crate::PlatformImpl>(format_args!(
+                "[liftoff] ap: 固件开着 x2APIC 而内核不支持，回退 xAPIC 失败：{error}\n"
+            ));
+            return 0;
+        }
+    }
     let access = unsafe { current::lapic::firmware_access(false) };
 
     // 【为什么把决策抽出去】这里原先有 5 处**静默** `continue` —— 于是一次真机失败

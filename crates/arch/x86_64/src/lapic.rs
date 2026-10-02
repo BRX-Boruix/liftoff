@@ -394,6 +394,55 @@ pub unsafe fn firmware_apic_state() -> ApicState {
 /// **中性层据此发 IPI**—— 它不必知道 MSR 编号，也不必解析位域。
 ///
 /// # Safety
+/// 把固件打开的 x2APIC **退回 xAPIC**（S4 的另一半）。
+///
+/// 对照 brxLimine `common/sys/smp.c:144-153`：固件若已开 x2APIC 而**内核不支持**，
+/// 必须回退；参考实现在回退不了时直接 `panic`。
+///
+/// **我们不 panic**：返回 `Result`，把决定权留给调用方，并且每一个失败都有具体类型。
+///
+/// **幂等**：本来就没生效时返回 `Ok(())`，不是错误。
+///
+/// **按目标门控**：它要读写的 `rdmsr`/`wrmsr` 只在 UEFI 目标上存在，
+/// 宿主构建里没有这两个函数，所以整个回退动作也只存在于 UEFI 目标。
+///
+/// # Safety
+/// 必须在任何 AP 启动之前调用：x2APIC 还开着时按 xAPIC 发 IPI 不会报错，
+/// 只会**什么都不发生**。
+#[cfg(target_os = "uefi")]
+pub unsafe fn revert_firmware_x2apic() -> Result<(), ApicError> {
+    // SAFETY: 调用方保证特权级与时机（见函数文档）。
+    let apic_base = unsafe { rdmsr(IA32_APIC_BASE) };
+    let Some((disabled, xapic)) = xapic_revert_steps(apic_base) else {
+        return Ok(());
+    };
+    // **先查再写**：永久关闭的 CPU 上写这个 MSR 会 #GP。
+    let arch_capabilities_present =
+        core::arch::x86_64::__cpuid(7).edx & CPUID_7_0_EDX_ARCH_CAPABILITIES != 0;
+    if arch_capabilities_present {
+        // SAFETY: 两个 MSR 都由 CPUID 报告为存在（上一行的判定）。
+        let arch_capabilities = unsafe { rdmsr(IA32_ARCH_CAPABILITIES) };
+        // SAFETY: 同上。
+        let disable_status = unsafe { rdmsr(IA32_XAPIC_DISABLE_STATUS) };
+        if xapic_permanently_disabled(true, arch_capabilities, disable_status) {
+            return Err(ApicError::XapicPermanentlyDisabled);
+        }
+    }
+    // 第一步：APIC 全关（同时清 bit 10 与 bit 11）。
+    // SAFETY: 见函数文档。
+    unsafe { wrmsr(IA32_APIC_BASE, disabled) };
+    // 第二步：置 bit 11，打开 xAPIC。
+    // SAFETY: 同上。
+    unsafe { wrmsr(IA32_APIC_BASE, xapic) };
+    // **复核**：写没生效就如实报错，不假装成功。
+    // SAFETY: 同上。
+    let now = unsafe { rdmsr(IA32_APIC_BASE) };
+    if x2apic_enabled(now) {
+        return Err(ApicError::RevertDidNotTakeEffect);
+    }
+    Ok(())
+}
+
 /// 同 [`firmware_apic_state`]。
 #[cfg(target_os = "uefi")]
 pub unsafe fn firmware_access(kernel_supports_x2apic: bool) -> ApicAccess {
