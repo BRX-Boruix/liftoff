@@ -71,6 +71,25 @@ fn u32_le(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(buf))
 }
 
+fn u64_le(bytes: &[u8], at: usize) -> Option<u64> {
+    let slice = bytes.get(at..at + 8)?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(slice);
+    Some(u64::from_le_bytes(buf))
+}
+
+/// 取任意 SDT 的**表长度**字段并校验它自洽（不检查签名 —— 那是调用方的事）。
+fn sdt_length(sdt: &[u8]) -> Result<usize, AcpiError> {
+    if sdt.len() < SDT_HEADER_LEN {
+        return Err(AcpiError::ShortTable);
+    }
+    let length = u32_le(sdt, 4).ok_or(AcpiError::ShortTable)? as usize;
+    if length < SDT_HEADER_LEN || length > sdt.len() {
+        return Err(AcpiError::BadLength);
+    }
+    Ok(length)
+}
+
 /// 取 MADT 的表长度字段，并校验它与签名、与映像范围自洽。
 ///
 /// 返回的是**表自身的长度**（而不是 `table.len()`）：固件给的缓冲可能比表大。
@@ -86,6 +105,84 @@ pub fn table_length(table: &[u8]) -> Result<usize, AcpiError> {
         return Err(AcpiError::BadLength);
     }
     Ok(length)
+}
+
+/// 根表的类型 —— **项宽不同**（RSDT 4 字节、XSDT 8 字节），所以必须显式区分。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SdtKind {
+    /// RSDT（ACPI 1.0）：4 字节项。
+    Rsdt,
+    /// XSDT（ACPI 2.0+）：8 字节项。
+    Xsdt,
+}
+
+/// RSDP 解析结果。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RsdpTables {
+    /// 根表类型。
+    pub kind: SdtKind,
+    /// 根表（RSDT / XSDT）的**物理地址**。
+    pub root: u64,
+}
+
+/// RSDP 签名（8 字节，含空格）。
+pub const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
+
+/// 解析 RSDP，得到根表地址与类型。
+///
+/// **按修订号选根表**：修订号 ≥ 2 才有 XSDT 字段（偏移 24）。ACPI 1.0 的 RSDP 只有 20 字节，
+/// 去读偏移 24 会读到**别的东西** —— 所以必须按修订号与长度双重判断，不能只看有没有那段内存。
+pub fn parse_rsdp(rsdp: &[u8]) -> Result<RsdpTables, AcpiError> {
+    if rsdp.len() < 20 {
+        return Err(AcpiError::ShortTable);
+    }
+    if rsdp.get(0..8) != Some(RSDP_SIGNATURE.as_slice()) {
+        return Err(AcpiError::WrongSignature);
+    }
+    if rsdp[15] >= 2 {
+        // XSDT 字段在偏移 24 —— 需要 36 字节，否则会读到别的东西。
+        if rsdp.len() < 36 {
+            return Err(AcpiError::ShortTable);
+        }
+        let root = u64_le(rsdp, 24).ok_or(AcpiError::ShortTable)?;
+        Ok(RsdpTables { kind: SdtKind::Xsdt, root })
+    } else {
+        let root = u32_le(rsdp, 16).ok_or(AcpiError::ShortTable)? as u64;
+        Ok(RsdpTables { kind: SdtKind::Rsdt, root })
+    }
+}
+
+/// 在根表里按**签名**查找子表，返回其物理地址。
+///
+/// 根表项里只有**地址**、没有签名，所以必须**读每张表的头 4 字节**来比对 —— 这也是本函数
+/// 需要一个读取器的原因：读取器由调用方给（真机是物理内存，宿主测试是假数据）。
+pub fn find_table<R>(
+    sdt: &[u8],
+    kind: SdtKind,
+    signature: &[u8; 4],
+    mut read_header: R,
+) -> Result<Option<u64>, AcpiError>
+where
+    R: FnMut(u64, &mut [u8; 4]) -> bool,
+{
+    let length = sdt_length(sdt)?;
+    let entry_size = match kind {
+        SdtKind::Rsdt => 4usize,
+        SdtKind::Xsdt => 8usize,
+    };
+    let mut at = SDT_HEADER_LEN;
+    while at + entry_size <= length {
+        let address = match kind {
+            SdtKind::Rsdt => u32_le(sdt, at).ok_or(AcpiError::ShortTable)? as u64,
+            SdtKind::Xsdt => u64_le(sdt, at).ok_or(AcpiError::ShortTable)?,
+        };
+        let mut header = [0u8; 4];
+        if read_header(address, &mut header) && &header == signature {
+            return Ok(Some(address));
+        }
+        at += entry_size;
+    }
+    Ok(None)
 }
 
 /// 把 MADT 里描述的处理器写进 `out`，返回**表里声明的总数**。
@@ -186,6 +283,82 @@ mod tests {
     }
 
     const EMPTY_CPU: MadtCpu = MadtCpu { processor_id: 0, apic_id: 0, enabled: false };
+
+    fn rsdp(revision: u8, rsdt: u32, xsdt: u64) -> Vec<u8> {
+        let mut table = std::vec![0u8; 36];
+        table[0..8].copy_from_slice(RSDP_SIGNATURE);
+        table[15] = revision;
+        table[16..20].copy_from_slice(&rsdt.to_le_bytes());
+        table[20..24].copy_from_slice(&36u32.to_le_bytes());
+        table[24..32].copy_from_slice(&xsdt.to_le_bytes());
+        table
+    }
+
+    #[test]
+    fn rsdp_revision_selects_the_root_table() {
+        // **只看"有没有那段内存"是不够的**：ACPI 1.0 的 RSDP 只有 20 字节，
+        // 偏移 24 处是**别的东西**。必须按修订号选。
+        assert_eq!(
+            parse_rsdp(&rsdp(0, 0x1234_5000, 0xDEAD_BEEF)),
+            Ok(RsdpTables { kind: SdtKind::Rsdt, root: 0x1234_5000 }),
+            "修订 0（ACPI 1.0）必须用 RSDT"
+        );
+        assert_eq!(
+            parse_rsdp(&rsdp(2, 0x1234_5000, 0xABCD_0000)),
+            Ok(RsdpTables { kind: SdtKind::Xsdt, root: 0xABCD_0000 }),
+            "修订 2 必须用 XSDT"
+        );
+    }
+
+    #[test]
+    fn a_wrong_rsdp_signature_is_rejected() {
+        let mut bad = rsdp(2, 0, 0);
+        bad[0] = 88; // ASCII X
+        assert_eq!(parse_rsdp(&bad), Err(AcpiError::WrongSignature));
+        assert_eq!(parse_rsdp(&[0u8; 8]), Err(AcpiError::ShortTable));
+    }
+
+    #[test]
+    fn find_table_matches_on_the_signature_it_reads_back() {
+        // 根表项只有地址、没有签名 —— 必须读每张表的头 4 字节比对。
+        // 造一张 XSDT，两项：0x1000 是别的表，0x2000 是 MADT。
+        // **这里我第一次写错了**：只分配了 `MADT_HEADER_LEN`(44) 字节，却往 `44..52` 写
+        // 第二项 —— 越界 panic。XSDT 的项是 8 字节，两项需要 44+16 字节。
+        let mut sdt = std::vec![0u8; MADT_HEADER_LEN + 16];
+        sdt[0..4].copy_from_slice(b"XSDT");
+        sdt[36..44].copy_from_slice(&0x1000u64.to_le_bytes());
+        sdt[44..52].copy_from_slice(&0x2000u64.to_le_bytes());
+        let length = sdt.len() as u32;
+        sdt[4..8].copy_from_slice(&length.to_le_bytes());
+
+        let mut reader = |address: u64, out: &mut [u8; 4]| {
+            if address == 0x2000 {
+                out.copy_from_slice(MADT_SIGNATURE);
+                true
+            } else {
+                out.copy_from_slice(b"XXXX");
+                true
+            }
+        };
+        assert_eq!(
+            find_table(&sdt, SdtKind::Xsdt, MADT_SIGNATURE, &mut reader),
+            Ok(Some(0x2000u64))
+        );
+    }
+
+    #[test]
+    fn find_table_reports_none_when_the_signature_is_absent() {
+        let mut sdt = std::vec![0u8; MADT_HEADER_LEN + 8];
+        sdt[0..4].copy_from_slice(b"XSDT");
+        sdt[36..44].copy_from_slice(&0x1000u64.to_le_bytes());
+        let length = sdt.len() as u32;
+        sdt[4..8].copy_from_slice(&length.to_le_bytes());
+        let mut reader = |_a: u64, out: &mut [u8; 4]| {
+            out.copy_from_slice(b"XXXX");
+            true
+        };
+        assert_eq!(find_table(&sdt, SdtKind::Xsdt, MADT_SIGNATURE, &mut reader), Ok(None));
+    }
 
     #[test]
     fn parses_xapic_entries_and_honours_the_enabled_flag() {
