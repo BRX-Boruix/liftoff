@@ -164,7 +164,7 @@ pub fn start_with<P: Platform>(
             .flatten(),
         };
         // SAFETY: 由 `check_before_entry` 与页表规划共同保证（见 `bring_up` 文档）。
-        bring_up(&*boot_services, image_handle, c, |entry| <P as Platform>::jump_to(entry))
+        bring_up(&mut *boot_services, image_handle, c, |entry| <P as Platform>::jump_to(entry))
     };
     if let Err(stage) = result {
         // 失败时把**环节与具体原因**都写出来：真跑时这是最有用的信息。
@@ -2196,7 +2196,10 @@ pub enum BringUpError {
 ///
 /// 引导阶段单线程调用一次；激活页表后不再返回。
 pub unsafe fn bring_up(
-    table: &BootServicesTable,
+    // **可变**：AP 接线需要在 `apply` 之后向固件要一页**低内存**（< 1 MiB ✗ 实模式寻址的硬约束 ✓），
+    // 而低页分配是 `allocate_zeroed_below(&mut self, …)` ✓ —— 不可变引用下**无法调用** ✗。
+    // 调用方是裸指针（`&mut *boot_services` ✓），所以这里改 `&mut` 不需要可变绑定 ✓。
+    table: &mut BootServicesTable,
     image_handle: Handle,
     c: BringUp<'_, '_>,
     enter: impl FnOnce(u64) -> !,
