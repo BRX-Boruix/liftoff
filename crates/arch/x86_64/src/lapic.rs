@@ -61,6 +61,15 @@ pub enum ApicError {
     ///
     /// **不得截断**：截断会把 IPI 发给**另一个核**，而调用方以为发对了。
     DestinationTooLargeForXapic,
+    /// 该 CPU **永久**关闭了 xAPIC，回退到 xAPIC 不可能成功。
+    ///
+    /// **不是"操作失败"**：是硬件状态决定了这条路不存在，只能如实上报。
+    XapicPermanentlyDisabled,
+    /// 两步写完了，但复读 MSR 发现 x2APIC **仍然开着**。
+    ///
+    /// **必须复核**：不复核就可能在 x2APIC 仍生效时按 xAPIC 发 IPI，
+    /// 而那不会报错，只会**什么都不发生**。
+    RevertDidNotTakeEffect,
 }
 
 impl core::fmt::Display for ApicError {
@@ -68,6 +77,12 @@ impl core::fmt::Display for ApicError {
         match self {
             Self::DestinationTooLargeForXapic => {
                 f.write_str("xAPIC 的目的地只有 8 位，超出即拒绝（截断会发给错误的核）")
+            }
+            Self::XapicPermanentlyDisabled => {
+                f.write_str("该 CPU 永久关闭了 xAPIC，无法从 x2APIC 回退")
+            }
+            Self::RevertDidNotTakeEffect => {
+                f.write_str("写完了 MSR 但 x2APIC 仍开着，回退未生效")
             }
         }
     }
@@ -189,6 +204,17 @@ pub const APIC_BASE_ENABLE: u64 = 1 << 11;
 /// `IA32_APIC_BASE` bit 10：**x2APIC** 使能。
 pub const APIC_BASE_X2APIC: u64 = 1 << 10;
 
+/// `IA32_ARCH_CAPABILITIES`（架构能力 MSR）。
+pub const IA32_ARCH_CAPABILITIES: u32 = 0x10A;
+/// 该 MSR 的 bit 21：支持 `XAPIC_DISABLE` 特性（Intel Meteor Lake 及以后）。
+pub const ARCH_CAPS_XAPIC_DISABLE: u64 = 1 << 21;
+/// `IA32_XAPIC_DISABLE_STATUS`：bit 0 表示 xAPIC 已被**永久**关闭。
+pub const IA32_XAPIC_DISABLE_STATUS: u32 = 0xBD;
+/// 该 MSR 的 bit 0。
+pub const XAPIC_DISABLE_STATUS_PERMANENT: u64 = 1;
+/// CPUID 叶 7 子叶 0 的 `EDX` bit 29：存在 `IA32_ARCH_CAPABILITIES`。
+pub const CPUID_7_0_EDX_ARCH_CAPABILITIES: u32 = 1 << 29;
+
 /// 读一个 MSR。
 ///
 /// **只在 UEFI 目标上存在**：`rdmsr` 是特权指令，宿主测试里执行会让整个测试进程崩掉。
@@ -235,6 +261,37 @@ pub const fn with_x2apic_enabled(apic_base: u64) -> u64 {
 /// **只清 bit 10，保留 bit 11**：LAPIC 仍要通过 MMIO 访问，全局使能不能关。
 pub const fn with_x2apic_disabled(apic_base: u64) -> u64 {
     (apic_base | APIC_BASE_ENABLE) & !APIC_BASE_X2APIC
+}
+
+/// 从 x2APIC 退回 xAPIC 的**两步** MSR 值；本来就没生效时返回 `None`。
+///
+/// **为什么必须两步**：x2APIC 直接切 xAPIC 是**非法状态转换**（`#GP`）。
+/// 参考实现（`common/sys/lapic.c:376-381`）先**同时**清 bit 10 与 bit 11（APIC 全关），
+/// 再单独置 bit 11 打开 xAPIC。所以 `with_x2apic_disabled` 算出的**最终值是对的**，
+/// 但**不能一次写进去** —— 这正是 S4 缺的另一半。
+///
+/// **判定比参考实现更严**：参考只看 bit 10（`rdmsr(0x1b) & (1 << 10)`），
+/// 我们用 [`x2apic_enabled`]（两个位都要）—— bit 10 残留但全局使能关着时 x2APIC
+/// 并未生效，那时**没有可退的东西**，返回 `None` 才是如实的。
+pub const fn xapic_revert_steps(apic_base: u64) -> Option<(u64, u64)> {
+    if !x2apic_enabled(apic_base) {
+        return None;
+    }
+    let disabled = apic_base & !(APIC_BASE_ENABLE | APIC_BASE_X2APIC);
+    Some((disabled, disabled | APIC_BASE_ENABLE))
+}
+
+/// xAPIC 是否被**永久**关闭（Meteor Lake 及以后）。
+///
+/// 为真时回退**不可能**成功，必须**先查再写** —— 往这种 CPU 的该 MSR 写非法值会 `#GP`。
+pub const fn xapic_permanently_disabled(
+    arch_capabilities_present: bool,
+    arch_capabilities: u64,
+    disable_status: u64,
+) -> bool {
+    arch_capabilities_present
+        && arch_capabilities & ARCH_CAPS_XAPIC_DISABLE != 0
+        && disable_status & XAPIC_DISABLE_STATUS_PERMANENT != 0
 }
 
 /// 选访问方式：固件是否已启用 x2APIC。
@@ -445,6 +502,41 @@ pub unsafe fn send_ipi(access: ApicAccess, value: u64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_xapic_revert_is_two_steps_and_not_a_direct_switch() {
+        // x2APIC 直接切 xAPIC 是非法状态转换（#GP），参考实现也是两步
+        // （common/sys/lapic.c:376-381）：先同时清 bit 10 与 bit 11，再单独置 bit 11。
+        let on = with_x2apic_enabled(0);
+        let (disabled, xapic) = xapic_revert_steps(on).expect("开着 x2APIC 就有得退");
+        assert_eq!(disabled & APIC_BASE_X2APIC, 0, "第一步必须清掉 bit 10");
+        assert_eq!(disabled & APIC_BASE_ENABLE, 0, "第一步连 bit 11 也清掉（APIC 全关）");
+        assert_eq!(xapic & APIC_BASE_ENABLE, APIC_BASE_ENABLE, "第二步打开 xAPIC");
+        assert_eq!(xapic & APIC_BASE_X2APIC, 0, "第二步不得把 bit 10 又置回来");
+        // 最终值与单步计算一致，但**写入必须分两步**。
+        assert_eq!(xapic, with_x2apic_disabled(on));
+    }
+
+    #[test]
+    fn reverting_is_idempotent_when_x2apic_is_not_in_effect() {
+        assert!(xapic_revert_steps(0).is_none(), "APIC 全关时没什么可退");
+        assert!(
+            xapic_revert_steps(APIC_BASE_ENABLE).is_none(),
+            "只有 bit 11 时 x2APIC 并未生效，不该假装有东西可退"
+        );
+    }
+
+    #[test]
+    fn a_permanently_disabled_xapic_is_reported_rather_than_guessed() {
+        // Meteor Lake 及以后可以永久关掉 xAPIC；那时回退不可能成功，
+        // 必须**先查再写**（写坏 MSR 会 #GP），并如实失败而不是假装成功。
+        assert!(xapic_permanently_disabled(true, ARCH_CAPS_XAPIC_DISABLE, 1));
+        assert!(
+            !xapic_permanently_disabled(false, ARCH_CAPS_XAPIC_DISABLE, 1),
+            "CPU 不报告该能力时不得据此拒绝"
+        );
+        assert!(!xapic_permanently_disabled(true, 0, 1), "不支持该特性时状态位无意义");
+        assert!(!xapic_permanently_disabled(true, ARCH_CAPS_XAPIC_DISABLE, 0), "没被永久关掉");
+    }
     use super::*;
 
     #[test]
