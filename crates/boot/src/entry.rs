@@ -500,6 +500,8 @@ unsafe fn start_aps(
         // 且**必须有界** ✓（参考实现 100 × 10 ms = 1 秒，`smp.c:112-117` ✓）。
         let flag_at = current::ap::AP_FRAME_OFFSET
             + core::mem::offset_of!(current::ap::ApTrampoline, booted_flag);
+        let stage_at = current::ap::AP_FRAME_OFFSET
+            + core::mem::offset_of!(current::ap::ApTrampoline, stage);
         let mut booted = false;
         for _ in 0..current::lapic::AP_BOOT_POLLS {
             // SAFETY: 参数块在刚分配的低页内、页对齐，读一个字节 ✓。
@@ -514,8 +516,12 @@ unsafe fn start_aps(
         if booted {
             started += 1;
         } else {
+            // 读回**进度标记** ✓：`0` = IPI 根本没送到；`N` = AP 跑了、停在跳板的第 N 步 ✗。
+            // 没有这一个字节，"没送到"与"崩在跳板里"在串口上**完全一样** ✗。
+            // SAFETY: 与 `booted_flag` 同一页内、页对齐，读一个字节。
+            let stage = unsafe { core::ptr::read_volatile(low.as_ptr().add(stage_at)) };
             report_fmt::<crate::PlatformImpl>(format_args!(
-                "[liftoff] ap: lapic={:#x} 未在 1 秒内醒来\n",
+                "[liftoff] ap: lapic={:#x} 未在 1 秒内醒来，跳板进度={stage}\n",
                 cpu.apic_id
             ));
         }

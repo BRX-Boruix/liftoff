@@ -24,8 +24,15 @@ pub struct ApTrampoline {
     /// 参考实现用 `xchg` 原子写（`smp_trampoline.asm_x86:176-177`）✓；
     /// BSP 侧必须**易失读**，否则优化器可能把它提到循环外 ✗。
     pub booted_flag: u8,
+    /// **进度标记**：跳板每走完一步就写一次 ✓。BSP 超时后读回它，于是
+    /// "IPI 根本没送到"（还是 `0`）与"AP 跑了、停在跳板第 N 步"（停在 `N`）**一眼可分** ✗。
+    ///
+    /// 编码（**与 `global_asm!` 里的立即数必须一致** ✓，由 `asm_check.py` 钉住）：
+    /// `1` 实模式已在执行、`2` 已进保护模式、`3` 已开分页、`4` 已在 64 位、
+    /// `5` 已写 `booted_flag` 即将自旋。
+    pub stage: u8,
     /// 显式补齐，使 `target_mode` 落在 4 字节边界。
-    pub pad0: [u8; 3],
+    pub pad0: [u8; 2],
     /// 目标模式位。bit 4 = `CR0.WP`（写保护）—— 与参考实现同一编码 ✓。
     pub target_mode: u32,
     /// 我们的页表**顶层物理地址**。页表在低 4 GiB 内，故 u32 够用 ✓。
@@ -50,7 +57,8 @@ impl ApTrampoline {
     pub const EMPTY: Self = Self {
         hhdm: 0,
         booted_flag: 0,
-        pad0: [0; 3],
+        stage: 0,
+        pad0: [0; 2],
         target_mode: 0,
         cr3: 0,
         info_struct: 0,
@@ -132,7 +140,8 @@ pub fn prepare(input: &ApTrampolineInput) -> Result<ApTrampoline, ApTrampolineEr
     if input.write_protect {
         block.target_mode |= 1 << 4;
     }
-    // `booted_flag` 保持 0：**只有 AP 自己**能把它置 1 ✓。
+    // `booted_flag` 与 `stage` 保持 0：**只有 AP 自己**能推进它们 ✓ ——
+    // 引导器预设任何一个，都会把"没发生"报成"发生了" ✗。
     Ok(block)
 }
 
@@ -210,7 +219,8 @@ mod tests {
         // **跳板按固定偏移读它**：偏移写错不会报错，只会静默跑飞。逐个钉住。
         assert_eq!(offset_of!(ApTrampoline, hhdm), 0);
         assert_eq!(offset_of!(ApTrampoline, booted_flag), 8);
-        assert_eq!(offset_of!(ApTrampoline, pad0), 9);
+        assert_eq!(offset_of!(ApTrampoline, stage), 9, "进度标记在 offset 9");
+        assert_eq!(offset_of!(ApTrampoline, pad0), 10);
         assert_eq!(offset_of!(ApTrampoline, target_mode), 12);
         assert_eq!(offset_of!(ApTrampoline, cr3), 16);
         assert_eq!(offset_of!(ApTrampoline, info_struct), 20);
@@ -219,6 +229,17 @@ mod tests {
         assert_eq!(offset_of!(ApTrampoline, gdtr), 32);
         assert_eq!(offset_of!(ApTrampoline, pad1), 36);
         assert_eq!(size_of::<ApTrampoline>(), 40, "必须是 40：不留隐式填充");
+    }
+
+    #[test]
+    fn the_progress_marker_starts_at_zero_and_only_the_ap_may_advance_it() {
+        // **为什么需要它**：AP 不醒时串口上只有一个 \`started=0\` ✗ —— 分不清
+        // "IPI 根本没送到"与"AP 跑了、崩在第 N 步" ✓。跳板每走一步写一次这个字节，
+        // BSP 超时后读回它，于是两者**一眼可分** ✓。
+        assert_eq!(ApTrampoline::EMPTY.stage, 0, "初始必须是 0：还没开始");
+        let block = prepare(&input()).expect("合法");
+        assert_eq!(block.stage, 0, "**只有 AP 自己**能推进它，引导器不得预设");
+        assert_eq!(block.booted_flag, 0);
     }
 
     #[test]
@@ -401,6 +422,7 @@ pub fn stage_frame(frame: &ApTrampoline, low: &mut [u8]) -> Result<(), StageErro
     };
     put(core::mem::offset_of!(ApTrampoline, hhdm), &frame.hhdm.to_le_bytes());
     put(core::mem::offset_of!(ApTrampoline, booted_flag), &[frame.booted_flag]);
+    put(core::mem::offset_of!(ApTrampoline, stage), &[frame.stage]);
     put(core::mem::offset_of!(ApTrampoline, target_mode), &frame.target_mode.to_le_bytes());
     put(core::mem::offset_of!(ApTrampoline, cr3), &frame.cr3.to_le_bytes());
     put(core::mem::offset_of!(ApTrampoline, info_struct), &frame.info_struct.to_le_bytes());
@@ -448,6 +470,8 @@ core::arch::global_asm!(
     "    xor ebx, ebx",
     "    mov bx, cs",
     "    shl ebx, 4",
+    // 进度标记 1：实模式已经在执行 —— 这一条被写出来就说明 **IPI 送到了、CS 也对** ✓。
+    "    mov byte ptr [ebx + 9], 1",
     "    lgdt [ebx + 0x880]",
     "    mov eax, cr0",
     "    or eax, 1",
@@ -457,6 +481,8 @@ core::arch::global_asm!(
     "    .word 0x18",
     ".code32",
     "ap_mode32:",
+    // 进度标记 2：远跳进了保护模式。
+    "    mov byte ptr [ebx + 9], 2",
     "    mov ax, 0x20",
     "    mov ds, ax",
     "    mov es, ax",
@@ -477,12 +503,16 @@ core::arch::global_asm!(
     "    mov eax, cr0",
     "    or eax, 0x80000000",
     "    mov cr0, eax",
+    // 进度标记 3：分页已开（用的是我们自己的页表 ✓）。
+    "    mov byte ptr [ebx + 9], 3",
     "    lea eax, [ebx + AP_MODE64_OFF]",
     "    push 0x28",
     "    push eax",
     "    retf",
     ".code64",
     "ap_mode64:",
+    // 进度标记 4：已经在 64 位模式里执行。
+    "    mov byte ptr [ebx + 9], 4",
     "    mov ax, 0x30",
     "    mov ds, ax",
     "    mov es, ax",
@@ -491,6 +521,8 @@ core::arch::global_asm!(
     "    mov gs, ax",
     "    mov eax, 1",
     "    xchg [rbx + 8], eax",
+    // 进度标记 5：`booted_flag` 已写，即将自旋等内核。
+    "    mov byte ptr [rbx + 9], 5",
     "    mov edi, [rbx + 20]",
     "    mov rax, [rbx]",
     "    add rdi, rax",
@@ -616,6 +648,15 @@ mod staging_tests {
             (0x8_0000 + AP_GDT_OFFSET) as u32,
             "GDTR 的基址必须指向**本页里的 GDT 副本**"
         );
+    }
+
+    #[test]
+    fn stage_frame_writes_the_progress_marker() {
+        let mut low = std::vec![0u8; AP_PAGE_SIZE];
+        let mut block = prepare(&input()).expect("合法");
+        block.stage = 3;
+        stage_frame(&block, &mut low).expect("应当成功");
+        assert_eq!(low[AP_FRAME_OFFSET + 9], 3, "进度标记必须落在 offset 9");
     }
 
     #[test]
