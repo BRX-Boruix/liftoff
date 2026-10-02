@@ -371,6 +371,73 @@ mod smp_tests {
     }
 
     #[test]
+    fn the_chain_from_rsdp_to_registration_composes() {
+        // **把 S1 与 S2 接起来。** RSDP → XSDT → 按签名找到 MADT → 解析出 CPU 列表 → 登记。
+        // 每一段都单独测过，但"合起来能不能用"没人测过 —— 而接线处正是最容易出错的地方
+        // （段与段各自正确、拼起来却对不上，这类问题在真机上表现为静默复位）。
+        use utils::acpi::{MADT_HEADER_LEN, MADT_SIGNATURE, RSDP_SIGNATURE, SdtKind, cpus, find_table, parse_rsdp};
+
+        const MADT_ADDR: u64 = 0x2000;
+
+        // ① MADT：两项 xAPIC（处理器 0/1，APIC ID 0/1，均可用）。
+        //    缓冲按**项数**算，不手写大小 —— 上一轮我就是手写大小而越界。
+        const ENTRY_LEN: usize = 8;
+        let mut madt = std::vec![0u8; MADT_HEADER_LEN + 2 * ENTRY_LEN];
+        madt[0..4].copy_from_slice(MADT_SIGNATURE);
+        for (index, apic_id) in [0u8, 1u8].into_iter().enumerate() {
+            let at = MADT_HEADER_LEN + index * ENTRY_LEN;
+            madt[at] = 0; // type 0 = xAPIC
+            madt[at + 1] = ENTRY_LEN as u8;
+            madt[at + 2] = apic_id; // processor id
+            madt[at + 3] = apic_id; // apic id
+            madt[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes()); // enabled
+        }
+        let madt_len = madt.len() as u32;
+        madt[4..8].copy_from_slice(&madt_len.to_le_bytes());
+
+        // ② XSDT：一项，指向 MADT。
+        let mut xsdt = std::vec![0u8; 36 + 8];
+        xsdt[0..4].copy_from_slice(b"XSDT");
+        xsdt[36..44].copy_from_slice(&MADT_ADDR.to_le_bytes());
+        let xsdt_len = xsdt.len() as u32;
+        xsdt[4..8].copy_from_slice(&xsdt_len.to_le_bytes());
+
+        // ③ RSDP：修订 2 → 用 XSDT。
+        let mut rsdp = std::vec![0u8; 36];
+        rsdp[0..8].copy_from_slice(RSDP_SIGNATURE);
+        rsdp[15] = 2;
+        rsdp[24..32].copy_from_slice(&0x1000u64.to_le_bytes()); // XSDT 的假地址
+
+        // ④ 走完整条链。
+        let root = parse_rsdp(&rsdp).expect("RSDP 应能解析");
+        assert_eq!(root.kind, SdtKind::Xsdt, "修订 2 必须选 XSDT");
+
+        let mut reader = |address: u64, out: &mut [u8; 4]| {
+            if address == MADT_ADDR {
+                out.copy_from_slice(MADT_SIGNATURE);
+                true
+            } else {
+                false
+            }
+        };
+        let found = find_table(&xsdt, root.kind, MADT_SIGNATURE, &mut reader)
+            .expect("查找不应报错")
+            .expect("必须找到 MADT");
+        assert_eq!(found, MADT_ADDR);
+
+        let mut list = [MadtCpu { processor_id: 0, apic_id: 0, enabled: false }; 4];
+        let total = cpus(&madt, &mut list).expect("MADT 应能解析");
+        assert_eq!(total, 2, "MADT 里声明了两颗 CPU");
+
+        // ⑤ 登记：**一个 AP 都没启动**，所以仍然只报 BSP。
+        let mut r = Responses::new();
+        assert_eq!(r.set_smp_cpus(&list[..total], 0), 2, "两颗都登记上了");
+        assert_eq!(r.mp_cpu_count(), 1, "没启动 AP 时只能报 BSP —— 这是安全属性");
+        assert_eq!(r.mp_info_at(0).expect("第 0 项").lapic_id, 0);
+        assert_eq!(r.mp_info_at(1).expect("第 1 项").lapic_id, 1);
+    }
+
+    #[test]
     fn claiming_more_started_aps_than_exist_is_rejected() {
         // 声称起了 9 个而表里只有 2 个 —— 不得把 `cpu_count` 报成 10。
         let mut r = Responses::new();
